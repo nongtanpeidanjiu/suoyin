@@ -62,6 +62,19 @@ struct TrackingTests {
         #expect(cursor.applied == 100)
     }
 
+    @Test func coalescedScanBoundaryRequiresNewerAncestorEvent() {
+        let boundary = ScanBoundary(marker: "/fixture/owned/marker", after: 10)
+        let recursive = UInt32(kFSEventStreamEventFlagMustScanSubDirs)
+        #expect(boundary.covered(by: VolumeEvent(path: "owned/marker", id: 11, flags: 0),
+                                 at: "/fixture/owned/marker"))
+        #expect(boundary.covered(by: VolumeEvent(path: "owned", id: 12, flags: recursive),
+                                 at: "/fixture/owned"))
+        #expect(!boundary.covered(by: VolumeEvent(path: "owned", id: 9, flags: recursive),
+                                  at: "/fixture/owned"))
+        #expect(!boundary.covered(by: VolumeEvent(path: "other", id: 12, flags: recursive),
+                                  at: "/fixture/other"))
+    }
+
     @Test func directoryMoveRemovesOldSubtreeAndIndexesNewSubtree() {
         var live = LiveIndex(base: fixture(), root: "/fixture")
         _ = live.reconcile(path: "/fixture/b", observed: .readable(own: folder, children: [:]))
@@ -100,6 +113,16 @@ struct TrackingTests {
         #expect(live.state.changes.isEmpty)
         #expect(live.base.prepared != nil)
         #expect(filePaths(live, query: "report") == ["/fixture/a/report"])
+    }
+
+    @Test func cachedRowsFromUnverifiedScopeAreWithheldOnFirstQuery() {
+        var cached = LiveIndex(base: fixture(), root: "/fixture")
+        cached.verifyStartupCoverage(at: ["/fixture/a", "/fixture/b"]) {
+            $0.hasSuffix("/a") ? .readable(own: folder, children: [:]) : nil
+        }
+        #expect(cached.state.restricted == ["/fixture/b"])
+        #expect(filePaths(cached, query: "deep").isEmpty)
+        #expect(filePaths(cached, query: "report") == ["/fixture/a/report"])
     }
 
     @Test func providerTrashIsNeverAnObservationTarget() throws {

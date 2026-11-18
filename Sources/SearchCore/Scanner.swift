@@ -343,6 +343,16 @@ private func CFUUIDCreateString(_ value: CFUUID) -> CFString {
 extension WalkScope {
     var dataVolumeRoots: [String] { [dataRoot] + mirrors.map { String($0.dropFirst(dataRoot.count)) } }
 
+    var protectedStartupRoots: [String] {
+        let home = NSHomeDirectory()
+        return [
+            "/Desktop", "/Documents", "/Downloads", "/Library/Mail", "/Library/Messages",
+            "/Library/Calendars", "/Library/Safari", "/Library/CloudStorage",
+            "/Library/Mobile Documents", "/Library/Application Support/AddressBook",
+            "/Library/Containers/com.apple.Home"
+        ].map { home + $0 }
+    }
+
     /// Observe one directory. A denied read is distinct from an empty directory.
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String]) throws -> DirectoryObservation {
         guard !insideProviderTrash(path) else { return .absent }

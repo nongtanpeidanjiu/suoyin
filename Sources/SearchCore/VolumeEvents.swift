@@ -20,6 +20,15 @@ struct VolumeEvent {
     }
 }
 
+struct ScanBoundary {
+    let marker: String
+    let after: UInt64
+
+    func covered(by event: VolumeEvent, at path: String) -> Bool {
+        path == marker || event.recursive && event.id > after && inside(marker, path)
+    }
+}
+
 struct VolumeIdentity {
     let root: String
     let mount: String

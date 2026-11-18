@@ -61,7 +61,7 @@ public final class ChangeTracker {
     private var closed = false
     private var observer: ((String) -> Void)?
     private var needsReplay: Set<Int> = []
-    private var scanBarriers: [Int: String] = [:]
+    private var scanBarriers: [Int: ScanBoundary] = [:]
     private var applyTrace: [ApplyInterval]?
 
     public init(root: String, snapshot: String, ownData: String) throws {
@@ -156,7 +156,11 @@ public final class ChangeTracker {
         }
         if var loaded {
             loaded.prepare()
-            publish(LiveIndex(base: loaded, root: root), changed: true)
+            var validated = LiveIndex(base: loaded, root: root)
+            validated.verifyStartupCoverage(at: scope.protectedStartupRoots) { folder in
+                try? scope.observe(folder, inherited: 0, excluding: excluded)
+            }
+            publish(validated, changed: true)
             lock.withLock { status.recovery = reset.isEmpty ? reason : "invalid-checkpoint" }
             note("ready")
         }
@@ -199,7 +203,7 @@ public final class ChangeTracker {
             // An event written on the observed device after enumeration bounds
             // the scan. The marker itself is excluded from the index.
             let marker = joinedPath(ownDirectory, ".scan-boundary-" + UUID().uuidString)
-            scanBarriers[i] = marker
+            scanBarriers[i] = ScanBoundary(marker: marker, after: FSEventsGetCurrentEventId())
             let fd = Darwin.open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw ScanError.metadata(path: ownDirectory, error: errno) }
             let closed = Darwin.close(fd)
@@ -268,10 +272,10 @@ public final class ChangeTracker {
                     reset.insert(volume)
                     continue
                 }
-                if scanBarriers[volume] == path { crossed.insert(volume) }
+                if scanBarriers[volume]?.covered(by: event, at: path) == true { crossed.insert(volume) }
                 if excluded.contains(where: { inside(path, $0) }) || scope.insideProviderTrash(path) { continue }
                 guard inside(path, root) else {
-                    if event.recursive && inside(root, path) { reset.insert(volume) }
+                    if event.recursive && inside(root, path) { work[root] = true }
                     continue
                 }
                 high[volume] = max(high[volume] ?? 0, event.id)

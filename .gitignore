@@ -7,3 +7,4 @@ spike/
 *.bin
 *.snapshot
 *.jsonl
+__pycache__/

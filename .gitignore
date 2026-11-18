@@ -1,0 +1,9 @@
+.flow/
+spike/
+.build/
+.swiftpm/
+.m1-tmp/
+.DS_Store
+*.bin
+*.snapshot
+*.jsonl

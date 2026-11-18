@@ -154,10 +154,12 @@ public final class ChangeTracker {
         for i in identities.indices where !identities[i].readOnly {
             try watch(i)
         }
+        var reopened: [String] = []
         if var loaded {
             loaded.prepare()
             var validated = LiveIndex(base: loaded, root: root)
-            validated.verifyStartupCoverage(at: scope.protectedStartupRoots) { folder in
+            let scopes = Set(scope.protectedStartupRoots).union(validated.state.restricted).sorted()
+            reopened = validated.verifyStartupCoverage(at: scopes) { folder in
                 try? scope.observe(folder, inherited: 0, excluding: excluded)
             }
             publish(validated, changed: true)
@@ -168,6 +170,8 @@ public final class ChangeTracker {
         loaded = nil
         if needsInitialScan || !reset.isEmpty {
             try rebuild(reset, initial: needsInitialScan, reason: needsInitialScan ? reason : "invalid-checkpoint")
+        } else if !reopened.isEmpty {
+            try applyCoverage(at: reopened)
         }
         for stream in sources.values { stream.flush() }
         update.async {
@@ -467,15 +471,18 @@ public final class ChangeTracker {
     /// after its existing access changes. Indeterminate access remains restricted.
     public func recheckCoverage(at paths: [String]) {
         update.async {
-            guard !self.closed, var updated = self.current else { return }
-            let work = paths.reduce(into: [String: Bool]()) { $0[$1] = false }
-            do {
-                try self.reconcile(work, in: &updated)
-                updated.prepareDelta()
-                self.publish(updated, changed: true)
-                self.scheduleSave()
-            } catch { self.fail(error) }
+            do { try self.applyCoverage(at: paths) }
+            catch { self.fail(error) }
         }
+    }
+
+    private func applyCoverage(at paths: [String]) throws {
+        guard !closed, var updated = current else { return }
+        let work = paths.reduce(into: [String: Bool]()) { $0[$1] = false }
+        try reconcile(work, in: &updated)
+        updated.prepareDelta()
+        publish(updated, changed: true)
+        scheduleSave()
     }
 
     public func stop() throws {

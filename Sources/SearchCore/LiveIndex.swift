@@ -138,15 +138,18 @@ struct LiveIndex {
 
     /// Apply the current access result before any cached rows can be published.
     mutating func verifyStartupCoverage(at paths: [String],
-                                        observe: (String) -> DirectoryObservation?) {
+                                        observe: (String) -> DirectoryObservation?) -> [String] {
+        var reopened: [String] = []
         for path in paths where inside(path, state.root) {
             switch observe(path) {
-            case .readable: continue
+            case .readable:
+                if state.restricted.contains(path) { reopened.append(path) }
             case .absent: _ = reconcile(path: path, observed: .absent)
             case .restricted, nil: _ = reconcile(path: path, observed: .restricted)
             }
         }
         prepareDelta()
+        return reopened
     }
 
     mutating func directoryID(_ path: String) -> UInt32? {

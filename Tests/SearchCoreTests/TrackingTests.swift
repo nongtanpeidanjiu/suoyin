@@ -117,12 +117,35 @@ struct TrackingTests {
 
     @Test func cachedRowsFromUnverifiedScopeAreWithheldOnFirstQuery() {
         var cached = LiveIndex(base: fixture(), root: "/fixture")
-        cached.verifyStartupCoverage(at: ["/fixture/a", "/fixture/b"]) {
+        let reopened = cached.verifyStartupCoverage(at: ["/fixture/a", "/fixture/b"]) {
             $0.hasSuffix("/a") ? .readable(own: folder, children: [:]) : nil
         }
+        #expect(reopened.isEmpty)
         #expect(cached.state.restricted == ["/fixture/b"])
         #expect(filePaths(cached, query: "deep").isEmpty)
         #expect(filePaths(cached, query: "report") == ["/fixture/a/report"])
+    }
+
+    @Test func reopenedScopeIsReconciledBeforeRestoringCachedVisibility() throws {
+        var older = LiveIndex(base: fixture(), root: "/fixture")
+        _ = older.verifyStartupCoverage(at: ["/fixture/b"]) { _ in .restricted }
+        let dir = try scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("index").path
+        try older.archive().savePrepared(to: path)
+        var restarted = LiveIndex(base: try SearchIndex.load(from: path), root: "/fixture")
+        let reopened = restarted.verifyStartupCoverage(at: ["/fixture/b"]) { _ in
+            .readable(own: folder, children: ["restored": file])
+        }
+        #expect(reopened == ["/fixture/b"])
+        #expect(filePaths(restarted, query: "deep").isEmpty)
+        for path in reopened {
+            _ = restarted.reconcile(path: path, observed: .readable(own: folder, children: ["restored": file]))
+        }
+        restarted.prepareDelta()
+        #expect(restarted.state.restricted.isEmpty)
+        #expect(filePaths(restarted, query: "restored") == ["/fixture/b/restored"])
+        #expect(filePaths(restarted, query: "deep").isEmpty)
     }
 
     @Test func providerTrashIsNeverAnObservationTarget() throws {

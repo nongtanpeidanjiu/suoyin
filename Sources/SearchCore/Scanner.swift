@@ -163,13 +163,9 @@ struct WalkScope {
         if inside(logical, homeLibrary) && !cloudRoots.contains(where: { inside(logical, $0) }) { return true }
         // An explicitly indexed fixture or external root is the reference point
         // for visibility. Only directories inside it affect that view.
-        let relative: Substring
-        if wholeDisk && inside(logical, "/usr/local") {
-            relative = logical.dropFirst("/usr/local".count)
-        } else {
-            relative = wholeDisk ? logical[...] : path.dropFirst(root.count)
-        }
-        var prefix = ""
+        let visiblePrefix = wholeDisk && inside(logical, "/usr/local") ? "/usr/local" : ""
+        let relative = wholeDisk ? logical.dropFirst(visiblePrefix.count) : path.dropFirst(root.count)
+        var prefix = visiblePrefix
         let components = relative.split(separator: "/")
         for (index, component) in components.enumerated() {
             prefix += "/" + component

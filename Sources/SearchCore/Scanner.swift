@@ -103,15 +103,18 @@ private final class ListenerSet {
 let dataRoot = "/System/Volumes/Data"
 
 struct WalkScope {
+    let root: String
     let primaryDevice: dev_t
     let dataDevice: dev_t
     let mirrors: Set<String>
     let cloudRoots: Set<String>
     let privateScratch: Set<String>
+    let homeLibrary: String
     let homeCaches: String
     let wholeDisk: Bool
 
     init(root: String) throws {
+        self.root = root
         wholeDisk = root == "/"
         primaryDevice = try Self.device(root)
         dataDevice = wholeDisk ? try Self.device(dataRoot) : primaryDevice
@@ -124,7 +127,8 @@ struct WalkScope {
         } else { mirrors = [] }
         let home = NSHomeDirectory()
         cloudRoots = wholeDisk ? [home + "/Library/CloudStorage", home + "/Library/Mobile Documents"] : []
-        homeCaches = home + "/Library/Caches"
+        homeLibrary = home + "/Library"
+        homeCaches = homeLibrary + "/Caches"
         let cwd = FileManager.default.currentDirectoryPath
         privateScratch = [cwd + "/.m1-tmp"]
     }
@@ -149,6 +153,21 @@ struct WalkScope {
              "/Library/Apple", "/Library/Updates", "/Library/Developer/CommandLineTools", "/Library/Caches":
             return true
         default: break
+        }
+        return false
+    }
+
+    func backgroundDirectory(_ path: String) -> Bool {
+        let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
+        if inside(logical, homeLibrary) && !cloudRoots.contains(where: { inside(logical, $0) }) { return true }
+        // An explicitly indexed fixture or external root is the reference point
+        // for visibility. Only directories inside it affect that view.
+        let relative = wholeDisk ? logical : String(path.dropFirst(root.count))
+        var prefix = ""
+        for component in relative.split(separator: "/") {
+            prefix += "/" + component
+            if component.hasPrefix(".") || component.hasSuffix(".app") ||
+                wholeDisk && defaultHiddenDirectory(prefix) { return true }
         }
         return false
     }

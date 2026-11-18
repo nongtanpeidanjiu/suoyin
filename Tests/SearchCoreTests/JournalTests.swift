@@ -112,7 +112,8 @@ struct JournalTests {
         #expect(cursor.lastSeen == 90)
         #expect(cursor.applied == 999)
         let second = cursor.received(VolumeEvent(path: "next", id: 89, flags: 0))
-        #expect(!second)
+        #expect(second && cursor.outOfOrderBatches == 1)
+        #expect(cursor.maximumRegression == 1 && cursor.lastSeen == 90)
     }
 
     @Test func rebuildCooldownIsPerVolume() {
@@ -137,6 +138,6 @@ struct JournalTests {
         #expect(end && cursor.applied == 99 && cursor.lastSeen == nil)
         let live = cursor.received(VolumeEvent(path: "live", id: 101, flags: 0))
         let backward = cursor.received(VolumeEvent(path: "backward", id: 100, flags: 0))
-        #expect(live && !backward)
+        #expect(live && backward && cursor.outOfOrderBatches == 1)
     }
 }

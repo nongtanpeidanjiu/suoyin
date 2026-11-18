@@ -13,6 +13,13 @@ public struct TrackingStatus: Codable {
     public var appliedEvents: [String: UInt64] = [:]
     public var durableEvents: [String: UInt64] = [:]
     public var durableGeneration: UInt64 = 0
+    public var outOfOrderBatches: UInt64 = 0
+    public var maximumEventRegression: UInt64 = 0
+    public var deferredDirectories = 0
+    public var baseWriteDeferred = false
+    public var automaticBaseWritesInWindow = 0
+    public var exitBaseWrites: UInt64 = 0
+    public var exitBaseWrittenBytes: UInt64 = 0
     public var baseWrites: UInt64 = 0
     public var baseWrittenBytes: UInt64 = 0
     public var journalFrames: UInt64 = 0
@@ -77,6 +84,14 @@ public final class ChangeTracker {
     static let journalFlushInterval = DispatchTimeInterval.seconds(45)
     private var saveScheduled = false
     private var needsBaseWrite = false
+    private var firstBaseWrite = false
+    private var quotaCheck: TimeInterval?
+    private var budget: BaseWriteBudget
+    private let wallTime: () -> TimeInterval
+    private var directories = DirectorySchedule()
+    private var deliveredHigh: [Int: UInt64] = [:]
+    private var directoryWake: UInt64?
+    private static let pendingLimit = 50_000
     private var journal: ChangeJournal?
     private var durableImage: JournalImage?
     private var saveTicket: UInt64 = 0
@@ -94,7 +109,15 @@ public final class ChangeTracker {
     private var applyTrace: [ApplyInterval]?
     private var lastAllocatorRelief: UInt64 = 0
 
-    public init(root: String, snapshot: String, ownData: String) throws {
+    public convenience init(root: String, snapshot: String, ownData: String) throws {
+        try self.init(root: root, snapshot: snapshot, ownData: ownData,
+                      wallTime: { Date().timeIntervalSince1970 })
+    }
+
+    init(root: String, snapshot: String, ownData: String,
+         wallTime: @escaping () -> TimeInterval) throws {
+        self.wallTime = wallTime
+        budget = BaseWriteBudget(snapshot: snapshot)
         let root = URL(fileURLWithPath: root).resolvingSymlinksInPath().standardizedFileURL.path
         self.root = root
         self.path = snapshot
@@ -203,6 +226,8 @@ public final class ChangeTracker {
         } catch SnapshotError.invalid { reason = "corrupt" }
         catch SnapshotError.unsupportedVersion { reason = "unsupported-version" }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile {}
+        firstBaseWrite = reason == "missing"
+        lock.withLock { status.automaticBaseWritesInWindow = budget.count(at: wallTime()) }
         let previous = loaded?.volumes ?? []
         var reset = Set<Int>()
         cursors = identities.enumerated().map { i, volume in
@@ -213,7 +238,7 @@ public final class ChangeTracker {
                 return EventCursor(applied: prior?.appliedEvent, replaying: true)
             }
             reset.insert(i)
-            return EventCursor(applied: nil)
+            return EventCursor(applied: nil, scanBaseline: volume.scanReplayBaseline())
         }
         for i in identities.indices where !identities[i].readOnly {
             try watch(i)
@@ -269,7 +294,10 @@ public final class ChangeTracker {
             status.registrationPosition[key] = observed
             status.firstCallbackPosition.removeValue(forKey: key)
         }
-        sources[volume] = try VolumeEventStream(volume: identities[volume], since: since) {
+        // A scoped tracker whose recovery marker is inside its tree need not
+        // receive unrelated events from the rest of the device.
+        let relative = root != "/" && inside(ownDirectory, root) ? identities[volume].relativeScope(root) : ""
+        sources[volume] = try VolumeEventStream(volume: identities[volume], since: since, scope: relative) {
             [weak self] events in
             guard let self else { return }
             self.update.async { self.enqueue(EventBatch(volume: volume, epoch: epoch, events: events)) }
@@ -305,7 +333,7 @@ public final class ChangeTracker {
                 status.firstCallbackPosition[key] = batch.events.lazy.filter { !$0.historyDone }.map(\.id).max()
             }
         }
-        if pendingEvents + batch.events.count > 50_000 {
+        if pendingEvents + batch.events.count > Self.pendingLimit {
             overflowed.insert(batch.volume)
         } else {
             pendingEvents += batch.events.count
@@ -338,15 +366,28 @@ public final class ChangeTracker {
         return suffix.isEmpty ? mount : joinedPath(mount, suffix)
     }
 
-    private func dirtyPaths(from events: [EventBatch]) -> ([String: Bool], Set<String>, [Int: UInt64], Set<Int>, Set<Int>) {
-        var work: [String: Bool] = [:]
-        var files = Set<String>()
+    private func dirtyPaths(from events: [EventBatch]) -> ([String: DirectoryUpdate], [Int: UInt64], Set<Int>, Set<Int>) {
+        var work: [String: DirectoryUpdate] = [:]
         var high: [Int: UInt64] = [:]
         var reset = overflowed
         var crossed = Set<Int>()
+        var late: UInt64 = 0
+        var maximum: UInt64 = 0
+
+        func mark(_ path: String, event: VolumeEvent, volume: Int, recursive: Bool? = nil, file: String? = nil) {
+            var item = work.removeValue(forKey: path) ?? DirectoryUpdate()
+            item.add(event: event.id, volume: volume)
+            if let recursive {
+                item.recursive = item.recursive == true || recursive
+                item.files.removeAll()
+            } else if let file, item.recursive == nil { item.files.insert(file) }
+            work[path] = item
+        }
+
         for batch in events where batch.epoch == epochs[batch.volume] {
             let volume = batch.volume
             let prior = cursors[volume].lastSeen
+            let before = cursors[volume].outOfOrderBatches
             if !cursors[volume].receivedBatch(batch.events) {
                 reset.insert(volume)
                 let invalid = batch.events.first(where: { $0.invalidatesHistory || !$0.historyDone && ($0.id == 0 || $0.id == .max) })
@@ -356,48 +397,84 @@ public final class ChangeTracker {
                 }
                 continue
             }
+            late += cursors[volume].outOfOrderBatches - before
+            maximum = max(maximum, cursors[volume].maximumRegression)
             for event in batch.events {
                 if event.historyDone { continue }
+                high[volume] = max(high[volume] ?? 0, event.id)
                 guard let path = logicalPath(event.path, volume: volume) else {
-                    reset.insert(volume)
+                    mark(root, event: event, volume: volume, recursive: true)
                     continue
                 }
                 if scanBarriers[volume]?.covered(by: event, at: path) == true { crossed.insert(volume) }
-                high[volume] = max(high[volume] ?? 0, event.id)
                 if excluded.contains(where: { inside(path, $0) }) || scope.insideProviderTrash(path) { continue }
                 guard inside(path, root) else {
-                    if event.recursive && inside(root, path) { work[root] = true }
+                    if event.recursive && inside(root, path) { mark(root, event: event, volume: volume, recursive: true) }
                     continue
                 }
-                if event.recursive { work[path] = true; continue }
-                if event.leafFileChange {
-                    files.insert(path)
-                    continue
-                }
-                let folder = event.isDirectory && !event.structural ? path : parentPath(path)
-                let target = inside(folder, root) ? folder : root
-                work[target] = work[target] ?? false
-                if event.isDirectory && event.structural && path != root {
-                    work[path] = true
+                if event.recursive {
+                    mark(path, event: event, volume: volume, recursive: true)
+                } else if event.leafFileChange, path != root {
+                    mark(parentPath(path), event: event, volume: volume, file: path)
+                } else {
+                    let folder = event.isDirectory && !event.structural ? path : parentPath(path)
+                    mark(inside(folder, root) ? folder : root, event: event, volume: volume, recursive: false)
+                    if event.isDirectory && event.structural && path != root {
+                        mark(path, event: event, volume: volume, recursive: true)
+                    }
                 }
             }
         }
-        return (work, files, high, reset, crossed)
+        if late > 0 {
+            lock.withLock {
+                status.outOfOrderBatches += late
+                status.maximumEventRegression = max(status.maximumEventRegression, maximum)
+            }
+        }
+        return (work, high, reset, crossed)
     }
 
-    private func drain() {
+    private func scheduleDirectoryWake() {
+        guard let next = directories.next else { directoryWake = nil; return }
+        if let scheduled = directoryWake, scheduled <= next { return }
+        directoryWake = next
+        update.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: next)) { [weak self] in
+            guard let self, self.directoryWake == next else { return }
+            self.directoryWake = nil
+            self.drain()
+        }
+    }
+
+    private func drain(force: Bool = false) {
         guard !closed, !paused, current != nil, snapshotStatus().error == nil,
-              !batches.isEmpty || !overflowed.isEmpty else { return }
-        if duringCompaction != nil, (current?.state.changes.count ?? 0) >= 2 * Self.compactionRows,
+              !batches.isEmpty || !overflowed.isEmpty || directories.count > 0 else { return }
+        if !force, duringCompaction != nil, (current?.state.changes.count ?? 0) >= 2 * Self.compactionRows,
            overflowed.isEmpty { return }
         let submitted = batches
         batches.removeAll(keepingCapacity: true)
         pendingEvents = 0
         lock.withLock { status.bufferedEvents = 0 }
         let before = cursors
-        let (work, files, high, reset, crossed) = dirtyPaths(from: submitted)
+        let (observations, high, invalid, crossed) = dirtyPaths(from: submitted)
+        var reset = invalid
         overflowed.removeAll()
+        let now = DispatchTime.now().uptimeNanoseconds
+        let immediate = force || snapshotStatus().phase != "caught-up"
+        if reset.isEmpty {
+            for (path, item) in observations {
+                let hidden = directories.knownVisibility(at: path, now: now) ??
+                    (scope.backgroundDirectory(path) || (current?.entry(at: path)?.attribute ?? 0) & Kind.hidden != 0)
+                directories.enqueue(item, at: path, hidden: hidden, now: now)
+            }
+            if directories.pendingItems > Self.pendingLimit, !immediate {
+                reset.formUnion(directories.pendingVolumes)
+            }
+        }
         if !reset.isEmpty {
+            directories.discard(volumes: reset)
+            for volume in reset { deliveredHigh[volume] = nil }
+            lock.withLock { status.deferredDirectories = directories.count }
+            scheduleDirectoryWake()
             lock.withLock { status.receivedEvents += UInt64(submitted.reduce(0) { $0 + $1.events.count }) }
             do {
                 var rebuildable = Set<Int>()
@@ -421,7 +498,7 @@ public final class ChangeTracker {
                     }
                     rebuildable.insert(i)
                     identities[i] = try VolumeIdentity(root: identities[i].root)
-                    cursors[i] = EventCursor(applied: nil)
+                    cursors[i] = EventCursor(applied: nil, scanBaseline: identities[i].scanReplayBaseline())
                     needsReplay.remove(i)
                     if !identities[i].readOnly { try watch(i) }
                 }
@@ -437,6 +514,16 @@ public final class ChangeTracker {
             return
         }
         lock.withLock { status.receivedEvents += UInt64(submitted.reduce(0) { $0 + $1.events.count }) }
+        for (volume, id) in high { deliveredHigh[volume] = max(deliveredHigh[volume] ?? 0, id) }
+        let ready = directories.take(at: now, force: immediate)
+        lock.withLock { status.deferredDirectories = directories.count }
+        scheduleDirectoryWake()
+        var work: [String: Bool] = [:]
+        var files = Set<String>()
+        for (path, item) in ready {
+            work[path] = item.recursive
+            files.formUnion(item.files)
+        }
         if (!work.isEmpty || !files.isEmpty), var updated = current {
             current = nil
             let start = DispatchTime.now().uptimeNanoseconds
@@ -453,7 +540,7 @@ public final class ChangeTracker {
                 }
                 try reconcile(work, in: &updated)
                 updated.prepareDelta()
-                for i in cursors.indices { cursors[i].acknowledge(high[i]) }
+                acknowledgeReadyEvents()
                 publish(updated, changed: true)
                 recordDuringCompaction(work)
                 if duringCompaction != nil {
@@ -479,11 +566,25 @@ public final class ChangeTracker {
             }
         }
         if work.isEmpty, files.isEmpty {
-            for i in cursors.indices { cursors[i].acknowledge(high[i]) }
+            acknowledgeReadyEvents()
             lock.withLock { status.appliedEvents = positions() }
         }
         for i in crossed { scanBarriers.removeValue(forKey: i) }
-        finishReplayIfReady()
+        if !force { finishReplayIfReady() }
+    }
+
+    private func acknowledgeReadyEvents() {
+        let floors = directories.floors()
+        let time = DispatchTime.now().uptimeNanoseconds
+        for i in cursors.indices {
+            var applied = deliveredHigh[i]
+            if let floor = floors[i] {
+                applied = applied.flatMap { floor > 1 ? min($0, floor - 1) : nil }
+            } else {
+                deliveredHigh[i] = nil
+            }
+            cursors[i].acknowledge(applied, at: time)
+        }
     }
 
     private func reconcile(_ initial: [String: Bool], in index: inout LiveIndex) throws {
@@ -553,7 +654,8 @@ public final class ChangeTracker {
             }
         }
         dm_release_allocator_cache()
-        index.prepare()
+        index.tightenScannedStorage()
+        dm_release_allocator_cache()
         publish(LiveIndex(base: index, root: root), changed: true)
         try markScanBoundary(for: affected)
         needsBaseWrite = true
@@ -578,8 +680,8 @@ public final class ChangeTracker {
         guard snapshotStatus().error == nil, !paused, batches.isEmpty else { return }
         needsReplay = needsReplay.filter { !cursors[$0].historyDelivered }
         guard needsReplay.isEmpty, scanBarriers.isEmpty, degraded.isEmpty else { return }
-        if needsBaseWrite {
-            do { try persistBase(); needsBaseWrite = false }
+        if needsBaseWrite, directories.count == 0 {
+            do { try persistPendingBase() }
             catch { fail(error); return }
         }
         if snapshotStatus().phase != "caught-up" {
@@ -599,14 +701,68 @@ public final class ChangeTracker {
     }
 
     private func checkpoints() -> [VolumeCheckpoint] {
-        zip(identities, cursors).map { volume, cursor in
-            // The daemon may have delivered newer IDs than are presently in
-            // its disk journal. Replay from the conservative processed prefix.
-            let durable = cursor.applied.flatMap { applied in
-                volume.observedBoundary().map { min($0, applied) }
+        var pending = directories.floors()
+        for batch in batches where batch.epoch == epochs[batch.volume] {
+            for event in batch.events where !event.historyDone && event.id != .max {
+                pending[batch.volume] = min(pending[batch.volume] ?? .max, event.id)
             }
-            return volume.checkpoint(durable)
         }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return identities.enumerated().map { i, volume in
+            let safe = !volume.readOnly && !overflowed.contains(i)
+                ? cursors[i].lag.position(at: now, observed: volume.observedBoundary(), pending: pending[i])
+                : nil
+            return volume.checkpoint(safe)
+        }
+    }
+
+    private func allowAutomaticWrite() -> Bool {
+        let now = wallTime()
+        let next = budget.next(at: now)
+        lock.withLock { status.automaticBaseWritesInWindow = budget.count(at: now) }
+        guard let next, next <= now else {
+            lock.withLock { status.baseWriteDeferred = true }
+            if let next { scheduleQuotaCheck(at: next) }
+            return false
+        }
+        return true
+    }
+
+    private func scheduleQuotaCheck(at time: TimeInterval) {
+        guard !closed, quotaCheck != time else { return }
+        quotaCheck = time
+        let delay = max(0.1, time - wallTime())
+        update.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.closed, self.quotaCheck == time else { return }
+            self.quotaCheck = nil
+            guard !self.paused, self.batches.isEmpty, self.directories.count == 0 else {
+                self.scheduleQuotaCheck(at: self.wallTime() + 1)
+                return
+            }
+            self.finishReplayIfReady()
+            self.scheduleCompaction()
+        }
+    }
+
+    private func reserveAutomaticWrite() -> Bool {
+        guard allowAutomaticWrite() else { return false }
+        do { return try budget.reserve(at: wallTime()) }
+        catch {
+            budget.preventWrites()
+            lock.withLock {
+                status.baseWriteDeferred = true
+                status.automaticBaseWritesInWindow = BaseWriteBudget.limit
+            }
+            return false
+        }
+    }
+
+    private func persistPendingBase(onExit: Bool = false) throws {
+        guard needsBaseWrite, needsReplay.isEmpty, scanBarriers.isEmpty, degraded.isEmpty else { return }
+        if !firstBaseWrite, !reserveAutomaticWrite() { return }
+        try persistBase(onExit: onExit)
+        needsBaseWrite = false
+        firstBaseWrite = false
     }
 
     private func durablePositions(_ volumes: [VolumeCheckpoint]) -> [String: UInt64] {
@@ -628,7 +784,7 @@ public final class ChangeTracker {
 
     private func persistBase(beforeReplace: (() throws -> Void)? = nil,
                              afterReplace: (() throws -> Void)? = nil,
-                             replacement: LiveIndex? = nil) throws {
+                             replacement: LiveIndex? = nil, onExit: Bool = false) throws {
         guard let index = replacement ?? current else { return }
         var archive = index.archive()
         archive.volumes = checkpoints()
@@ -642,7 +798,14 @@ public final class ChangeTracker {
         didSave(index.journalImage(at: durablePositions(archive.volumes)))
         lock.withLock {
             status.baseWrites += 1
-            status.baseWrittenBytes += bytes?.uint64Value ?? 0
+            let size = bytes?.uint64Value ?? 0
+            status.baseWrittenBytes += size
+            status.automaticBaseWritesInWindow = budget.count(at: wallTime())
+            status.baseWriteDeferred = false
+            if onExit {
+                status.exitBaseWrites += 1
+                status.exitBaseWrittenBytes += size
+            }
             status.journalWrittenBytes += UInt64(initialized)
         }
     }
@@ -683,6 +846,7 @@ public final class ChangeTracker {
               let original = current,
               original.state.changes.count >= Self.compactionRows || (journal?.length ?? 0) >= Self.compactionBytes
         else { return }
+        guard allowAutomaticWrite() else { return }
         let token = compactionToken
         let started = DispatchTime.now().uptimeNanoseconds
         duringCompaction = [:]
@@ -701,6 +865,11 @@ public final class ChangeTracker {
                     var replacement = LiveIndex(base: base, root: self.root)
                     try self.reconcile(work, in: &replacement)
                     replacement.prepareDelta()
+                    guard self.reserveAutomaticWrite() else {
+                        self.lock.withLock { self.status.compacting = false }
+                        self.drain()
+                        return
+                    }
                     try self.persistBase(replacement: replacement)
                     self.lock.withLock {
                         self.status.compacting = false
@@ -752,12 +921,16 @@ public final class ChangeTracker {
     }
 
     public func stop() throws {
-        synchronize()
+        update.sync { for stream in sources.values { stream.flush() } }
         try update.sync {
+            drain(force: true)
             for stream in sources.values { stream.stop() }
             sources.removeAll()
             closed = true
-            if snapshotStatus().error == nil { try flushJournal() }
+            if snapshotStatus().error == nil {
+                if needsBaseWrite { try persistPendingBase(onExit: true) }
+                else { try flushJournal() }
+            }
         }
     }
 
@@ -790,6 +963,14 @@ public final class ChangeTracker {
         update.sync {
             guard let i = identities.firstIndex(where: { !$0.readOnly }) else { return }
             overflowed.insert(i)
+            drain()
+        }
+    }
+
+    func deliverForTesting(_ events: [VolumeEvent]) {
+        update.sync {
+            guard let i = identities.firstIndex(where: { !$0.readOnly }) else { return }
+            enqueue(EventBatch(volume: i, epoch: epochs[i], events: events))
             drain()
         }
     }

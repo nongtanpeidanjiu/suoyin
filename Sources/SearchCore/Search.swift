@@ -71,6 +71,13 @@ struct PreparedSearch {
     }
 }
 
+private extension Array {
+    mutating func removeSpareCapacity() {
+        guard capacity - count > 64 else { return }
+        self = withUnsafeBufferPointer { Array($0) }
+    }
+}
+
 extension SearchIndex {
     func storageBreakdown() -> [String: Int] {
         let keyBytes = prepared.map { $0.keyBytes.capacity + 4 * ($0.keyOffsets.capacity + $0.changedRows.capacity) } ?? 0
@@ -82,6 +89,20 @@ extension SearchIndex {
             "names": names.capacity, "foldedKeys": keyBytes, "sortTables": order,
             "suppressedRows": suppressed.capacity,
         ]
+    }
+
+    mutating func tightenScannedStorage() {
+        records.removeSpareCapacity()
+        attributes.removeSpareCapacity()
+        names.removeSpareCapacity()
+        prepare()
+        prepared?.keyBytes.removeSpareCapacity()
+        prepared?.keyOffsets.removeSpareCapacity()
+        prepared?.changedRows.removeSpareCapacity()
+        prepared?.nameOrder.removeSpareCapacity()
+        prepared?.pathOrder.removeSpareCapacity()
+        prepared?.sizeOrder.removeSpareCapacity()
+        prepared?.modifiedOrder.removeSpareCapacity()
     }
 
     /// Materialize shared folded keys and exact sort permutations for this index value.

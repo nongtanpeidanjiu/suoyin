@@ -11,8 +11,9 @@ from measure import RSS_LIMIT, STALL_SECONDS
 
 
 class TrackClient:
-    def __init__(self, cli, root, snapshot, own, log, gate=False):
+    def __init__(self, cli, root, snapshot, own, log, gate=False, record_query_rows=True):
         self.started = time.monotonic_ns()
+        self.record_query_rows = record_query_rows
         self.log = open(log, "a", encoding="utf-8")
         self.errors = open(str(log) + ".stderr", "ab")
         environment = dict(os.environ)
@@ -24,6 +25,7 @@ class TrackClient:
             bufsize=0, env=environment,
         )
         self.maximum = 0
+        self.window_rss = None
         self.stop_reason = None
         self.buffer = bytearray()
         self.monitor = threading.Thread(target=self.watch, daemon=True)
@@ -41,7 +43,11 @@ class TrackClient:
                 previous = time.monotonic()
                 value = ps.stdout.strip()
                 if value:
-                    self.maximum = max(self.maximum, int(value) * 1024)
+                    rss = int(value) * 1024
+                    self.maximum = max(self.maximum, rss)
+                    window = self.window_rss
+                    if window is not None:
+                        self.window_rss = max(window, rss)
                 if elapsed <= STALL_SECONDS and self.maximum <= RSS_LIMIT:
                     time.sleep(.1)
                     continue
@@ -66,7 +72,12 @@ class TrackClient:
         end = self.buffer.index(10)
         row = json.loads(self.buffer[:end])
         del self.buffer[:end + 1]
-        self.log.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if not self.record_query_rows and row["event"] == "query":
+            logged = {key: value for key, value in row.items() if key != "rows"}
+            logged["rowsCount"] = len(row["rows"])
+        else:
+            logged = row
+        self.log.write(json.dumps(logged, ensure_ascii=False) + "\n")
         self.log.flush()
         if row["event"] == "error":
             raise RuntimeError(row["status"]["error"])

@@ -29,8 +29,9 @@ def from_search(rows):
     return {item["path"]: (item["size"], item["modified"]) for item in rows}
 
 
-def converge(tracker, expected, timeout=10):
-    until = time.monotonic() + timeout
+def converge(tracker, expected, timeout=33):
+    start = time.monotonic()
+    until = start + timeout
     last = None
     while time.monotonic() < until:
         last = tracker.call("query", limit=max(len(expected) + 100, 200))
@@ -39,7 +40,7 @@ def converge(tracker, expected, timeout=10):
         if rows == expected:
             last["referenceReceivedAt"] = received_at
             return last
-        time.sleep(.025)
+        time.sleep(.025 if time.monotonic() - start < 2 else .25)
     differences = [(path, expected.get(path), rows.get(path))
                    for path in rows.keys() | expected.keys() if rows.get(path) != expected.get(path)]
     raise AssertionError(f"did not converge: {len(differences)} differences, sample={differences[:4]}, status={last['status']}")
@@ -65,11 +66,21 @@ def exercise(cli, directory):
     (tree / "a").mkdir()
     (tree / "b").mkdir()
     (tree / "a" / "ready.tmp").touch()
+    for i in range(3):
+        for label in ("create", "delete", "rename", "cross-from", "cross-to", "move-from", "move-to"):
+            (tree / f"{label}-{i}").mkdir()
+        for label in ("delete", "rename", "cross-from"):
+            (tree / f"{label}-{i}" / "before.tmp").touch()
+        source = tree / f"move-from-{i}" / "folder"
+        source.mkdir()
+        (source / "deep.tmp").touch()
+    for label in ("batch", "frequent", ".hidden"):
+        (tree / label).mkdir()
     for i in range(2100):
         (tree / f"seed-{i:05}.tmp").touch()
     summary = {"iterations": []}
     log = directory / "transcript.tmp"
-    tracker = TrackClient(cli, tree, snap, store, log, gate=True)
+    tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False, gate=True)
     maximums = []
     try:
         partial = tracker.wait("scan-partial")
@@ -113,22 +124,35 @@ def exercise(cli, directory):
             return 1
 
         for i in range(3):
-            at = tree / "a" / f"m{i}.tmp"
-            renamed = tree / "a" / f"renamed-{i}.tmp"
-            destination = tree / "b" / f"relocated-{i}.tmp"
-            measure("create", lambda: touch(at))
-            measure("rename", lambda: move(at, renamed))
-            measure("cross", lambda: move(renamed, destination))
-            measure("delete", lambda: remove(destination))
-            source = tree / "a" / f"folder-{i}"
-            source.mkdir()
-            (source / "deep.tmp").touch()
+            measure("create", lambda: touch(tree / f"create-{i}" / "new.tmp"))
+            before = tree / f"rename-{i}" / "before.tmp"
+            measure("rename", lambda: move(before, before.with_name("after.tmp")))
+            measure("cross", lambda: move(tree / f"cross-from-{i}" / "before.tmp",
+                                          tree / f"cross-to-{i}" / "after.tmp"))
+            measure("delete", lambda: remove(tree / f"delete-{i}" / "before.tmp"))
+            measure("move-directory", lambda: move(tree / f"move-from-{i}" / "folder",
+                                                   tree / f"move-to-{i}" / "folder"))
+
+        delays = {}
+        for folder in ("frequent", ".hidden"):
+            marker = tree / folder / f"r7-timing-{folder.lstrip('.')}.tmp"
+            touch(marker)
             converge(tracker, tree_rows(tree, store))
-            measure("move-directory", lambda: move(source, tree / "b" / source.name))
+            marker.write_bytes(b"changed")
+            start = time.monotonic()
+            while time.monotonic() - start < 30:
+                row = tracker.call("query", query=marker.name, limit=2)
+                if from_search(row["rows"]).get(str(marker)) == (len(b"changed"), marker.lstat().st_mtime_ns):
+                    break
+                time.sleep(.05)
+            elapsed = time.monotonic() - start
+            assert elapsed < 30, (folder, elapsed)
+            converge(tracker, tree_rows(tree, store))
+            delays[folder] = dict(milliseconds=elapsed * 1000, equal=True)
+        summary["throttled"] = delays
 
         def bulk():
             folder = tree / "batch"
-            folder.mkdir()
             for i in range(10000):
                 (folder / f"row-{i:05}.tmp").touch()
             return 10000
@@ -168,7 +192,7 @@ def exercise(cli, directory):
         maximums.append(tracker.finish(kill=True))
         assert fingerprint(snap) == fingerprint_at_hold
         time.sleep(.25)
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         checkpoint_ready = tracker.wait("ready")
         assert checkpoint_ready["status"]["recovery"] == "replay"
         tracker.wait("caught-up")
@@ -182,7 +206,7 @@ def exercise(cli, directory):
         (tree / "ready-offline.tmp").touch()
         (tree / "a" / "ready.tmp").rename(tree / "b" / "offline-renamed.tmp")
         time.sleep(.25)
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         cached = tracker.wait("ready")
         tracker.wait("caught-up")
         recovered = converge(tracker, tree_rows(tree, store))
@@ -197,7 +221,7 @@ def exercise(cli, directory):
         tracker.call("pause-before-replace", expected="before-replace")
         maximums.append(tracker.finish(kill=True))
         assert fingerprint(snap) == old_archive
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         tracker.wait("ready")
         tracker.wait("caught-up")
         converge(tracker, tree_rows(tree, store))
@@ -211,7 +235,7 @@ def exercise(cli, directory):
         tracker.call("pause-after-replace", expected="after-replace")
         maximums.append(tracker.finish(kill=True))
         assert fingerprint(snap) != old_archive and fingerprint(journal) == old_journal
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         ready = tracker.wait("ready")
         tracker.wait("caught-up")
         converge(tracker, tree_rows(tree, store))
@@ -259,7 +283,7 @@ def exercise(cli, directory):
                 journal.unlink()
             else:
                 journal.write_bytes(payload)
-            tracker = TrackClient(cli, tree, snap, store, log)
+            tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
             ready = tracker.wait("ready")
             tracker.wait("caught-up")
             converge(tracker, tree_rows(tree, store))
@@ -269,7 +293,7 @@ def exercise(cli, directory):
             summary["journalFaults"][name] = dict(recovery=behavior, validPrefix=restored, replayEqual=True)
             maximums.append(tracker.finish())
 
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         tracker.wait("ready")
         tracker.wait("caught-up")
         tracker.call("hold")
@@ -291,7 +315,7 @@ def exercise(cli, directory):
         data = bytearray(snap.read_bytes())
         data[-1] ^= 1
         snap.write_bytes(data)
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         corrupted = tracker.wait("ready")
         tracker.wait("caught-up")
         assert corrupted["status"]["recovery"] == "corrupt"
@@ -305,7 +329,7 @@ def exercise(cli, directory):
         for i in range(12000):
             (offline_tree / f"entry-{i:05}.tmp").touch()
         expected = tree_rows(tree, store)
-        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker = TrackClient(cli, tree, snap, store, log, record_query_rows=False)
         initialized = tracker.wait("ready")
         caught = tracker.wait("caught-up")
         converge(tracker, expected)

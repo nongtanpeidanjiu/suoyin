@@ -34,7 +34,8 @@ struct TrackingTests {
         cursor.acknowledge(113)
         #expect(cursor.applied == 113)
         let regressed = cursor.received(VolumeEvent(path: "c", id: 101, flags: 0))
-        #expect(!regressed)
+        #expect(regressed && cursor.outOfOrderBatches == 1)
+        #expect(cursor.lastSeen == 129 && cursor.maximumRegression == 28)
     }
 
     @Test func historyDoneDoesNotCommitAndDroppedInvalidates() {
@@ -207,6 +208,201 @@ struct TrackingTests {
         fresh.append("new.txt", parent: newUsers)
         let result = mergeDataVolume(old: LiveIndex(base: old, root: "/"), new: fresh, targets: ["/Users"])
         #expect(Set(result.restoredRows().map(\.path)) == ["/sealed", "/Users", "/Users/new.txt"])
+    }
+
+    @Test func lagAgesAppliedPositionsAndCannotOvertakeDeferredWork() {
+        let second = ReplayLag.second
+        var cursor = EventCursor(applied: 100)
+        cursor.acknowledge(130, at: 20 * second)
+        cursor.acknowledge(150, at: 22 * second)
+        #expect(cursor.lag.position(at: 29 * second, observed: 180, pending: nil) == 100)
+        #expect(cursor.lag.position(at: 30 * second, observed: 180, pending: nil) == 130)
+        #expect(cursor.lag.position(at: 32 * second, observed: 142, pending: nil) == 142)
+        #expect(cursor.lag.position(at: 32 * second, observed: 180, pending: 128) == 127)
+        #expect(cursor.lag.position(at: 32 * second, observed: nil, pending: nil) == nil)
+    }
+
+    @Test func delayedDirectoriesKeepEarliestEventAndSettleOnDeadline() {
+        let second = ReplayLag.second
+        var schedule = DirectorySchedule()
+        func request(_ event: UInt64) -> DirectoryUpdate {
+            DirectoryUpdate(recursive: true, pending: [0: event])
+        }
+        schedule.enqueue(request(100), at: "visible", hidden: false, now: 90 * second)
+        #expect(schedule.take(at: 90 * second, force: false).count == 1)
+        schedule.enqueue(request(150), at: "visible", hidden: false, now: 91 * second)
+        schedule.enqueue(request(140), at: "visible", hidden: false, now: 92 * second)
+        #expect(schedule.next == 95 * second)
+        #expect(schedule.floors() == [0: 140])
+        #expect(schedule.take(at: 94 * second, force: false).isEmpty)
+        #expect(schedule.take(at: 95 * second, force: false).count == 1)
+        schedule.enqueue(request(151), at: "visible", hidden: false, now: 96 * second)
+        #expect(schedule.next == 105 * second)
+        _ = schedule.take(at: 105 * second, force: false)
+        schedule.enqueue(request(152), at: "visible", hidden: false, now: 106 * second)
+        #expect(schedule.next == 125 * second)
+        _ = schedule.take(at: 125 * second, force: false)
+        schedule.enqueue(request(153), at: "visible", hidden: false, now: 126 * second)
+        #expect(schedule.next == 155 * second)
+        _ = schedule.take(at: 155 * second, force: false)
+        schedule.enqueue(request(154), at: "visible", hidden: false, now: 216 * second)
+        #expect(schedule.next == 216 * second)
+        _ = schedule.take(at: 216 * second, force: false)
+        schedule.enqueue(request(101), at: "hidden", hidden: true, now: 216 * second)
+        _ = schedule.take(at: 216 * second, force: false)
+        schedule.enqueue(request(102), at: "hidden", hidden: true, now: 217 * second)
+        #expect(schedule.next == 246 * second)
+        #expect(schedule.take(at: 218 * second, force: true).count == 1)
+        #expect(schedule.floors().isEmpty)
+    }
+
+    @Test func writeBudgetSurvivesNewOwnerAndUsesRollingWindow() throws {
+        let dir = try scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("index").path
+        var first = BaseWriteBudget(snapshot: path)
+        #expect(try first.reserve(at: 100))
+        #expect(try first.reserve(at: 200))
+        var restarted = BaseWriteBudget(snapshot: path)
+        #expect(restarted.count(at: 300) == 2)
+        #expect(try !restarted.reserve(at: 300))
+        #expect(restarted.next(at: 300) == 100 + BaseWriteBudget.window)
+        #expect(try restarted.reserve(at: 100 + BaseWriteBudget.window))
+        #expect(try !restarted.reserve(at: 150 + BaseWriteBudget.window))
+        try Data("invalid".utf8).write(to: URL(fileURLWithPath: path + ".budget"))
+        var corrupted = BaseWriteBudget(snapshot: path)
+        #expect(try !corrupted.reserve(at: 1_000_000))
+    }
+
+    @Test func scannedStorageCompactsWithoutChangingSearchRows() {
+        var index = SearchIndex()
+        index.reserve(10_000, nameBytes: 100_000)
+        let root = index.append("/fixture", attribute: Kind.anchor)
+        index.append("Abc", parent: root, size: 4, modified: 9)
+        let original = index.directSearch("abc")
+        index.tightenScannedStorage()
+        #expect(index.records.capacity < 100)
+        #expect(index.attributes.capacity < 100)
+        #expect(index.names.capacity < 100)
+        #expect(index.search("abc") == original)
+    }
+
+    @Test func lateBatchAppliesAndOnlyDroppedEventsRebuildTheSubscription() throws {
+        let fixture = try scratch()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let own = fixture.appendingPathComponent("owned")
+        let local = fixture.appendingPathComponent("local")
+        let sibling = fixture.appendingPathComponent("sibling")
+        for dir in [own, local, sibling] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let path = own.appendingPathComponent("index.tmp").path
+        let tracker = try ChangeTracker(root: fixture.path, snapshot: path, ownData: own.path)
+        tracker.start()
+        defer { try? tracker.stop() }
+        try awaitStatus(tracker) { $0.phase == "caught-up" }
+
+        let flag = UInt32(kFSEventStreamEventFlagMustScanSubDirs)
+        let marker = local.appendingPathComponent("late-applied.tmp")
+        try Data([1, 2, 3]).write(to: marker)
+        let observed = tracker.snapshotStatus().appliedEvents.values.max() ?? 1
+        tracker.deliverForTesting([VolumeEvent(path: sibling.path, id: observed + 20_000, flags: flag)])
+        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 19_999, flags: flag)])
+        try awaitStatus(tracker) { $0.outOfOrderBatches > 0 && !tracker.search("late-applied").isEmpty }
+        #expect(tracker.snapshotStatus().rebuilds == 0)
+        #expect(tracker.search("late-applied").first?.size == 3)
+        #expect(tracker.snapshotStatus().recursiveDirectoriesObserved > 0)
+
+        let dropped = UInt32(kFSEventStreamEventFlagKernelDropped)
+        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 20_001, flags: flag | dropped)])
+        try awaitStatus(tracker) { $0.rebuilds == 1 && $0.phase == "caught-up" }
+        #expect(tracker.search("late-applied").map(\.path) == [marker.path])
+        let userDropped = UInt32(kFSEventStreamEventFlagUserDropped)
+        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 20_002, flags: flag | userDropped)])
+        #expect(tracker.snapshotStatus().phase == "degraded")
+        #expect(tracker.snapshotStatus().rebuilds == 1)
+    }
+
+    private final class WallClock {
+        private let lock = NSLock()
+        private var value: TimeInterval = 300
+        private var started: Date?
+
+        func read() -> TimeInterval {
+            lock.withLock { value + (started.map { Date().timeIntervalSince($0) } ?? 0) }
+        }
+
+        func set(_ time: TimeInterval, ticking: Bool = false) {
+            lock.withLock {
+                value = time
+                started = ticking ? Date() : nil
+            }
+        }
+    }
+
+    @Test(arguments: ["frozen", "exit", "idle"])
+    func exhaustedBudgetFreezesDiskButDoesNotFreezeTheRebuiltView(mode: String) throws {
+        let fixture = try scratch()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let own = fixture.appendingPathComponent("owned")
+        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        let snapshot = own.appendingPathComponent("index.tmp")
+        let journal = URL(fileURLWithPath: snapshot.path + ".changes")
+        var budget = BaseWriteBudget(snapshot: snapshot.path)
+        #expect(try budget.reserve(at: 100))
+        #expect(try budget.reserve(at: 200))
+        let clock = WallClock()
+        let idle = mode == "idle"
+        let second = try ChangeTracker(root: fixture.path, snapshot: snapshot.path,
+                                       ownData: own.path, wallTime: { clock.read() })
+        second.start()
+        defer { try? second.stop() }
+        try awaitStatus(second) { $0.phase == "caught-up" }
+        let initialWrites = second.snapshotStatus().baseWrites
+        let baseline = try Data(contentsOf: snapshot)
+        let prefix = try Data(contentsOf: journal)
+        if idle { clock.set(100 + BaseWriteBudget.window - 5, ticking: true) }
+        second.holdUpdates(true)
+        let changed = fixture.appendingPathComponent("changed-live.tmp")
+        try Data([8]).write(to: changed)
+        second.simulateDroppedHistory()
+        second.holdUpdates(false)
+        try awaitStatus(second) { $0.phase == "caught-up" && $0.baseWriteDeferred }
+        #expect(second.search("changed-live").map(\.path) == [changed.path])
+        try second.save()
+        #expect(second.snapshotStatus().baseWrites == initialWrites)
+        #expect(try Data(contentsOf: snapshot) == baseline)
+        #expect(try Data(contentsOf: journal) == prefix)
+
+        if mode == "exit" {
+            second.holdUpdates(true)
+            clock.set(100 + BaseWriteBudget.window)
+        } else if idle {
+            try awaitStatus(second) { $0.baseWrites == initialWrites + 1 && !$0.baseWriteDeferred }
+        }
+        try second.stop()
+        let result = second.snapshotStatus()
+        #expect(result.baseWrites == initialWrites + (mode == "frozen" ? 0 : 1))
+        #expect(result.exitBaseWrites == (mode == "exit" ? 1 : 0))
+        if mode != "frozen" {
+            let persisted = try SearchIndex.load(from: snapshot.path)
+            #expect(persisted.restoredRows().map(\.path).contains(changed.path))
+            #expect(result.automaticBaseWritesInWindow == 2)
+        }
+    }
+
+    private func awaitStatus(_ tracker: ChangeTracker,
+                             _ ready: (TrackingStatus) -> Bool) throws {
+        let end = Date().addingTimeInterval(9)
+        while Date() < end {
+            let status = tracker.snapshotStatus()
+            if ready(status) { return }
+            if status.error != nil { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        let latest = tracker.snapshotStatus()
+        Issue.record("Unexpected tracking phase: \(latest.phase) / \(latest.recovery) / \(latest.invalidEvidence ?? "-") / \(latest.error ?? "no error")")
+        throw CocoaError(.fileReadUnknown)
     }
 
     private func scratch() throws -> URL {

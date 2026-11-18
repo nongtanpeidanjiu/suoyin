@@ -90,19 +90,25 @@ def window(first, last):
                 extrapolatedProcessBytesPerDay=disk * 86400 / wall,
                 extrapolatedNetGrowthPerDay=growth * 86400 / wall,
                 events=stop["receivedEvents"] - start["receivedEvents"],
-                batches=stop["appliedBatches"] - start["appliedBatches"])
+                batches=stop["appliedBatches"] - start["appliedBatches"],
+                rebuilds=stop.get("rebuilds", 0) - start.get("rebuilds", 0),
+                outOfOrderBatches=stop.get("outOfOrderBatches", 0) - start.get("outOfOrderBatches", 0),
+                maximumEventRegression=stop.get("maximumEventRegression", 0))
 
 
-def idle(tracker, seconds, snapshot):
+def idle(tracker, seconds, snapshot, write_cap):
     tracker.call("save")
     before = dict(load=os.getloadavg(), files=file_bytes(snapshot), **tracker.call("status"))
+    if before["processMetrics"]["processWrittenBytes"] >= write_cap:
+        raise RuntimeError("Startup approached the measurement write limit")
+    tracker.window_rss = before["residentBytes"]
     observations = [before]
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(min(10, deadline - time.monotonic()))
         row = dict(load=os.getloadavg(), files=file_bytes(snapshot), **tracker.call("status"))
         observations.append(row)
-        if row["processMetrics"]["processWrittenBytes"] - before["processMetrics"]["processWrittenBytes"] >= 4_500_000_000:
+        if row["processMetrics"]["processWrittenBytes"] >= write_cap:
             raise RuntimeError("Stopped before approaching the measurement write limit")
 
     def summarized(rows):
@@ -115,6 +121,8 @@ def idle(tracker, seconds, snapshot):
         cutoff = next(i for i, row in enumerate(observations)
                       if row["time"] - before["time"] >= 300_000_000_000)
         result["firstFiveMinutes"] = summarized(observations[:cutoff + 1])
+    result["maxResidentBytesWatched"] = tracker.window_rss
+    tracker.window_rss = None
     result["observations"] = observations
     return result
 
@@ -127,15 +135,18 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=int, default=300)
     parser.add_argument("--idle-only", action="store_true")
     parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--write-cap", type=int, default=4_500_000_000)
+    parser.add_argument("--caught-up-timeout", type=int, default=70)
     args = parser.parse_args()
     state = args.state.resolve()
     tree = args.tree.resolve()
-    for name in ("controls", "mutable"):
-        (tree / name).mkdir(parents=True, exist_ok=True)
-    for i in range(40):
-        control = tree / "controls" / f"r6stable-{tree.name}-{i:02}.tmp"
-        if not control.exists():
-            control.touch()
+    if not args.idle_only:
+        for name in ("controls", "mutable"):
+            (tree / name).mkdir(parents=True, exist_ok=True)
+        for i in range(40):
+            control = tree / "controls" / f"r6stable-{tree.name}-{i:02}.tmp"
+            if not control.exists():
+                control.touch()
 
     with (state / "live-command.json").open("w") as f:
         json.dump(dict(scope="/", state=str(state), tree=str(tree), seconds=args.seconds), f)
@@ -143,10 +154,10 @@ if __name__ == "__main__":
     tracker = TrackClient(args.cli, "/", snapshot, state, state / "full-transcript.tmp")
     try:
         ready = tracker.wait("ready", timeout=55)
-        tracker.wait("caught-up", timeout=70)
+        tracker.wait("caught-up", timeout=args.caught_up_timeout)
         if not args.idle_only:
             write_summary(state / "overlap.json", overlap(tracker, tree))
-        result = idle(tracker, args.seconds, snapshot)
+        result = idle(tracker, args.seconds, snapshot, args.write_cap)
         result["startup"] = ready
         result["peakMonitoredRSS"] = tracker.maximum
         result["normalExit"] = False

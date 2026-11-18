@@ -60,9 +60,21 @@ struct VolumeIdentity {
         readOnly = info.f_flags & UInt32(MNT_RDONLY) != 0
     }
 
-    func observedBoundary() -> UInt64? {
-        let number = FSEventsGetLastEventIdForDeviceBeforeTime(device, Date().timeIntervalSince1970)
+    func observedBoundary(before time: TimeInterval = Date().timeIntervalSince1970) -> UInt64? {
+        let number = FSEventsGetLastEventIdForDeviceBeforeTime(device, time)
         return number == 0 || number == UInt64.max ? nil : number
+    }
+
+    func scanReplayBaseline() -> UInt64? {
+        observedBoundary(before: Date().timeIntervalSince1970 - 10)
+    }
+
+    func relativeScope(_ path: String) -> String {
+        if path == mount { return "" }
+        if mount != "/", path.hasPrefix(mount + "/") {
+            return String(path.dropFirst(mount.count + 1))
+        }
+        return String(path.drop(while: { $0 == "/" }))
     }
 
     func checkpoint(_ event: UInt64?) -> VolumeCheckpoint {
@@ -84,7 +96,7 @@ final class VolumeEventStream {
     let volume: VolumeIdentity
     let deliver: ([VolumeEvent]) -> Void
 
-    init(volume: VolumeIdentity, since: UInt64?, deliver: @escaping ([VolumeEvent]) -> Void) throws {
+    init(volume: VolumeIdentity, since: UInt64?, scope: String, deliver: @escaping ([VolumeEvent]) -> Void) throws {
         self.volume = volume
         self.deliver = deliver
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
@@ -102,7 +114,7 @@ final class VolumeEventStream {
                     batch.append(VolumeEvent(path: path, id: ids[i], flags: flags[i]))
                 }
                 source.deliver(batch)
-            }, &context, volume.device, [""] as CFArray, since ?? UInt64.max, 0.12, flags)
+            }, &context, volume.device, [scope] as CFArray, since ?? UInt64.max, 0.12, flags)
         else { throw ScanError.listener(root: volume.root) }
         FSEventStreamSetDispatchQueue(value, queue)
         guard FSEventStreamStart(value) else {
@@ -135,14 +147,17 @@ struct EventCursor {
     private(set) var historyDelivered = false
     private let replaying: Bool
     private var pendingHistory: UInt64?
+    private(set) var lag: ReplayLag
+    private(set) var outOfOrderBatches: UInt64 = 0
+    private(set) var maximumRegression: UInt64 = 0
 
-    init(applied: UInt64?, replaying: Bool = false) {
+    init(applied: UInt64?, replaying: Bool = false, scanBaseline: UInt64? = nil) {
         self.applied = applied
         self.replaying = replaying
+        lag = ReplayLag(baseline: applied ?? scanBaseline)
     }
 
-    /// A larger, nonconsecutive ID is normal. Regressions and invalidating
-    /// flags require a new baseline. The caller acknowledges after applying.
+    /// Gaps and late deliveries are diagnostic. Only invalidation requires recovery.
     mutating func received(_ event: VolumeEvent) -> Bool {
         receivedBatch([event])
     }
@@ -162,17 +177,23 @@ struct EventCursor {
             boundary = max(boundary ?? 0, event.id)
         }
         if let boundary {
-            if lastSeen.map({ boundary < $0 }) == true { return false }
-            lastSeen = boundary
+            if let lastSeen, boundary < lastSeen {
+                outOfOrderBatches += 1
+                maximumRegression = max(maximumRegression, lastSeen - boundary)
+            }
+            lastSeen = max(lastSeen ?? 0, boundary)
         }
         historyDelivered = done
         return true
     }
 
-    mutating func acknowledge(_ id: UInt64?) {
+    mutating func acknowledge(_ id: UInt64?, at time: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         if let id { pendingHistory = max(pendingHistory ?? 0, id) }
         if replaying && !historyDelivered { return }
-        if let safe = pendingHistory, applied.map({ safe > $0 }) ?? true { applied = safe }
+        if let safe = pendingHistory, applied.map({ safe > $0 }) ?? true {
+            applied = safe
+            lag.record(safe, at: time)
+        }
         pendingHistory = nil
     }
 }

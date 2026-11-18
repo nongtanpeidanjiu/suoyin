@@ -59,8 +59,9 @@ def first_page(snapshot):
         count, names, folded, changed, metadata_size, version = struct.unpack_from("<6I", data, 8)
         flag_start = 64 + count * ROW.size
         pool = flag_start + count
-        metadata_start = pool + names + 20 * count + 4 * changed + folded
-        assert version == 1 and metadata_start + metadata_size == len(data)
+        assert version in (1, 2)
+        metadata_start = pool + names + (20 if version == 1 else 8) * count + 4 * changed + folded
+        assert metadata_start + metadata_size == len(data)
         metadata = json.loads(data[metadata_start:])
         overlay, masks = journal_changes(snapshot, data[32:64], metadata)
 

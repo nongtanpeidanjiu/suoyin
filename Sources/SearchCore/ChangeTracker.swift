@@ -44,6 +44,7 @@ public struct TrackingStatus: Codable {
     public var directoriesObserved: UInt64 = 0
     public var recursiveDirectoriesObserved: UInt64 = 0
     public var directFilesObserved: UInt64 = 0
+    public var directDirectoriesObserved: UInt64 = 0
     public var error: String?
 }
 
@@ -64,8 +65,8 @@ public final class ChangeTracker {
     private let root: String
     private let scope: WalkScope
     private let path: String
-    private let ownDirectory: String
-    private let excluded: [String]
+    let ownDirectory: String
+    let excluded: [String]
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var view: LiveSearchView?
@@ -89,6 +90,7 @@ public final class ChangeTracker {
     private var budget: BaseWriteBudget
     private let wallTime: () -> TimeInterval
     private var directories = DirectorySchedule()
+    private var fileContents = FileContentSchedule()
     private var deliveredHigh: [Int: UInt64] = [:]
     private var directoryWake: UInt64?
     private var directoryTimer: DispatchSourceTimer?
@@ -119,16 +121,22 @@ public final class ChangeTracker {
          wallTime: @escaping () -> TimeInterval) throws {
         self.wallTime = wallTime
         budget = BaseWriteBudget(snapshot: snapshot)
-        let root = URL(fileURLWithPath: root).resolvingSymlinksInPath().standardizedFileURL.path
+        let root = try Self.canonicalPath(root)
         self.root = root
         self.path = snapshot
-        ownDirectory = URL(fileURLWithPath: ownData).resolvingSymlinksInPath().standardizedFileURL.path
+        ownDirectory = try Self.canonicalPath(ownData)
         let walk = try WalkScope(root: root)
         scope = walk
         excluded = Array(walk.privateScratch.filter { !inside(root, $0) }) +
             [ownDirectory].filter { !inside(root, $0) }
         identities = try (root == "/" ? ["/", dataRoot] : [root]).map { try VolumeIdentity(root: $0) }
         epochs = [UInt64](repeating: 0, count: identities.count)
+    }
+
+    private static func canonicalPath(_ path: String) throws -> String {
+        guard let resolved = realpath(path, nil) else { throw ScanError.metadata(path: path, error: errno) }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     public func start(onPhase: @escaping (String) -> Void = { _ in }) {
@@ -349,7 +357,7 @@ public final class ChangeTracker {
         }
     }
 
-    private func logicalPath(_ raw: String, volume: Int) -> String? {
+    func logicalPath(_ raw: String, volume: Int) -> String? {
         let mount = identities[volume].mount
         let relative = raw == mount ? "" : raw.hasPrefix(mount + "/") && mount != "/"
             ? String(raw.dropFirst(mount.count + 1))
@@ -367,7 +375,8 @@ public final class ChangeTracker {
         return suffix.isEmpty ? mount : joinedPath(mount, suffix)
     }
 
-    private func dirtyPaths(from events: [EventBatch]) -> ([String: DirectoryUpdate], [Int: UInt64], Set<Int>, Set<Int>) {
+    private func dirtyPaths(from events: [EventBatch], now: UInt64)
+        -> ([String: DirectoryUpdate], [Int: UInt64], Set<Int>, Set<Int>) {
         var work: [String: DirectoryUpdate] = [:]
         var high: [Int: UInt64] = [:]
         var reset = overflowed
@@ -375,13 +384,17 @@ public final class ChangeTracker {
         var late: UInt64 = 0
         var maximum: UInt64 = 0
 
-        func mark(_ path: String, event: VolumeEvent, volume: Int, recursive: Bool? = nil, file: String? = nil) {
+        func mark(_ path: String, event: VolumeEvent, volume: Int, recursive: Bool? = nil,
+                  file: String? = nil, metadata: Bool = false) {
             var item = work.removeValue(forKey: path) ?? DirectoryUpdate()
             item.add(event: event.id, volume: volume)
             if let recursive {
                 item.recursive = item.recursive == true || recursive
                 item.files.removeAll()
-            } else if let file, item.recursive == nil { item.files.insert(file) }
+            } else if item.recursive == nil {
+                if let file { item.files[file] = item.files[file] == true || event.structural }
+                item.metadata = item.metadata || metadata
+            }
             work[path] = item
         }
 
@@ -415,14 +428,19 @@ public final class ChangeTracker {
                 }
                 if event.recursive {
                     mark(path, event: event, volume: volume, recursive: true)
-                } else if event.leafFileChange, path != root {
-                    mark(parentPath(path), event: event, volume: volume, file: path)
-                } else {
-                    let folder = event.isDirectory && !event.structural ? path : parentPath(path)
-                    mark(inside(folder, root) ? folder : root, event: event, volume: volume, recursive: false)
-                    if event.isDirectory && event.structural && path != root {
+                } else if event.isDirectory || path == root {
+                    if event.structural && path != root {
+                        mark(parentPath(path), event: event, volume: volume, recursive: false)
                         mark(path, event: event, volume: volume, recursive: true)
+                    } else {
+                        mark(path, event: event, volume: volume, metadata: true)
                     }
+                } else if event.contentOnly {
+                    if !reset.contains(volume) {
+                        fileContents.enqueue(path, event: event.id, volume: volume, now: now)
+                    }
+                } else {
+                    mark(parentPath(path), event: event, volume: volume, file: path)
                 }
             }
         }
@@ -436,7 +454,7 @@ public final class ChangeTracker {
     }
 
     private func scheduleDirectoryWake() {
-        let next = directories.next
+        let next = [directories.next, fileContents.next].compactMap { $0 }.min()
         guard next != directoryWake else { return }
         directoryWake = next
         guard let next else {
@@ -461,7 +479,7 @@ public final class ChangeTracker {
 
     private func drain(force: Bool = false) {
         guard !closed, !paused, current != nil, snapshotStatus().error == nil,
-              !batches.isEmpty || !overflowed.isEmpty || directories.count > 0 else { return }
+              !batches.isEmpty || !overflowed.isEmpty || directories.count > 0 || fileContents.count > 0 else { return }
         if !force, duringCompaction != nil, (current?.state.changes.count ?? 0) >= 2 * Self.compactionRows,
            overflowed.isEmpty { return }
         let submitted = batches
@@ -469,10 +487,10 @@ public final class ChangeTracker {
         pendingEvents = 0
         lock.withLock { status.bufferedEvents = 0 }
         let before = cursors
-        let (observations, high, invalid, crossed) = dirtyPaths(from: submitted)
+        let now = DispatchTime.now().uptimeNanoseconds
+        let (observations, high, invalid, crossed) = dirtyPaths(from: submitted, now: now)
         var reset = invalid
         overflowed.removeAll()
-        let now = DispatchTime.now().uptimeNanoseconds
         let immediate = force || snapshotStatus().phase != "caught-up"
         if reset.isEmpty {
             for (path, item) in observations {
@@ -486,12 +504,14 @@ public final class ChangeTracker {
                 }
                 directories.enqueue(item, at: path, hidden: hidden, now: now)
             }
-            if directories.pendingItems > Self.pendingLimit, !immediate {
+            if directories.pendingItems + fileContents.count > Self.pendingLimit, !immediate {
                 reset.formUnion(directories.pendingVolumes)
+                reset.formUnion(fileContents.pendingVolumes)
             }
         }
         if !reset.isEmpty {
             directories.discard(volumes: reset)
+            fileContents.discard(volumes: reset)
             for volume in reset { deliveredHigh[volume] = nil }
             lock.withLock { status.deferredDirectories = directories.count }
             scheduleDirectoryWake()
@@ -536,27 +556,44 @@ public final class ChangeTracker {
         lock.withLock { status.receivedEvents += UInt64(submitted.reduce(0) { $0 + $1.events.count }) }
         for (volume, id) in high { deliveredHigh[volume] = max(deliveredHigh[volume] ?? 0, id) }
         let ready = directories.take(at: now, force: immediate)
-        lock.withLock { status.deferredDirectories = directories.count }
-        scheduleDirectoryWake()
+        var files = Dictionary(uniqueKeysWithValues: fileContents.take(at: now, force: immediate).map { ($0, false) })
         var work: [String: Bool] = [:]
-        var files = Set<String>()
+        var metadata = Set<String>()
         for (path, item) in ready {
             work[path] = item.recursive
-            files.formUnion(item.files)
+            if item.metadata { metadata.insert(path) }
+            files.merge(item.files) { $0 || $1 }
         }
-        if (!work.isEmpty || !files.isEmpty), var updated = current {
+        let directoriesToVerify = metadata
+        if (!work.isEmpty || !files.isEmpty || !metadata.isEmpty), var updated = current {
             current = nil
             let start = DispatchTime.now().uptimeNanoseconds
             lock.withLock { status.applying = true; status.lastApplyStart = start }
             do {
                 var work = work
                 var direct: UInt64 = 0
-                for path in files {
+                var directDirectories: UInt64 = 0
+                for (path, structural) in files {
                     let parent = parentPath(path)
+                    fileContents.observed(path, at: now)
                     if work[parent] != nil { continue }
-                    if updated.refreshFile(path, observation: { scope.observeFile(path, inherited: $0) }) {
+                    if updated.refreshFile(path, observation: { scope.observeEntry(path, inherited: $0) }) {
                         direct += 1
-                    } else { work[parent] = false }
+                        if structural { metadata.insert(parent) }
+                    } else {
+                        let target = observationAncestor(parent, in: &updated)
+                        if work[target] == nil { work[target] = false }
+                    }
+                }
+                for folder in metadata where work[folder] == nil {
+                    let verifyAccess = directoriesToVerify.contains(folder)
+                    if folder == root && !verifyAccess { continue }
+                    if updated.refreshDirectory(folder, observation: { scope.observeEntry(folder, inherited: $0, verifyAccess: verifyAccess) }) {
+                        if folder != root { directDirectories += 1 }
+                    } else {
+                        let target = observationAncestor(folder, in: &updated)
+                        if work[target] == nil { work[target] = false }
+                    }
                 }
                 try reconcile(work, in: &updated)
                 updated.prepareDelta()
@@ -564,10 +601,11 @@ public final class ChangeTracker {
                 publish(updated, changed: true)
                 recordDuringCompaction(work)
                 if duringCompaction != nil {
-                    for path in files {
+                    for path in files.keys {
                         let parent = parentPath(path)
                         if duringCompaction?[parent] == nil { duringCompaction?[parent] = false }
                     }
+                    recordDuringCompaction(Dictionary(uniqueKeysWithValues: metadata.map { ($0, false) }))
                 }
                 let end = DispatchTime.now().uptimeNanoseconds
                 lock.withLock {
@@ -575,6 +613,7 @@ public final class ChangeTracker {
                     status.lastApplyEnd = end
                     status.appliedBatches += 1
                     status.directFilesObserved += direct
+                    status.directDirectoriesObserved += directDirectories
                 }
                 applyTrace?.append(ApplyInterval(start: start, end: end))
                 scheduleSave()
@@ -585,7 +624,9 @@ public final class ChangeTracker {
                 fail(error)
             }
         }
-        if work.isEmpty, files.isEmpty {
+        lock.withLock { status.deferredDirectories = directories.count }
+        scheduleDirectoryWake()
+        if work.isEmpty, files.isEmpty, metadata.isEmpty {
             acknowledgeReadyEvents()
             lock.withLock { status.appliedEvents = positions() }
         }
@@ -593,8 +634,20 @@ public final class ChangeTracker {
         if !force { finishReplayIfReady() }
     }
 
+    private func observationAncestor(_ path: String, in index: inout LiveIndex) -> String {
+        var directory = path
+        while directory != root && index.entry(at: directory)?.directory != true {
+            directory = parentPath(directory)
+        }
+        return directory
+    }
+
+    private func pendingFloors() -> [Int: UInt64] {
+        directories.floors().merging(fileContents.floors(), uniquingKeysWith: min)
+    }
+
     private func acknowledgeReadyEvents() {
-        let floors = directories.floors()
+        let floors = pendingFloors()
         let time = DispatchTime.now().uptimeNanoseconds
         for i in cursors.indices {
             var applied = deliveredHigh[i]
@@ -700,7 +753,7 @@ public final class ChangeTracker {
         guard snapshotStatus().error == nil, !paused, batches.isEmpty else { return }
         needsReplay = needsReplay.filter { !cursors[$0].historyDelivered }
         guard needsReplay.isEmpty, scanBarriers.isEmpty, degraded.isEmpty else { return }
-        if needsBaseWrite, directories.count == 0 {
+        if needsBaseWrite, directories.count == 0, fileContents.count == 0 {
             do { try persistPendingBase() }
             catch { fail(error); return }
         }
@@ -721,7 +774,7 @@ public final class ChangeTracker {
     }
 
     private func checkpoints() -> [VolumeCheckpoint] {
-        var pending = directories.floors()
+        var pending = pendingFloors()
         for batch in batches where batch.epoch == epochs[batch.volume] {
             for event in batch.events where !event.historyDone && event.id != .max {
                 pending[batch.volume] = min(pending[batch.volume] ?? .max, event.id)
@@ -755,7 +808,7 @@ public final class ChangeTracker {
         update.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, !self.closed, self.quotaCheck == time else { return }
             self.quotaCheck = nil
-            guard !self.paused, self.batches.isEmpty, self.directories.count == 0 else {
+            guard !self.paused, self.batches.isEmpty, self.directories.count == 0, self.fileContents.count == 0 else {
                 self.scheduleQuotaCheck(at: self.wallTime() + 1)
                 return
             }

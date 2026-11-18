@@ -2,14 +2,54 @@ import Darwin
 import DarwinMetadata
 import Foundation
 
+/// Shared by published copies of the same immutable base records.
+final class ColumnOrders {
+    private static let idle: UInt64 = 300_000_000_000
+    private let lock = NSLock()
+    private var cached: [SearchColumn: (rows: [UInt32], lastUse: UInt64)] = [:]
+
+    var bytes: Int {
+        lock.withLock { cached.values.reduce(0) { $0 + 4 * $1.rows.capacity } }
+    }
+
+    func order(for column: SearchColumn, build: () -> [UInt32]?) -> [UInt32]? {
+        lock.withLock {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if let hit = cached[column], now - hit.lastUse < Self.idle {
+                cached[column]?.lastUse = now
+                return hit.rows
+            }
+            let needsWake = cached[column] == nil
+            guard let rows = build() else { return nil }
+            let finished = DispatchTime.now().uptimeNanoseconds
+            cached[column] = (rows, finished)
+            if needsWake { scheduleExpiry(column, at: finished + Self.idle) }
+            return rows
+        }
+    }
+
+    private func scheduleExpiry(_ column: SearchColumn, at deadline: UInt64) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline)) { [weak self] in
+            self?.expire(column, at: DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    func expire(_ column: SearchColumn, at now: UInt64) {
+        lock.withLock {
+            guard let lastUse = cached[column]?.lastUse else { return }
+            let expiry = lastUse + Self.idle
+            if now >= expiry { cached.removeValue(forKey: column) }
+            else { scheduleExpiry(column, at: expiry) }
+        }
+    }
+}
+
 struct PreparedSearch {
     var keyBytes: [UInt8] = []
     var keyOffsets: [UInt32]
     var changedRows: [UInt32] = []
     var nameOrder: [UInt32] = []
-    var pathOrder: [UInt32] = []
-    var sizeOrder: [UInt32] = []
-    var modifiedOrder: [UInt32] = []
+    let columnOrders = ColumnOrders()
 
     init(keyOffsets: [UInt32]) { self.keyOffsets = keyOffsets }
 
@@ -21,16 +61,13 @@ struct PreparedSearch {
                 let end = i + 1 == index.recordCount ? pool.count : Int(index.records[i + 1].offset)
                 let base = pool.baseAddress!.advanced(by: offset)
                 let count = end - offset - 1
-                let classification = dm_key_class(base, count)
-                guard classification != 0 else { continue }
+                guard dm_has_non_ascii(base, count) else { continue }
                 let original = UnsafeBufferPointer(start: base, count: count)
-                let folded = classification == 1
-                    ? original.map { (65...90).contains($0) ? $0 + 32 : $0 }
-                    : SearchIndex.key(String(decoding: original, as: UTF8.self))
-                guard !folded.elementsEqual(original) else { continue }
+                let normalized = String(decoding: original, as: UTF8.self).precomposedStringWithCanonicalMapping
+                guard !normalized.utf8.elementsEqual(original) else { continue }
                 keyOffsets[i] = UInt32(keyBytes.count)
                 changedRows.append(UInt32(i))
-                keyBytes.append(contentsOf: folded)
+                keyBytes.append(contentsOf: normalized.utf8.map { (65...90).contains($0) ? $0 + 32 : $0 })
                 keyBytes.append(0)
             }
         }
@@ -61,12 +98,21 @@ struct PreparedSearch {
         }
     }
 
-    func order(for column: SearchColumn) -> [UInt32] {
-        switch column {
-        case .name: return nameOrder
-        case .path: return pathOrder
-        case .size: return sizeOrder
-        case .modified: return modifiedOrder
+    func order(for column: SearchColumn, index: SearchIndex) -> [UInt32]? {
+        if column == .name { return nameOrder }
+        return columnOrders.order(for: column) {
+            let number: Int32
+            switch column {
+            case .path: number = 1
+            case .size: number = 2
+            case .modified: number = 3
+            case .name: return nameOrder
+            }
+            var rows = nameOrder
+            let ok = withView(index: index) { view in
+                rows.withUnsafeMutableBufferPointer { dm_column_order(&view, $0.baseAddress, number) }
+            }
+            return ok ? rows : nil
         }
     }
 }
@@ -82,7 +128,7 @@ extension SearchIndex {
     func storageBreakdown() -> [String: Int] {
         let keyBytes = prepared.map { $0.keyBytes.capacity + 4 * ($0.keyOffsets.capacity + $0.changedRows.capacity) } ?? 0
         let order = prepared.map {
-            4 * ($0.nameOrder.capacity + $0.pathOrder.capacity + $0.sizeOrder.capacity + $0.modifiedOrder.capacity)
+            4 * $0.nameOrder.capacity + $0.columnOrders.bytes
         } ?? 0
         return [
             "recordsAndAttributes": records.capacity * MemoryLayout<DMRecord>.stride + attributes.capacity,
@@ -100,36 +146,17 @@ extension SearchIndex {
         prepared?.keyOffsets.removeSpareCapacity()
         prepared?.changedRows.removeSpareCapacity()
         prepared?.nameOrder.removeSpareCapacity()
-        prepared?.pathOrder.removeSpareCapacity()
-        prepared?.sizeOrder.removeSpareCapacity()
-        prepared?.modifiedOrder.removeSpareCapacity()
     }
 
-    /// Materialize shared folded keys and exact sort permutations for this index value.
+    /// Materialize the normalized keys and the default name order.
     public mutating func prepare() {
         guard prepared == nil, !records.isEmpty else { return }
         var keys = PreparedSearch(index: self)
-        let count = recordCount
-        var names = [UInt32](repeating: 0, count: count)
-        var paths = [UInt32](repeating: 0, count: count)
-        var sizes = [UInt32](repeating: 0, count: count)
-        var times = [UInt32](repeating: 0, count: count)
-        let ok = keys.withView(index: self) { view in
-            names.withUnsafeMutableBufferPointer { name in
-                paths.withUnsafeMutableBufferPointer { path in
-                    sizes.withUnsafeMutableBufferPointer { size in
-                        times.withUnsafeMutableBufferPointer { time in
-                            dm_order(&view, name.baseAddress, path.baseAddress, size.baseAddress, time.baseAddress)
-                        }
-                    }
-                }
-            }
+        var names = [UInt32](repeating: 0, count: recordCount)
+        keys.withView(index: self) { view in
+            names.withUnsafeMutableBufferPointer { dm_name_order(&view, $0.baseAddress) }
         }
-        guard ok else { return }
         keys.nameOrder = names
-        keys.pathOrder = paths
-        keys.sizeOrder = sizes
-        keys.modifiedOrder = times
         prepared = keys
     }
 
@@ -138,7 +165,7 @@ extension SearchIndex {
                        offset: Int = 0, limit: Int = 50) -> [SearchRow] {
         guard let capacity = pageCapacity(offset: offset, limit: limit),
               !query.utf8.contains(0) else { return [] }
-        guard let prepared else {
+        guard let prepared, let order = prepared.order(for: column, index: self) else {
             return directSearch(query, mode: mode, column: column, direction: direction,
                                 showAll: showAll, offset: offset, limit: limit)
         }
@@ -152,7 +179,7 @@ extension SearchIndex {
         let length = capacity - offset
         var ids = [UInt32](repeating: 0, count: length)
         let emitted = prepared.withView(index: self) { view in
-            prepared.order(for: column).withUnsafeBufferPointer { order in
+            order.withUnsafeBufferPointer { order in
                 words.withUnsafeBufferPointer { words in
                     offsets.withUnsafeBufferPointer { offsets in
                         ids.withUnsafeMutableBufferPointer { ids in

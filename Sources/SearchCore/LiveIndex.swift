@@ -346,17 +346,35 @@ struct LiveIndex {
         return baseEntry(id)
     }
 
-    mutating func refreshFile(_ path: String,
-                             observation: (UInt8) -> (file: TrackedEntry?, parent: TrackedEntry)?) -> Bool {
+    mutating func refreshFile(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
         guard !state.restricted.contains(where: { inside(path, $0) }) else { return false }
         let parent = parentPath(path)
         let folder = entry(at: parent)
-        guard folder?.directory == true || parent == state.root,
-              let observed = observation(folder?.attribute ?? Kind.directory) else { return false }
+        guard folder?.directory == true || parent == state.root else { return false }
         let former = entry(at: path)
-        if former?.directory == true || observed.file?.directory == true { return false }
-        if observed.file != former { set(observed.file, path: path, original: baseID(at: path)) }
-        if let folder, observed.parent != folder { set(observed.parent, path: parent, original: baseID(at: parent)) }
+        let value: TrackedEntry?
+        switch observation(folder?.attribute ?? Kind.directory) {
+        case .entry(let found): value = found
+        case .missing: value = nil
+        case .unverified: return false
+        }
+        guard former?.directory != true, value?.directory != true else { return false }
+        if value != former { set(value, path: path, original: baseID(at: path)) }
+        return true
+    }
+
+    mutating func refreshDirectory(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
+        guard !state.restricted.contains(where: { inside(path, $0) }) else { return false }
+        if path == state.root {
+            guard case .entry(let found) = observation(Kind.directory) else { return false }
+            return found.directory
+        }
+        guard let former = entry(at: path), former.directory,
+              case .entry(let found) = observation(former.attribute), found.directory,
+              (former.attribute ^ found.attribute) & Kind.pending == 0
+        else { return false }
+        let latest = TrackedEntry(size: found.size, modified: found.modified, attribute: former.attribute)
+        if latest != former { set(latest, path: path, original: baseID(at: path)) }
         return true
     }
 

@@ -1,4 +1,6 @@
 import CoreServices
+import CryptoKit
+import Darwin
 import Foundation
 import Testing
 @testable import SearchCore
@@ -127,6 +129,28 @@ struct TrackingTests {
         #expect(filePaths(cached, query: "report") == ["/fixture/a/report"])
     }
 
+    @Test func directoryMetadataCannotHideAChangeInCoverage() {
+        var index = LiveIndex(base: fixture(), root: "/fixture")
+        #expect(!index.refreshDirectory("/fixture/b") { _ in .unverified })
+        _ = index.reconcile(path: "/fixture/b", observed: .restricted)
+        #expect(!index.refreshDirectory("/fixture/b") { _ in .entry(folder) })
+        index.prepareDelta()
+        #expect(filePaths(index, query: "deep").isEmpty)
+    }
+
+    @Test func restoredIndexRootRequiresReconciliation() {
+        var index = LiveIndex(base: fixture(), root: "/fixture")
+        #expect(index.refreshDirectory("/fixture") { _ in .entry(folder) })
+        #expect(!index.refreshDirectory("/fixture") { _ in .unverified })
+        _ = index.reconcile(path: "/fixture", observed: .restricted)
+        index.prepareDelta()
+        #expect(filePaths(index).isEmpty)
+        #expect(!index.refreshDirectory("/fixture") { _ in .entry(folder) })
+        let reopened = index.reconcile(path: "/fixture", observed: .readable(own: folder, children: ["b": folder]))
+        #expect(reopened == ["/fixture/b"])
+        #expect(index.state.restricted.isEmpty)
+    }
+
     @Test func reopenedScopeIsReconciledBeforeRestoringCachedVisibility() throws {
         var older = LiveIndex(base: fixture(), root: "/fixture")
         _ = older.verifyStartupCoverage(at: ["/fixture/b"]) { _ in .restricted }
@@ -177,6 +201,119 @@ struct TrackingTests {
         data[data.count - 1] ^= 1
         try data.write(to: path)
         #expect(throws: SnapshotError.invalid) { try SearchIndex.load(from: path.path) }
+    }
+
+    @Test func olderPreparedSnapshotRetainsNameOrderAndDropsSecondaryTables() throws {
+        let dir = try scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("legacy-index").path
+        let original = fixture()
+        try original.savePrepared(to: path)
+        var data = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(data[28] == 2)
+        let metadataCount = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 24, as: UInt32.self) })
+        let endOfOrders = data.count - metadataCount
+        let nameOrder = Data(data[(endOfOrders - 4 * original.recordCount)..<endOfOrders])
+        data.insert(contentsOf: nameOrder + nameOrder + nameOrder, at: endOfOrders)
+        data[28] = 1
+        var digest = SHA256()
+        digest.update(data: data.prefix(32))
+        digest.update(data: data.dropFirst(64))
+        data.replaceSubrange(32..<64, with: Array(digest.finalize()))
+        try data.write(to: URL(fileURLWithPath: path))
+        let loaded = try SearchIndex.load(from: path)
+        #expect(loaded.prepared?.columnOrders.bytes == 0)
+        #expect(loaded.prepared?.nameOrder == original.prepared?.nameOrder)
+        #expect(loaded.search("", column: .path) == original.directSearch("", column: .path))
+    }
+
+    @Test func privateTemporaryPathsUseTheSameSpellingAsEventPaths() throws {
+        // The real system alias is read-only in this test. All file-writing
+        // tracker tests stay in the project's own scratch tree.
+        let tracker = try ChangeTracker(root: "/", snapshot: "/dev/null", ownData: "/tmp/")
+        #expect(tracker.ownDirectory == "/private/tmp")
+        #expect(tracker.excluded.contains("/private/tmp"))
+        let marker = "/private/tmp/owned/.scan-boundary-fixture"
+        let event = VolumeEvent(path: "private/tmp/owned/.scan-boundary-fixture", id: 20, flags: 0)
+        let logical = try #require(tracker.logicalPath(event.path, volume: 1))
+        #expect(logical == marker)
+        #expect(tracker.excluded.contains { inside(logical, $0) })
+        #expect(ScanBoundary(marker: marker, after: 19).covered(by: event, at: logical))
+    }
+
+    @Test func fileEventsUpdateRowsAndParentMetadataWithoutEnumerating() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let own = root.appendingPathComponent("owned")
+        let dir = root.appendingPathComponent("fixture")
+        for folder in [own, dir] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false) }
+        let old = dir.appendingPathComponent("old-marker")
+        let gone = dir.appendingPathComponent("gone-marker")
+        let new = dir.appendingPathComponent("new-marker")
+        let renamed = dir.appendingPathComponent("renamed-marker")
+        try Data([1]).write(to: old)
+        try Data([1]).write(to: gone)
+        let tracker = try ChangeTracker(root: root.path, snapshot: own.appendingPathComponent("base").path,
+                                        ownData: own.path)
+        tracker.start()
+        defer { try? tracker.stop() }
+        try awaitStatus(tracker) { $0.phase == "caught-up" }
+        let before = tracker.snapshotStatus()
+        let id = before.appliedEvents.values.max() ?? 1
+        let file = kFSEventStreamEventFlagItemIsFile
+        try tracker.deliverForTesting([
+            VolumeEvent(path: old.path, id: id + 1, flags: UInt32(file | kFSEventStreamEventFlagItemRenamed)),
+            VolumeEvent(path: renamed.path, id: id + 2, flags: UInt32(file | kFSEventStreamEventFlagItemRenamed)),
+            VolumeEvent(path: gone.path, id: id + 3, flags: UInt32(file | kFSEventStreamEventFlagItemRemoved)),
+            VolumeEvent(path: new.path, id: id + 4, flags: UInt32(file | kFSEventStreamEventFlagItemCreated)),
+        ], writing: {
+            try FileManager.default.moveItem(at: old, to: renamed)
+            try FileManager.default.removeItem(at: gone)
+            try Data([1, 2]).write(to: new)
+        }, check: {
+            let after = tracker.snapshotStatus()
+            #expect(after.directFilesObserved - before.directFilesObserved == 4)
+            #expect(after.directDirectoriesObserved - before.directDirectoriesObserved == 1)
+            #expect(after.directoriesObserved == before.directoriesObserved)
+            #expect(tracker.search("-marker").map(\.path) == [new.path, renamed.path])
+            #expect(tracker.search("new-marker").first?.size == 2)
+            var info = stat()
+            #expect(lstat(dir.path, &info) == 0)
+            let latest = tracker.search("fixture").first
+            #expect(latest?.size == info.st_size)
+            #expect(latest?.modified == Int64(info.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(info.st_mtimespec.tv_nsec))
+        })
+    }
+
+    @Test func onlyUnambiguousFileContentNotificationsAreCoalesced() {
+        let file = kFSEventStreamEventFlagItemIsFile
+        let modified = kFSEventStreamEventFlagItemModified
+        let inode = kFSEventStreamEventFlagItemInodeMetaMod
+        func isContent(_ flags: Int) -> Bool {
+            VolumeEvent(path: "item", id: 1, flags: UInt32(flags)).contentOnly
+        }
+        #expect(isContent(file | modified))
+        #expect(isContent(file | modified | inode))
+        #expect(!isContent(file | inode))
+        #expect(!isContent(file | modified | kFSEventStreamEventFlagItemRenamed))
+        #expect(!isContent(file | modified | kFSEventStreamEventFlagItemXattrMod))
+        #expect(!isContent(kFSEventStreamEventFlagItemIsDir | modified))
+    }
+
+    @Test func repeatedContentEventsDelayOnlyTheirOwnPathAndHoldTheCursor() {
+        var content = FileContentSchedule()
+        let second = ReplayLag.second
+        content.enqueue("/a", event: 10, volume: 0, now: 100 * second)
+        #expect(content.take(at: 100 * second, force: false) == ["/a"])
+        content.enqueue("/a", event: 12, volume: 0, now: 101 * second)
+        content.enqueue("/a", event: 11, volume: 0, now: 102 * second)
+        content.enqueue("/b", event: 13, volume: 0, now: 102 * second)
+        #expect(content.take(at: 102 * second, force: false) == ["/b"])
+        #expect(content.floors() == [0: 11])
+        #expect(content.next == 130 * second)
+        #expect(content.take(at: 129 * second, force: false).isEmpty)
+        #expect(content.take(at: 130 * second, force: false) == ["/a"])
+        #expect(content.floors().isEmpty)
     }
 
     @Test func failureBeforeReplaceRetainsOlderGeneration() throws {

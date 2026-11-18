@@ -51,6 +51,44 @@ struct CoreTests {
         }
     }
 
+    @Test func normalizationStoresOnlyChangedNonASCIIKeys() {
+        var index = SearchIndex()
+        let root = index.append("/UPPER", attribute: Kind.anchor)
+        let folder = index.append("MixedÉ", parent: root, attribute: Kind.directory)
+        index.append("REPORT [Name].PDF", parent: folder)
+        index.append("REPORT {Name}.PDF", parent: folder)
+        index.append("CAFE\u{301}.PDF", parent: folder)
+        index.append("Report-é.PDF", parent: folder)
+        index.prepare()
+        #expect(index.prepared?.changedRows == [4])
+        for column in SearchColumn.allCases {
+            for (term, mode) in [("report  [name]", QueryMode.name), ("café", .name),
+                                 ("report É", .name), ("upper/mixedÉ/report P", .path),
+                                 ("XEDÉ/CAfÉ", .path), ("REPORT\u{301}", .name)] {
+                #expect(index.search(term, mode: mode, column: column) ==
+                        index.directSearch(term, mode: mode, column: column))
+            }
+        }
+        #expect(index.search("report é").map(\.name) == ["Report-é.PDF"])
+        #expect(index.search("report É").isEmpty)
+    }
+
+    @Test func secondaryOrdersAreBuiltSeparatelyAndExpire() throws {
+        var index = fixture()
+        index.prepare()
+        let cache = try #require(index.prepared?.columnOrders)
+        #expect(cache.bytes == 0)
+        for column in [SearchColumn.size, .modified, .path] {
+            #expect(index.search("", column: column) == index.directSearch("", column: column))
+            #expect(cache.bytes > 0)
+            let now = DispatchTime.now().uptimeNanoseconds
+            cache.expire(column, at: now + 298_000_000_000)
+            #expect(cache.bytes > 0)
+            cache.expire(column, at: now + 300_000_000_000)
+            #expect(cache.bytes == 0)
+        }
+    }
+
     private func scratch() throws -> URL {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".m2-tmp", isDirectory: true)

@@ -50,7 +50,7 @@ extension SearchIndex {
         let fields = [records.count, names.count, tables.keyBytes.count, tables.changedRows.count, metadata.count]
         guard fields.allSatisfy({ $0 <= Int(UInt32.max) }) else { throw SnapshotError.invalid }
         var header = Data(Self.hotMagic)
-        for value in fields + [1] {
+        for value in fields + [2] {
             var little = UInt32(value).littleEndian
             withUnsafeBytes(of: &little) { header.append(contentsOf: $0) }
         }
@@ -92,9 +92,6 @@ extension SearchIndex {
         try put(tables.changedRows)
         try put(tables.keyBytes)
         try put(tables.nameOrder)
-        try put(tables.pathOrder)
-        try put(tables.sizeOrder)
-        try put(tables.modifiedOrder)
         try metadata.withUnsafeBytes { bytes in
             hash.update(bufferPointer: bytes)
             try write(bytes)
@@ -139,10 +136,12 @@ extension SearchIndex {
             (0..<6).map { Int(UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 8 + 4 * $0, as: UInt32.self))) }
         }
         let n = fields[0], nameCount = fields[1], foldedCount = fields[2], changedCount = fields[3], metaCount = fields[4]
-        guard fields[5] == 1 else { throw SnapshotError.unsupportedVersion }
+        let version = fields[5]
+        guard version == 1 || version == 2 else { throw SnapshotError.unsupportedVersion }
+        let rowBytes = version == 1 ? 45 : 33
         guard n <= 20_000_000, changedCount <= n, nameCount <= 512_000_000,
               foldedCount <= 512_000_000, metaCount <= 64_000_000,
-              st.st_size == Int64(64 + n * 45 + changedCount * 4 + nameCount + foldedCount + metaCount)
+              st.st_size == Int64(64 + n * rowBytes + changedCount * 4 + nameCount + foldedCount + metaCount)
         else { throw SnapshotError.invalid }
 
         var hash = SHA256()
@@ -163,9 +162,12 @@ extension SearchIndex {
         tables.changedRows = try load(changedCount)
         tables.keyBytes = try load(foldedCount)
         tables.nameOrder = try load(n)
-        tables.pathOrder = try load(n)
-        tables.sizeOrder = try load(n)
-        tables.modifiedOrder = try load(n)
+        if version == 1 {
+            for _ in 0..<3 {
+                let discarded: [UInt32] = try load(n)
+                guard PreparedSearch.validOrder(discarded, rows: n) else { throw SnapshotError.invalid }
+            }
+        }
         let metadataBytes: [UInt8] = try load(metaCount)
         guard hash.finalize().elementsEqual(header.dropFirst(32)), index.structureIsValid(),
               tables.validForPersistence(rows: n) else { throw SnapshotError.invalid }
@@ -175,6 +177,11 @@ extension SearchIndex {
         } catch { throw SnapshotError.invalid }
         index.volumes = metadata.volumes
         index.tracking = metadata.tracking
+        if version == 1 {
+            var normalized = PreparedSearch(index: index)
+            normalized.nameOrder = tables.nameOrder
+            tables = normalized
+        }
         index.prepared = tables
         index.loadedPrepared = true
         return index
@@ -198,14 +205,17 @@ extension SearchIndex {
 }
 
 private extension PreparedSearch {
-    func validForPersistence(rows: Int) -> Bool {
-        for order in [nameOrder, pathOrder, sizeOrder, modifiedOrder] {
-            var seen = [UInt8](repeating: 0, count: rows)
-            for id in order {
-                guard id < rows, seen[Int(id)] == 0 else { return false }
-                seen[Int(id)] = 1
-            }
+    static func validOrder(_ order: [UInt32], rows: Int) -> Bool {
+        var seen = [UInt8](repeating: 0, count: rows)
+        for id in order {
+            guard id < rows, seen[Int(id)] == 0 else { return false }
+            seen[Int(id)] = 1
         }
+        return true
+    }
+
+    func validForPersistence(rows: Int) -> Bool {
+        guard Self.validOrder(nameOrder, rows: rows) else { return false }
         var count = 0
         var former: UInt32?
         for row in changedRows {

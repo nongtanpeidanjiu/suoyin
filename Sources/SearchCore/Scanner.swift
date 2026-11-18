@@ -102,6 +102,12 @@ private final class ListenerSet {
 
 let dataRoot = "/System/Volumes/Data"
 
+enum EntryObservation {
+    case entry(TrackedEntry)
+    case missing
+    case unverified
+}
+
 struct WalkScope {
     static let packageSuffixes = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
     let root: String
@@ -446,35 +452,35 @@ extension WalkScope {
                          children: children)
     }
 
-    /// An explicit regular-file event never traverses a substituted leaf or
-    /// a cloud scope. Renames and ambiguous results use directory reconciliation.
-    func observeFile(_ path: String, inherited: UInt8) -> (file: TrackedEntry?, parent: TrackedEntry)? {
-        guard !cloudRoots.contains(where: { inside(path, $0) }) else { return nil }
-        let parent = parentPath(path)
-        let fd = Darwin.open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { return nil }
-        defer { _ = Darwin.close(fd) }
+    // Cloud observation must check unavailable ancestors before accessing a leaf.
+    // Reconcile those paths using the guarded directory reader.
+    func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false) -> EntryObservation {
+        guard !cloudRoots.contains(where: { inside(path, $0) }) else { return .unverified }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_flags & 0x40000000 == 0,
-              info.st_dev == primaryDevice || info.st_dev == dataDevice,
-              let folder = Self.fileEntry(info, attribute: inherited)
-        else { return nil }
-        var result: Int32
-        let name = leafName(path)
-        repeat { result = fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) } while result < 0 && errno == EINTR
-        if result < 0 && errno == ENOENT { return (nil, folder) }
-        guard result == 0, info.st_mode & S_IFMT == S_IFREG,
-              info.st_dev == primaryDevice || info.st_dev == dataDevice
-        else { return nil }
-        var attribute = Kind.file | (inherited & Kind.hidden)
-        let package = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
-            .contains { parent.hasSuffix($0) }
-        if name.hasPrefix(".") || info.st_flags & 0x8000 != 0 || package || defaultHiddenDirectory(path) {
+        if Self.metadata(path, &info) != 0 {
+            return errno == ENOENT ? .missing : .unverified
+        }
+        guard info.st_dev == primaryDevice || info.st_dev == dataDevice else { return .unverified }
+        let type = info.st_mode & S_IFMT
+        if verifyAccess, type == S_IFDIR {
+            // An explicit directory event can report an ACL or mode change
+            // even though lstat still succeeds. Check coverage without listing it.
+            guard info.st_flags & 0x40000000 == 0, access(path, R_OK | X_OK) == 0 else { return .unverified }
+            let fd = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { return .unverified }
+            _ = Darwin.close(fd)
+        }
+        let kind = type == S_IFDIR ? Kind.directory : type == S_IFREG ? Kind.file : Kind.other
+        var attribute = kind | (inherited & Kind.hidden)
+        let parent = parentPath(path)
+        if leafName(path).hasPrefix(".") || info.st_flags & 0x8000 != 0 ||
+            Self.packageSuffixes.contains(where: { parent.hasSuffix($0) }) || defaultHiddenDirectory(path) {
             attribute |= Kind.hidden
         }
+        if path == "/usr/local" { attribute &= ~Kind.hidden }
         if info.st_flags & 0x40000000 != 0 { attribute |= Kind.pending }
-        guard let entry = Self.fileEntry(info, attribute: attribute) else { return nil }
-        return (entry, folder)
+        guard let entry = Self.fileEntry(info, attribute: attribute) else { return .unverified }
+        return .entry(entry)
     }
 
     private static func fileEntry(_ info: stat, attribute: UInt8) -> TrackedEntry? {

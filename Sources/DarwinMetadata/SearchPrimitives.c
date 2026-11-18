@@ -47,20 +47,53 @@ uint32_t dm_child_lookup(const DMRecord *records, const uint8_t *attributes,
     return UINT32_MAX;
 }
 
-int dm_key_class(const uint8_t *name, size_t length) {
-    int kind = 0;
-    for (size_t i = 0; i < length; i++) {
-        uint8_t c = name[i];
-        if (c >= 128) return 2;
-        if (c >= 'A' && c <= 'Z') kind = 1;
+bool dm_has_non_ascii(const uint8_t *name, size_t length) {
+    while (length >= 16) {
+        if (vmaxvq_u8(vld1q_u8(name)) >= 128) return true;
+        name += 16;
+        length -= 16;
     }
-    return kind;
+    for (size_t i = 0; i < length; i++)
+        if (name[i] >= 128) return true;
+    return false;
+}
+
+static inline uint8_t ascii_fold(uint8_t byte) {
+    return (unsigned)(byte - 'A') <= 'Z' - 'A' ? byte | 0x20 : byte;
+}
+
+static inline bool ascii_letter(uint8_t folded) {
+    return (unsigned)(folded - 'a') <= 'z' - 'a';
+}
+
+static int folded_order(const char *left, const char *right) {
+    for (;; left++, right++) {
+        int a = ascii_fold((uint8_t)*left), b = ascii_fold((uint8_t)*right);
+        if (a != b || !a) return a - b;
+    }
+}
+
+static bool folded_prefix(const char *value, const char *lower, size_t length) {
+    for (size_t i = 0; i < length; i++)
+        if (ascii_fold((uint8_t)value[i]) != (uint8_t)lower[i]) return false;
+    return true;
+}
+
+static bool folded_contains(const char *value, const char *lower) {
+    size_t length = strlen(lower);
+    uint8_t first = (uint8_t)lower[0];
+    unsigned mask = ascii_letter(first) ? 0x20 : 0;
+    for (; *value; value++) {
+        if (((uint8_t)*value | mask) == first && folded_prefix(value + 1, lower + 1, length - 1))
+            return true;
+    }
+    return false;
 }
 
 static int name_order(void *context, const void *a, const void *b) {
     const DMQueryView *v = context;
     uint32_t left = *(const uint32_t *)a, right = *(const uint32_t *)b;
-    int compare = strcmp(key(v, left), key(v, right));
+    int compare = folded_order(key(v, left), key(v, right));
     if (compare) return compare;
     compare = strcmp(original(v, left), original(v, right));
     if (compare) return compare;
@@ -112,7 +145,9 @@ static bool get_directory_ranks(const DMQueryView *v, uint32_t *ranks) {
             memcpy(destination, pool + before.offset, prefix);
             if (prefix && !before.ends_in_slash) destination[prefix++] = '/';
         }
-        memcpy(destination + prefix, key(v, id), keys[id].length - prefix + 1);
+        const char *word = key(v, id);
+        for (size_t i = 0; i <= keys[id].length - prefix; i++)
+            destination[prefix + i] = (char)ascii_fold((uint8_t)word[i]);
     }
 
     DirectoryOrder order = {pool, keys};
@@ -164,23 +199,18 @@ static void stable_order(const DMQueryView *v, uint32_t *result, uint32_t *scrat
     }
 }
 
-bool dm_order(const DMQueryView *v, uint32_t *name, uint32_t *path,
-              uint32_t *size, uint32_t *modified) {
+void dm_name_order(const DMQueryView *v, uint32_t *order) {
+    for (uint32_t i = 0; i < v->row_count; i++) order[i] = i;
+    qsort_r(order, v->row_count, sizeof(*order), (void *)v, name_order);
+}
+
+bool dm_column_order(const DMQueryView *v, uint32_t *order, int column) {
     if (!v->row_count) return true;
     size_t bytes = v->row_count * sizeof(uint32_t);
-    uint32_t *ranks = scratch_map(bytes);
+    uint32_t *ranks = column == 1 ? scratch_map(bytes) : NULL;
     uint32_t *scratch = scratch_map(bytes);
-    bool ok = ranks && scratch && get_directory_ranks(v, ranks);
-    if (ok) {
-        for (uint32_t i = 0; i < v->row_count; i++) name[i] = i;
-        qsort_r(name, v->row_count, sizeof(*name), (void *)v, name_order);
-        memcpy(path, name, bytes);
-        stable_order(v, path, scratch, 1, ranks);
-        memcpy(size, name, bytes);
-        stable_order(v, size, scratch, 2, ranks);
-        memcpy(modified, name, bytes);
-        stable_order(v, modified, scratch, 3, ranks);
-    }
+    bool ok = scratch && (column != 1 || (ranks && get_directory_ranks(v, ranks)));
+    if (ok) stable_order(v, order, scratch, column, ranks);
     scratch_release(ranks, bytes);
     scratch_release(scratch, bytes);
     return ok;
@@ -202,7 +232,9 @@ static uint32_t row_at(const DMQueryView *v, size_t position, bool folded) {
 
 static bool hit_at(const DMQueryView *v, const char *word, size_t length,
                    const uint8_t *pool, size_t start, bool folded, uint8_t *hits, size_t *skip) {
-    if (start < *skip || memcmp(pool + start, word, length)) return false;
+    if (start < *skip) return false;
+    if (folded ? memcmp(pool + start, word, length) != 0 :
+        !folded_prefix((const char *)pool + start, word, length)) return false;
     uint32_t id = row_at(v, start, folded);
     uint32_t offset = folded ? v->fold_offsets[id] : v->rows[id].offset;
     *skip = offset + strlen((const char *)pool + offset) + 1;
@@ -232,9 +264,11 @@ static size_t pool_hits(const DMQueryView *v, const char *word, bool folded, uin
     size_t found = 0, skip = 0, position = 0, end = bytes - length + 1;
     uint8x16_t first = vdupq_n_u8((uint8_t)word[0]);
     uint8x16_t last = vdupq_n_u8((uint8_t)word[length - 1]);
+    uint8x16_t first_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[0]) ? 0x20 : 0);
+    uint8x16_t last_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[length - 1]) ? 0x20 : 0);
     for (; end - position >= 16; position += 16) {
-        uint8x16_t a = vceqq_u8(vld1q_u8(pool + position), first);
-        uint8x16_t b = vceqq_u8(vld1q_u8(pool + position + length - 1), last);
+        uint8x16_t a = vceqq_u8(vorrq_u8(vld1q_u8(pool + position), first_mask), first);
+        uint8x16_t b = vceqq_u8(vorrq_u8(vld1q_u8(pool + position + length - 1), last_mask), last);
         uint64x2_t masks = vreinterpretq_u64_u8(vandq_u8(a, b));
         found += match_lanes(v, word, length, pool, position, folded, hits, &skip, vgetq_lane_u64(masks, 0));
         found += match_lanes(v, word, length, pool, position + 8, folded, hits, &skip, vgetq_lane_u64(masks, 1));
@@ -247,8 +281,11 @@ static size_t pool_hits(const DMQueryView *v, const char *word, bool folded, uin
 static size_t name_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
     if (word[0] && !word[1]) {
         size_t count = 0;
+        char letters[] = {word[0], ascii_letter((uint8_t)word[0]) ? word[0] - 32 : 0, 0};
         for (uint32_t i = 0; i < v->row_count; i++) {
-            hits[i] = strchr(key(v, i), (unsigned char)word[0]) != NULL;
+            const char *name = key(v, i);
+            hits[i] = strchr(name, letters[0]) != NULL ||
+                (letters[1] && v->fold_offsets[i] == UINT32_MAX && strchr(name, letters[1]) != NULL);
             count += hits[i];
         }
         return count;
@@ -283,13 +320,13 @@ static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
         uint32_t inherited = root ? 0 : states[parent];
         bool prior_match = !root && hits[parent];
         const char *name = key(v, i);
-        hits[i] = (uint8_t)(prior_match || (root ? strstr(name, word) != NULL :
-                   inherited == stem && strncmp(name, tail, tail_length) == 0));
+        hits[i] = (uint8_t)(prior_match || (root ? folded_contains(name, word) :
+                   inherited == stem && folded_prefix(name, tail, tail_length)));
         if (kind != ANCHOR && kind != DIRECTORY) continue;
         if (hits[i]) continue;
         uint32_t state = inherited;
         const char *p = name;
-        for (; *p; p++) state = advance(word, stem, fallback, state, *p);
+        for (; *p; p++) state = advance(word, stem, fallback, state, (char)ascii_fold((uint8_t)*p));
         if (p == name || p[-1] != '/') state = advance(word, stem, fallback, state, '/');
         states[i] = state;
     }
@@ -300,7 +337,7 @@ static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
 
 static bool all_words(const char *name, const uint8_t *patterns, const uint32_t *offsets, size_t words) {
     for (size_t j = 0; j < words; j++) {
-        if (!strstr(name, (const char *)patterns + offsets[j])) return false;
+        if (!folded_contains(name, (const char *)patterns + offsets[j])) return false;
     }
     return true;
 }

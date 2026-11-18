@@ -83,7 +83,8 @@ struct BaseWriteBudget {
 
 struct DirectoryUpdate {
     var recursive: Bool?
-    var files = Set<String>()
+    var files: [String: Bool] = [:]
+    var metadata = false
     var pending: [Int: UInt64] = [:]
 
     mutating func add(event: UInt64, volume: Int) {
@@ -92,7 +93,7 @@ struct DirectoryUpdate {
 
     mutating func merge(_ other: DirectoryUpdate) {
         if let recursive = other.recursive { self.recursive = self.recursive == true || recursive }
-        if recursive == nil { files.formUnion(other.files) }
+        if recursive == nil { files.merge(other.files) { $0 || $1 }; metadata = metadata || other.metadata }
         else { files.removeAll() }
         for (volume, event) in other.pending { add(event: event, volume: volume) }
     }
@@ -165,5 +166,54 @@ struct DirectorySchedule {
 
     mutating func discard(volumes: Set<Int>) {
         pending = pending.filter { volumes.isDisjoint(with: $0.value.update.pending.keys) }
+    }
+}
+
+
+/// A first content observation is immediate. Further notifications for the
+/// same path are combined until 30 seconds after the last observation.
+struct FileContentSchedule {
+    private static let interval: UInt64 = 30 * ReplayLag.second
+    private var visits: [String: UInt64] = [:]
+    private var pending: [String: (due: UInt64, events: [Int: UInt64])] = [:]
+    private var lastPrune: UInt64 = 0
+
+    var next: UInt64? { pending.values.lazy.map(\.due).min() }
+    var count: Int { pending.count }
+    var pendingVolumes: Set<Int> { Set(pending.values.flatMap { $0.events.keys }) }
+
+    mutating func enqueue(_ path: String, event: UInt64, volume: Int, now: UInt64) {
+        if now - lastPrune >= Self.interval {
+            visits = visits.filter { now - $0.value < Self.interval }
+            lastPrune = now
+        }
+        if pending[path] == nil {
+            pending[path] = (visits[path].map { max(now, $0 + Self.interval) } ?? now, [:])
+        }
+        let earlier = pending[path]?.events[volume] ?? .max
+        pending[path]?.events[volume] = min(earlier, event)
+    }
+
+    mutating func take(at now: UInt64, force: Bool) -> [String] {
+        let ready = pending.compactMap { force || $0.value.due <= now ? $0.key : nil }
+        for path in ready { observed(path, at: now) }
+        return ready
+    }
+
+    mutating func observed(_ path: String, at now: UInt64) {
+        pending.removeValue(forKey: path)
+        visits[path] = now
+    }
+
+    func floors() -> [Int: UInt64] {
+        var result: [Int: UInt64] = [:]
+        for item in pending.values {
+            for (volume, event) in item.events { result[volume] = min(result[volume] ?? .max, event) }
+        }
+        return result
+    }
+
+    mutating func discard(volumes: Set<Int>) {
+        pending = pending.filter { volumes.isDisjoint(with: $0.value.events.keys) }
     }
 }

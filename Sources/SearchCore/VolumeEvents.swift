@@ -14,12 +14,11 @@ struct VolumeEvent {
         flags & UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved |
                        kFSEventStreamEventFlagItemRenamed) != 0
     }
-    var leafFileChange: Bool {
-        let file = UInt32(kFSEventStreamEventFlagItemIsFile)
-        let change = UInt32(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemCreated |
-                            kFSEventStreamEventFlagItemRemoved)
-        let allowed = file | change | UInt32(kFSEventStreamEventFlagItemInodeMetaMod)
-        return flags & file != 0 && flags & change != 0 && flags & ~allowed == 0
+    var contentOnly: Bool {
+        let required = UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified)
+        let allowed = required | UInt32(kFSEventStreamEventFlagItemInodeMetaMod |
+                                       kFSEventStreamEventFlagItemIsHardlink | kFSEventStreamEventFlagItemIsLastHardlink)
+        return flags & required == required && flags & ~allowed == 0
     }
     var invalidatesHistory: Bool {
         flags & UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped |

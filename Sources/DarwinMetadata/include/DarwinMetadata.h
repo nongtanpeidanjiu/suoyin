@@ -44,9 +44,9 @@ typedef struct {
     size_t row_count, name_bytes, fold_bytes, fold_count;
 } DMQueryView;
 
-int dm_key_class(const uint8_t *name, size_t length);
-bool dm_order(const DMQueryView *view, uint32_t *by_name, uint32_t *by_path,
-              uint32_t *by_size, uint32_t *by_modified);
+bool dm_has_non_ascii(const uint8_t *name, size_t length);
+void dm_name_order(const DMQueryView *view, uint32_t *order);
+bool dm_column_order(const DMQueryView *view, uint32_t *order, int column);
 size_t dm_query(const DMQueryView *view, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *word_offsets, size_t words,
                 bool path, bool descending, bool show_all, size_t offset,

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import statistics
+import struct
 import subprocess
 import tempfile
 import time
@@ -59,14 +60,15 @@ def exercise(cli, directory):
     tree.mkdir()
     store = tree / "owned-index"
     store.mkdir()
-    snap = store / "index.snapshot"
+    snap = store / "index.tmp"
+    journal = Path(str(snap) + ".changes")
     (tree / "a").mkdir()
     (tree / "b").mkdir()
-    (tree / "a" / "ready.txt").touch()
+    (tree / "a" / "ready.tmp").touch()
     for i in range(2100):
-        (tree / f"seed-{i:05}.txt").touch()
+        (tree / f"seed-{i:05}.tmp").touch()
     summary = {"iterations": []}
-    log = directory / "transcript.jsonl"
+    log = directory / "transcript.tmp"
     tracker = TrackClient(cli, tree, snap, store, log, gate=True)
     maximums = []
     try:
@@ -74,7 +76,7 @@ def exercise(cli, directory):
         expected_partial = tree_rows(tree, store)
         published = from_search(tracker.call("query", limit=len(expected_partial) + 100)["rows"])
         assert published and published.items() <= expected_partial.items()
-        (tree / "seed-00000.txt").rename(tree / "observed-during-scan.txt")
+        (tree / "seed-00000.tmp").rename(tree / "observed-during-scan.tmp")
         tracker.call("continue-scan")
         first = tracker.wait("ready")
         aligned = tracker.wait("caught-up")
@@ -111,16 +113,16 @@ def exercise(cli, directory):
             return 1
 
         for i in range(3):
-            at = tree / "a" / f"m{i}.txt"
-            renamed = tree / "a" / f"renamed-{i}.txt"
-            destination = tree / "b" / f"relocated-{i}.txt"
+            at = tree / "a" / f"m{i}.tmp"
+            renamed = tree / "a" / f"renamed-{i}.tmp"
+            destination = tree / "b" / f"relocated-{i}.tmp"
             measure("create", lambda: touch(at))
             measure("rename", lambda: move(at, renamed))
             measure("cross", lambda: move(renamed, destination))
             measure("delete", lambda: remove(destination))
             source = tree / "a" / f"folder-{i}"
             source.mkdir()
-            (source / "deep.txt").touch()
+            (source / "deep.tmp").touch()
             converge(tracker, tree_rows(tree, store))
             measure("move-directory", lambda: move(source, tree / "b" / source.name))
 
@@ -128,26 +130,23 @@ def exercise(cli, directory):
             folder = tree / "batch"
             folder.mkdir()
             for i in range(10000):
-                (folder / f"row-{i:05}.txt").touch()
+                (folder / f"row-{i:05}.tmp").touch()
             return 10000
 
         measure("bulk", bulk)
-        until = time.monotonic() + 6
-        while time.monotonic() < until:
-            current = tracker.call("status")["status"]
-            if current["durableEvents"] and current["durableGeneration"] == current["generation"]:
-                break
-            time.sleep(.10)
+        current = tracker.call("save")["status"]
         saved = current["appliedEvents"]
         assert saved and current["durableGeneration"] == current["generation"] and tracker.process.poll() is None
         durable, archive = inspect(cli, snap)
         assert durable == current["durableEvents"] and archive == tree_rows(tree, store)
         assert all(durable[volume] <= saved[volume] for volume in durable)
-        summary["delayed"] = dict(alive=True, applied=saved, durable=durable, equal=True)
+        summary["incremental"] = dict(alive=True, applied=saved, durable=durable, equal=True,
+                                      baseWrites=current["baseWrites"], frames=current["journalFrames"])
+        assert current["baseWrites"] == 1 and current["journalFrames"] >= 1
 
         before = tracker.call("status")["status"]["appliedEvents"]
         tracker.call("hold")
-        pending = tree / "pending.txt"
+        pending = tree / "pending.tmp"
         pending.touch()
         run = tracker.call("sync")
         until = time.monotonic() + 3
@@ -180,8 +179,8 @@ def exercise(cli, directory):
                                              withheld=True, restartedFromSameFile=True, replayEqual=True)
         maximums.append(tracker.finish())
 
-        (tree / "ready-offline.txt").touch()
-        (tree / "a" / "ready.txt").rename(tree / "b" / "offline-renamed.txt")
+        (tree / "ready-offline.tmp").touch()
+        (tree / "a" / "ready.tmp").rename(tree / "b" / "offline-renamed.tmp")
         time.sleep(.25)
         tracker = TrackClient(cli, tree, snap, store, log)
         cached = tracker.wait("ready")
@@ -193,7 +192,7 @@ def exercise(cli, directory):
 
         tracker.call("save")
         old_archive = fingerprint(snap)
-        (tree / "atomic-survivor.txt").touch()
+        (tree / "atomic-survivor.tmp").touch()
         converge(tracker, tree_rows(tree, store))
         tracker.call("pause-before-replace", expected="before-replace")
         maximums.append(tracker.finish(kill=True))
@@ -204,14 +203,89 @@ def exercise(cli, directory):
         converge(tracker, tree_rows(tree, store))
         summary["crashBeforeReplace"] = dict(oldIntact=True, replayEqual=True)
 
+        tracker.call("save")
+        old_archive = fingerprint(snap)
+        old_journal = fingerprint(journal)
+        (tree / "after-swap.tmp").touch()
+        converge(tracker, tree_rows(tree, store))
+        tracker.call("pause-after-replace", expected="after-replace")
+        maximums.append(tracker.finish(kill=True))
+        assert fingerprint(snap) != old_archive and fingerprint(journal) == old_journal
+        tracker = TrackClient(cli, tree, snap, store, log)
+        ready = tracker.wait("ready")
+        tracker.wait("caught-up")
+        converge(tracker, tree_rows(tree, store))
+        assert ready["status"]["journalRecovery"] == "identity-or-version"
+        summary["crashAfterReplace"] = dict(newBase=True, oldJournalIgnored=True, replayEqual=True)
+
+        high_frequency = tree / "hot.tmp"
+        high_frequency.write_bytes(b"a")
+        converge(tracker, tree_rows(tree, store))
+        before_hot = tracker.call("save")["status"]
+        for i in range(240):
+            high_frequency.write_bytes(bytes(i % 32))
+        converge(tracker, tree_rows(tree, store))
+        after_hot = tracker.call("save")["status"]
+        assert after_hot["journalFrames"] - before_hot["journalFrames"] == 1
+        summary["hotPath"] = dict(updates=240, frames=1,
+                                  bytes=after_hot["journalWrittenBytes"] - before_hot["journalWrittenBytes"])
+
+        for i in range(3):
+            (tree / f"journal-edit-{i}.tmp").touch()
+            converge(tracker, tree_rows(tree, store))
+            tracker.call("save")
+        maximums.append(tracker.finish())
+        base = snap.read_bytes()
+        valid = journal.read_bytes()
+        offsets = []
+        at = 44
+        while at + 36 <= len(valid):
+            offsets.append(at)
+            at += 36 + struct.unpack_from("<I", valid, at)[0]
+        assert at == len(valid) and len(offsets) >= 3
+        damaged = bytearray(valid)
+        damaged[offsets[1] + 4] ^= 1
+        mismatch = bytearray(valid)
+        mismatch[12] ^= 1
+        summary["journalFaults"] = {}
+        for name, payload, behavior, restored in (
+            ("tail", valid[:-3], "discarded-suffix", len(offsets) - 1),
+            ("middle", damaged, "discarded-suffix", 1),
+            ("mismatch", mismatch, "identity-or-version", 0),
+            ("missing", None, "missing", 0),
+        ):
+            snap.write_bytes(base)
+            if payload is None:
+                journal.unlink()
+            else:
+                journal.write_bytes(payload)
+            tracker = TrackClient(cli, tree, snap, store, log)
+            ready = tracker.wait("ready")
+            tracker.wait("caught-up")
+            converge(tracker, tree_rows(tree, store))
+            assert ready["status"]["journalRecovery"] == behavior
+            assert ready["status"]["journalRestoredFrames"] == restored
+            assert ready["status"]["recovery"] == "replay"
+            summary["journalFaults"][name] = dict(recovery=behavior, validPrefix=restored, replayEqual=True)
+            maximums.append(tracker.finish())
+
+        tracker = TrackClient(cli, tree, snap, store, log)
+        tracker.wait("ready")
+        tracker.wait("caught-up")
         tracker.call("hold")
-        (tree / "dropped.txt").touch()
+        (tree / "dropped.tmp").touch()
         tracker.call("sync")
         tracker.call("invalidate-history", expected="invalidated")
         tracker.call("resume")
         row = converge(tracker, tree_rows(tree, store))
         assert row["status"]["recovery"] == "history-invalid"
         summary["invalidHistory"] = dict(route=row["status"]["recovery"], equal=True)
+        tracker.wait("caught-up") if row["status"]["phase"] != "caught-up" else None
+        initial_rebuilds = tracker.call("status")["status"]["rebuilds"]
+        tracker.call("invalidate-history", expected="invalidated")
+        degraded = tracker.call("status")["status"]
+        assert degraded["degradedVolumes"] and degraded["rebuilds"] == initial_rebuilds
+        summary["rebuildThrottle"] = dict(degraded=True, rebuilds=degraded["rebuilds"])
         maximums.append(tracker.finish())
 
         data = bytearray(snap.read_bytes())
@@ -223,6 +297,22 @@ def exercise(cli, directory):
         assert corrupted["status"]["recovery"] == "corrupt"
         converge(tracker, tree_rows(tree, store))
         summary["corrupt"] = dict(route=corrupted["status"]["recovery"], equal=True)
+        tracker.call("save")
+        maximums.append(tracker.finish())
+
+        offline_tree = tree / "offline-many"
+        offline_tree.mkdir()
+        for i in range(12000):
+            (offline_tree / f"entry-{i:05}.tmp").touch()
+        expected = tree_rows(tree, store)
+        tracker = TrackClient(cli, tree, snap, store, log)
+        initialized = tracker.wait("ready")
+        caught = tracker.wait("caught-up")
+        converge(tracker, expected)
+        summary["longReplay"] = dict(created=12000, route=initialized["status"]["recovery"],
+            delivered=caught["status"]["receivedEvents"], replayMilliseconds=(caught["time"] - initialized["time"]) / 1e6,
+            equal=True)
+        assert summary["longReplay"]["route"] == "replay"
         maximums.append(tracker.finish())
 
         for name in {item["kind"] for item in summary["iterations"]}:

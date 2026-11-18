@@ -74,7 +74,7 @@ private func run(_ args: [String]) throws {
                     "preparedMS": prepareTime, "savedMS": elapsed(started)])
     case "inspect-cache":
         guard args.count == 2 else { throw CommandError.usage }
-        let index = try SearchIndex.load(from: args[1])
+        let index = try SearchIndex.loadTrackedIndex(from: args[1])
         try report(index.volumes)
         try report(index.restoredRows())
     case "scan":

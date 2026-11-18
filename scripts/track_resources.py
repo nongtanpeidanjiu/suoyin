@@ -17,8 +17,10 @@ def nearest_rank(samples, fraction):
 def overlap(tracker, test):
     mutable = test / "mutable"
     stable = test / "controls"
+    marker = "r6stable-" + test.name
     control = [(str(path), path.stat().st_size, path.stat().st_mtime_ns)
-               for path in sorted(stable.iterdir())]
+               for path in sorted(stable.glob(marker + "-*"))]
+    assert len(control) == 40
     end = threading.Event()
     errors = []
 
@@ -42,7 +44,7 @@ def overlap(tracker, test):
     samples = []
     try:
         while thread.is_alive():
-            for mode, query in (("name", "m2stablemarker"), ("path", "controls m2stablemarker")):
+            for mode, query in (("name", marker), ("path", "controls " + marker)):
                 result = tracker.call("query", query=query, mode=mode, limit=50)
                 comparable = [(row["path"], row["size"], row["modified"]) for row in result["rows"]]
                 assert comparable == control
@@ -68,22 +70,53 @@ def overlap(tracker, test):
                         for m in ("name", "path")})
 
 
-def idle(tracker, seconds):
+def file_bytes(snapshot):
+    related = [snapshot, Path(str(snapshot) + ".changes")]
+    return {path.name: path.stat().st_size if path.is_file() else 0 for path in related}
+
+
+def window(first, last):
+    wall = (last["time"] - first["time"]) / 1e9
+    start, stop = first["status"], last["status"]
+    growth = sum(last["files"].values()) - sum(first["files"].values())
+    disk = last["processMetrics"]["processWrittenBytes"] - first["processMetrics"]["processWrittenBytes"]
+    return dict(wallSeconds=wall, cpuSeconds=last["cpu"] - first["cpu"],
+                singleCorePct=100 * (last["cpu"] - first["cpu"]) / wall,
+                baseWrites=stop["baseWrites"] - start["baseWrites"],
+                baseWrittenBytes=stop["baseWrittenBytes"] - start["baseWrittenBytes"],
+                journalFrames=stop["journalFrames"] - start["journalFrames"],
+                journalWrittenBytes=stop["journalWrittenBytes"] - start["journalWrittenBytes"],
+                processWrittenBytes=disk, persistentNetGrowth=growth,
+                extrapolatedProcessBytesPerDay=disk * 86400 / wall,
+                extrapolatedNetGrowthPerDay=growth * 86400 / wall,
+                events=stop["receivedEvents"] - start["receivedEvents"],
+                batches=stop["appliedBatches"] - start["appliedBatches"])
+
+
+def idle(tracker, seconds, snapshot):
     tracker.call("save")
-    before = tracker.call("status")
-    observations = [dict(load=os.getloadavg(), **before)]
+    before = dict(load=os.getloadavg(), files=file_bytes(snapshot), **tracker.call("status"))
+    observations = [before]
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(min(10, deadline - time.monotonic()))
-        observations.append(dict(load=os.getloadavg(), **tracker.call("status")))
-    after = observations[-1]
-    wall = (after["time"] - before["time"]) / 1e9
-    cpu = after["cpu"] - before["cpu"]
-    return dict(wallSeconds=wall, cpuSeconds=cpu, singleCorePct=100 * cpu / wall,
-                maxResidentBytes=max(r["residentBytes"] for r in observations),
-                events=after["status"]["receivedEvents"] - before["status"]["receivedEvents"],
-                batches=after["status"]["appliedBatches"] - before["status"]["appliedBatches"],
-                observations=observations)
+        row = dict(load=os.getloadavg(), files=file_bytes(snapshot), **tracker.call("status"))
+        observations.append(row)
+        if row["processMetrics"]["processWrittenBytes"] - before["processMetrics"]["processWrittenBytes"] >= 4_500_000_000:
+            raise RuntimeError("Stopped before approaching the measurement write limit")
+
+    def summarized(rows):
+        return dict(**window(rows[0], rows[-1]),
+                    maxResidentBytes=max(r["residentBytes"] for r in rows),
+                    maxPhysicalFootprint=max(r["processMetrics"]["physicalFootprint"] for r in rows))
+
+    result = summarized(observations)
+    if seconds >= 300:
+        cutoff = next(i for i, row in enumerate(observations)
+                      if row["time"] - before["time"] >= 300_000_000_000)
+        result["firstFiveMinutes"] = summarized(observations[:cutoff + 1])
+    result["observations"] = observations
+    return result
 
 
 if __name__ == "__main__":
@@ -93,25 +126,27 @@ if __name__ == "__main__":
     parser.add_argument("tree", type=Path)
     parser.add_argument("--seconds", type=int, default=300)
     parser.add_argument("--idle-only", action="store_true")
+    parser.add_argument("--snapshot", type=Path)
     args = parser.parse_args()
     state = args.state.resolve()
     tree = args.tree.resolve()
     for name in ("controls", "mutable"):
         (tree / name).mkdir(parents=True, exist_ok=True)
     for i in range(40):
-        control = tree / "controls" / f"m2stablemarker-{i:02}.txt"
+        control = tree / "controls" / f"r6stable-{tree.name}-{i:02}.tmp"
         if not control.exists():
             control.touch()
 
     with (state / "live-command.json").open("w") as f:
         json.dump(dict(scope="/", state=str(state), tree=str(tree), seconds=args.seconds), f)
-    tracker = TrackClient(args.cli, "/", state / "full.snapshot", state, state / "full-transcript.jsonl")
+    snapshot = args.snapshot.resolve() if args.snapshot else state / "full.snapshot"
+    tracker = TrackClient(args.cli, "/", snapshot, state, state / "full-transcript.tmp")
     try:
         ready = tracker.wait("ready", timeout=55)
         tracker.wait("caught-up", timeout=70)
         if not args.idle_only:
             write_summary(state / "overlap.json", overlap(tracker, tree))
-        result = idle(tracker, args.seconds)
+        result = idle(tracker, args.seconds, snapshot)
         result["startup"] = ready
         result["peakMonitoredRSS"] = tracker.maximum
         result["normalExit"] = False

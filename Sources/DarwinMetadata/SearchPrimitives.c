@@ -35,12 +35,14 @@ uint32_t dm_directory_candidate(const DMRecord *records, const uint8_t *attribut
     return UINT32_MAX;
 }
 
-uint32_t dm_child_directory(const DMRecord *records, const uint8_t *attributes,
-                            const uint8_t *names, const uint32_t *next, uint32_t first,
-                            const char *leaf) {
-    for (uint32_t row = first; row != UINT32_MAX; row = next[row]) {
-        if ((attributes[row] & KIND_MASK) == DIRECTORY &&
-            strcmp((const char *)names + records[row].offset, leaf) == 0) return row;
+uint32_t dm_child_lookup(const DMRecord *records, const uint8_t *attributes,
+                         const uint8_t *names, const DMChildRun *runs, uint32_t first,
+                         const char *leaf, bool directories_only) {
+    for (uint32_t run = first; run != UINT32_MAX; run = runs[run].next) {
+        for (uint32_t row = runs[run].start; row < runs[run].end; row++) {
+            if ((!directories_only || (attributes[row] & KIND_MASK) == DIRECTORY) &&
+                strcmp((const char *)names + records[row].offset, leaf) == 0) return row;
+        }
     }
     return UINT32_MAX;
 }

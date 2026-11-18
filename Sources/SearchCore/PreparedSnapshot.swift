@@ -25,6 +25,14 @@ private struct SnapshotMetadata: Codable {
 extension SearchIndex {
     private static let hotMagic = Array("M2INDEX2".utf8)
 
+    static func preparedIdentity(at path: String) throws -> Data {
+        let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? file.close() }
+        guard let header = try file.read(upToCount: 64), header.count == 64,
+              header.starts(with: hotMagic) else { throw SnapshotError.invalid }
+        return header.suffix(32)
+    }
+
     /// Persist search-ready tables and committed tracking state in one atomic file.
     public func savePrepared(to path: String, beforeReplace: (() throws -> Void)? = nil) throws {
         guard let tables = prepared else {
@@ -177,6 +185,15 @@ extension SearchIndex {
     public func saveAsLoaded(to path: String) throws {
         if loadedPrepared { try savePrepared(to: path) }
         else { try save(to: path) }
+    }
+
+    public static func loadTrackedIndex(from path: String) throws -> SearchIndex {
+        var index = try load(from: path)
+        if index.loadedPrepared, let root = index.tracking?.root {
+            var journal = ChangeJournal(snapshot: path, identity: try preparedIdentity(at: path))
+            try journal.restore(into: &index, root: root, repairSuffix: false)
+        }
+        return index
     }
 }
 

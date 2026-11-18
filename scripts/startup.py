@@ -51,13 +51,14 @@ def trial(cli, snapshot):
 
 def tracking_trial(cli, snapshot, own_data):
     tracker = TrackClient(cli, "/", snapshot.resolve(), own_data.resolve(),
-                          own_data / "warm-tracking-transcript.jsonl")
+                          own_data / "warm-tracking-transcript.tmp")
     try:
         first = tracker.wait("ready")
         elapsed = (time.monotonic_ns() - tracker.started) / 1e6
         assert first["status"]["recovery"] == "replay"
         tracker.wait("caught-up")
-        peak = tracker.finish()
+        # Leave the input snapshot and journal fixed for all seven trials.
+        peak = tracker.finish(kill=True)
         return dict(externalMilliseconds=elapsed, rssMax=peak, metrics={
             "peakBytesAtReady": first["peakBytes"], "residentBytes": first["residentBytes"],
             "rows": len(first["rows"]), "baseRecords": first["status"]["baseRecords"],

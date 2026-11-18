@@ -14,6 +14,13 @@ struct VolumeEvent {
         flags & UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved |
                        kFSEventStreamEventFlagItemRenamed) != 0
     }
+    var leafFileChange: Bool {
+        let file = UInt32(kFSEventStreamEventFlagItemIsFile)
+        let change = UInt32(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemCreated |
+                            kFSEventStreamEventFlagItemRemoved)
+        let allowed = file | change | UInt32(kFSEventStreamEventFlagItemInodeMetaMod)
+        return flags & file != 0 && flags & change != 0 && flags & ~allowed == 0
+    }
     var invalidatesHistory: Bool {
         flags & UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped |
                        kFSEventStreamEventFlagEventIdsWrapped | kFSEventStreamEventFlagRootChanged) != 0
@@ -127,10 +134,10 @@ struct EventCursor {
     private(set) var lastSeen: UInt64?
     private(set) var historyDelivered = false
     private let replaying: Bool
+    private var pendingHistory: UInt64?
 
     init(applied: UInt64?, replaying: Bool = false) {
         self.applied = applied
-        lastSeen = applied
         self.replaying = replaying
     }
 
@@ -144,23 +151,39 @@ struct EventCursor {
     /// Compare the callback boundary, as FSEventStreamGetLatestEventId does.
     mutating func receivedBatch(_ events: [VolumeEvent]) -> Bool {
         var boundary: UInt64?
-        var done = false
+        var done = historyDelivered
         for event in events {
             if event.invalidatesHistory { return false }
             if event.historyDone { done = true; continue }
             if event.id == 0 || event.id == UInt64.max { return false }
+            // Historical directory coalescing can deliver separate batches
+            // out of ID order. HistoryDone delimits live stream comparisons.
+            if replaying && !done { continue }
             boundary = max(boundary ?? 0, event.id)
         }
         if let boundary {
-            if lastSeen.map({ boundary < $0 }) == true && !(replaying && !historyDelivered) { return false }
-            lastSeen = max(lastSeen ?? 0, boundary)
+            if lastSeen.map({ boundary < $0 }) == true { return false }
+            lastSeen = boundary
         }
-        if done { historyDelivered = true }
+        historyDelivered = done
         return true
     }
 
     mutating func acknowledge(_ id: UInt64?) {
-        guard let id else { return }
-        if applied.map({ id > $0 }) ?? true { applied = id }
+        if let id { pendingHistory = max(pendingHistory ?? 0, id) }
+        if replaying && !historyDelivered { return }
+        if let safe = pendingHistory, applied.map({ safe > $0 }) ?? true { applied = safe }
+        pendingHistory = nil
+    }
+}
+
+struct RebuildThrottle {
+    static let interval: UInt64 = 600_000_000_000
+    private var lastStart: [Int: UInt64] = [:]
+
+    mutating func allow(volume: Int, now: UInt64) -> Bool {
+        if let previous = lastStart[volume], now - previous < Self.interval { return false }
+        lastStart[volume] = now
+        return true
     }
 }

@@ -1,5 +1,6 @@
 """Check the complete warm-tracker startup page from the saved index records."""
 import argparse
+import hashlib
 import heapq
 import json
 import mmap
@@ -8,6 +9,48 @@ from collections import defaultdict
 from pathlib import Path
 
 from oracle import ROOT, ROW, join, key
+
+
+def journal_changes(snapshot, identity, metadata):
+    tracking = metadata.get("tracking") or {}
+    overlay = dict(tracking.get("changes", {}))
+    masks = {}
+    path = Path(str(snapshot) + ".changes")
+    if not path.is_file():
+        return overlay, masks
+    with path.open("rb") as source:
+        if source.read(44) != b"M2DELTA1" + struct.pack("<I", 1) + identity:
+            return overlay, masks
+        while prefix := source.read(4):
+            if len(prefix) != 4:
+                break
+            length = struct.unpack("<I", prefix)[0]
+            if length > 32 * 1024 * 1024:
+                break
+            digest = source.read(32)
+            body = source.read(length)
+            if len(body) != length or hashlib.sha256(prefix + body).digest() != digest:
+                break
+            at = 0
+
+            def integer(code):
+                nonlocal at
+                value = struct.unpack_from("<" + code, body, at)[0]
+                at += struct.calcsize(code)
+                return value
+
+            for _ in range(integer("I")):
+                width = integer("I")
+                name = body[at:at + width].decode()
+                at += width
+                if integer("B"):
+                    overlay[name] = dict(attribute=integer("B"), size=integer("q"), modified=integer("q"))
+                else:
+                    overlay.pop(name, None)
+            for _ in range(integer("I")):
+                row = integer("I")
+                masks[row] = bool(integer("B"))
+    return overlay, masks
 
 
 def first_page(snapshot):
@@ -19,6 +62,7 @@ def first_page(snapshot):
         metadata_start = pool + names + 20 * count + 4 * changed + folded
         assert version == 1 and metadata_start + metadata_size == len(data)
         metadata = json.loads(data[metadata_start:])
+        overlay, masks = journal_changes(snapshot, data[32:64], metadata)
 
         def stored(index):
             offset, parent, size, modified = ROW.unpack_from(data, 64 + ROW.size * index)
@@ -41,15 +85,14 @@ def first_page(snapshot):
         def candidates():
             for index in range(count):
                 flags = data[flag_start + index]
-                if flags & 3 == 0 or flags & 48:
+                if flags & 3 == 0 or flags & 16 or masks.get(index, bool(flags & 32)):
                     continue
                 raw, _, size, modified = stored(index)
                 folded_name = key(raw)
                 if b"a" in folded_name:
                     yield folded_name, raw, index, size, modified, None
-            tracking = metadata["tracking"] or {}
             groups = defaultdict(list)
-            for path, entry in tracking.get("changes", {}).items():
+            for path, entry in overlay.items():
                 parent, _, name = path.rpartition("/")
                 if not entry["attribute"] & 48:
                     groups[parent or "/"].append((path, name, entry))

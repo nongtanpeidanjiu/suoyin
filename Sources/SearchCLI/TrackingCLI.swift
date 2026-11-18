@@ -26,6 +26,8 @@ private struct Line: Encodable {
     var beforeApplying: Bool?
     var intervals: [ApplyInterval]?
     var queuedEvent: UInt64?
+    var processMetrics: [String: UInt64]?
+    var indexBytes: [String: Int]?
 }
 
 func usageAtProcess() -> (Double, Int) {
@@ -44,11 +46,14 @@ func runTrackingCLI(_ args: [String]) throws {
                   queryEnd: UInt64? = nil, before: TrackingStatus? = nil,
                   intervals: [ApplyInterval]? = nil, queuedEvent: UInt64? = nil) {
         let info = usageAtProcess()
+        let measure = name == "status" || name == "ready" || name == "rebuilt" || name == "quit"
+        let components = name == "status" ? tracker.memoryBreakdown() : nil
         let line = Line(event: name, time: DispatchTime.now().uptimeNanoseconds, cpu: info.0,
                         residentBytes: SearchIndex.residentBytes(), peakBytes: info.1,
                         status: tracker.snapshotStatus(), rows: rows, queryStart: queryStart,
                         queryEnd: queryEnd, beforeGeneration: before?.generation, beforeApplying: before?.applying,
-                        intervals: intervals, queuedEvent: queuedEvent)
+                        intervals: intervals, queuedEvent: queuedEvent,
+                        processMetrics: measure ? ChangeTracker.processMetrics() : nil, indexBytes: components)
         guard var data = try? JSONEncoder().encode(line) else { return }
         data.append(10)
         stdout.withLock { FileHandle.standardOutput.write(data) }
@@ -96,10 +101,15 @@ func runTrackingCLI(_ args: [String]) throws {
             case "resume" where allowedFaults: tracker.holdUpdates(false); announce("resume")
             case "invalidate-history" where allowedFaults: tracker.simulateDroppedHistory(); announce("invalidated")
             case "pause-before-replace" where allowedFaults:
-                try tracker.save {
+                try tracker.compactForTesting(beforeReplace: {
                     announce("before-replace")
                     Darwin.raise(SIGSTOP)
-                }
+                })
+            case "pause-after-replace" where allowedFaults:
+                try tracker.compactForTesting(afterReplace: {
+                    announce("after-replace")
+                    Darwin.raise(SIGSTOP)
+                })
             case "quit":
                 try tracker.stop()
                 announce("quit")

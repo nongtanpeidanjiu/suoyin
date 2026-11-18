@@ -27,26 +27,64 @@ enum DirectoryObservation {
 }
 
 struct DirectoryLinks {
-    let head: [UInt32]
-    let next: [UInt32]
+    private let present: [UInt64]
+    private let ranks: [UInt32]
+    private let heads: [UInt32]
+    let runs: [DMChildRun]
     let anchors: [String: UInt32]
 
     init(_ index: SearchIndex) {
         var first = [UInt32](repeating: .max, count: index.recordCount)
-        var following = first
+        var childRuns: [DMChildRun] = []
         var roots: [String: UInt32] = [:]
-        for i in index.records.indices.reversed() {
-            let parent = index.records[i].parent
+        var cursor = 0
+        while cursor < index.recordCount {
+            let parent = index.records[cursor].parent
             if parent == .max {
-                roots[index.name(UInt32(i))] = UInt32(i)
-            } else {
-                following[i] = first[Int(parent)]
-                first[Int(parent)] = UInt32(i)
+                roots[index.name(UInt32(cursor))] = UInt32(cursor)
+                cursor += 1
+                continue
             }
+            let start = cursor
+            repeat { cursor += 1 } while cursor < index.recordCount && index.records[cursor].parent == parent
+            childRuns.append(DMChildRun(start: UInt32(start), end: UInt32(cursor), next: first[Int(parent)]))
+            first[Int(parent)] = UInt32(childRuns.count - 1)
         }
-        head = first
-        next = following
+        var bits = [UInt64](repeating: 0, count: (first.count + 63) / 64)
+        var compact: [UInt32] = []
+        for (i, head) in first.enumerated() where head != .max {
+            bits[i >> 6] |= 1 << (i & 63)
+            compact.append(head)
+        }
+        var rank: UInt32 = 0
+        ranks = bits.map { word in
+            defer { rank += UInt32(word.nonzeroBitCount) }
+            return rank
+        }
+        present = bits
+        heads = compact
+        runs = childRuns
         anchors = roots
+    }
+
+    func head(_ parent: UInt32) -> UInt32 {
+        let word = Int(parent >> 6)
+        let bit = UInt64(1) << (parent & 63)
+        guard present[word] & bit != 0 else { return .max }
+        return heads[Int(ranks[word]) + (present[word] & (bit - 1)).nonzeroBitCount]
+    }
+
+    func forEachChild(_ parent: UInt32, _ body: (UInt32) -> Void) {
+        var index = head(parent)
+        while index != .max {
+            let run = runs[Int(index)]
+            for row in run.start..<run.end { body(row) }
+            index = run.next
+        }
+    }
+
+    var bytes: Int {
+        present.capacity * 8 + (ranks.capacity + heads.capacity) * 4 + runs.capacity * MemoryLayout<DMChildRun>.stride
     }
 }
 
@@ -136,6 +174,75 @@ struct LiveIndex {
         return result
     }
 
+    func journalImage(at positions: [String: UInt64]) -> JournalImage {
+        JournalImage(rows: state.changes, masks: base.suppressed, coverage: state.restricted,
+                     positions: positions)
+    }
+
+    /// Rebuild row IDs without expanding every base row into a path string.
+    /// A directory with updated metadata keeps its descendants attached.
+    func compacted() -> SearchIndex {
+        var result = SearchIndex()
+        var edits = state.changes
+        var remap = [UInt32](repeating: .max, count: base.recordCount)
+        var parents: [String: UInt32] = [:]
+        let wantedParents = Set(edits.keys.map(parentPath))
+        let parentNames = Set(wantedParents.map(leafName))
+        let editedDirectories = Set(edits.compactMap { $0.value.directory ? leafName($0.key) : nil })
+        result.reserve(base.recordCount + edits.count, nameBytes: base.names.count)
+        base.names.withUnsafeBufferPointer { pool in
+            for (i, row) in base.records.enumerated() {
+                let id = UInt32(i)
+                let parent = row.parent == .max ? .max : remap[Int(row.parent)]
+                if row.parent != .max && parent == .max { continue }
+                let flag = base.attributes[i]
+                let kind = flag & Kind.mask
+                let size: Int64
+                let modified: Int64
+                let attributes: UInt8
+                if base.isSuppressed(i) {
+                    guard kind == Kind.directory, editedDirectories.contains(base.name(id)) else { continue }
+                    let path = base.fullPath(id)
+                    guard let edited = edits[path], edited.directory else { continue }
+                    edits.removeValue(forKey: path)
+                    size = edited.size
+                    modified = edited.modified
+                    attributes = edited.attribute
+                } else {
+                    size = row.size
+                    modified = row.modified
+                    attributes = flag
+                }
+                let start = Int(row.offset)
+                let end = i + 1 < base.recordCount ? Int(base.records[i + 1].offset) : pool.count
+                let raw = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: start), count: end - start - 1)
+                let appended = result.append(bytes: raw, parent: parent, size: size,
+                                             modified: modified, attribute: attributes)
+                remap[i] = appended
+                if kind == Kind.anchor || kind == Kind.directory && parentNames.contains(base.name(id)) {
+                    let path = base.fullPath(id)
+                    if wantedParents.contains(path) { parents[path] = appended }
+                }
+            }
+        }
+        for path in edits.keys.sorted() {
+            let location = parentPath(path)
+            let parent: UInt32
+            if let found = parents[location] { parent = found }
+            else {
+                parent = result.append(location, attribute: Kind.anchor)
+                parents[location] = parent
+            }
+            let row = edits[path]!
+            let appended = result.append(leafName(path), parent: parent, size: row.size,
+                                         modified: row.modified, attribute: row.attribute)
+            if row.directory { parents[path] = appended }
+        }
+        result.tracking = TrackingState(root: state.root, changes: [:], restricted: state.restricted)
+        result.prepare()
+        return result
+    }
+
     /// Apply the current access result before any cached rows can be published.
     mutating func verifyStartupCoverage(at paths: [String],
                                         observe: (String) -> DirectoryObservation?) -> [String] {
@@ -161,19 +268,7 @@ struct LiveIndex {
             let parent = parentPath(path)
             if parent == path { return nil }
             let previous = directoryID(parent)
-            found = previous.flatMap { id in
-                let candidate = links.next.withUnsafeBufferPointer { next in
-                    base.records.withUnsafeBufferPointer { records in
-                        base.attributes.withUnsafeBufferPointer { attributes in
-                            base.names.withUnsafeBufferPointer { names in
-                                dm_child_directory(records.baseAddress, attributes.baseAddress,
-                                    names.baseAddress, next.baseAddress, links.head[Int(id)], name)
-                            }
-                        }
-                    }
-                }
-                return candidate == .max ? nil : candidate
-            }
+            found = previous.flatMap { child(named: name, of: $0, using: links, directoriesOnly: true) }
         } else {
             found = findDirectoryDirect(path, name: name)
         }
@@ -206,15 +301,36 @@ struct LiveIndex {
                             attribute: base.attributes[Int(id)] & ~Kind.suppressed)
     }
 
+    private func child(named leaf: String, of parent: UInt32, using links: DirectoryLinks,
+                       directoriesOnly: Bool) -> UInt32? {
+        let candidate = links.runs.withUnsafeBufferPointer { runs in
+            base.records.withUnsafeBufferPointer { records in
+                base.attributes.withUnsafeBufferPointer { attributes in
+                    base.names.withUnsafeBufferPointer { names in
+                        dm_child_lookup(records.baseAddress, attributes.baseAddress, names.baseAddress,
+                                        runs.baseAddress, links.head(parent), leaf, directoriesOnly)
+                    }
+                }
+            }
+        }
+        return candidate == .max ? nil : candidate
+    }
+
+    private mutating func baseID(at path: String) -> UInt32? {
+        let parent = parentPath(path)
+        let leaf = leafName(path)
+        if let links, let id = directoryID(parent) {
+            return child(named: leaf, of: id, using: links, directoriesOnly: false)
+        }
+        if links != nil { return nil }
+        return baseChildren(parent)[leaf]
+    }
+
     private mutating func baseChildren(_ path: String) -> [String: UInt32] {
         guard let parent = directoryID(path) else { return [:] }
         var children: [String: UInt32] = [:]
         if let links {
-            var id = links.head[Int(parent)]
-            while id != .max {
-                children[base.name(id)] = id
-                id = links.next[Int(id)]
-            }
+            links.forEachChild(parent) { children[base.name($0)] = $0 }
         } else {
             for i in (Int(parent) + 1)..<base.recordCount where base.records[i].parent == parent {
                 children[base.name(UInt32(i))] = UInt32(i)
@@ -225,9 +341,23 @@ struct LiveIndex {
 
     mutating func entry(at path: String) -> TrackedEntry? {
         if let overlay = state.changes[path] { return overlay }
-        guard let id = baseChildren(parentPath(path))[leafName(path)],
+        guard let id = baseID(at: path),
               base.attributes[Int(id)] & Kind.excluded == 0, !base.isSuppressed(Int(id)) else { return nil }
         return baseEntry(id)
+    }
+
+    mutating func refreshFile(_ path: String,
+                             observation: (UInt8) -> (file: TrackedEntry?, parent: TrackedEntry)?) -> Bool {
+        guard !state.restricted.contains(where: { inside(path, $0) }) else { return false }
+        let parent = parentPath(path)
+        let folder = entry(at: parent)
+        guard folder?.directory == true || parent == state.root,
+              let observed = observation(folder?.attribute ?? Kind.directory) else { return false }
+        let former = entry(at: path)
+        if former?.directory == true || observed.file?.directory == true { return false }
+        if observed.file != former { set(observed.file, path: path, original: baseID(at: path)) }
+        if let folder, observed.parent != folder { set(observed.parent, path: parent, original: baseID(at: parent)) }
+        return true
     }
 
     private mutating func set(_ value: TrackedEntry?, path: String, original: UInt32?) {
@@ -250,11 +380,9 @@ struct LiveIndex {
             if let links {
                 var parents = [root]
                 while let parent = parents.popLast() {
-                    var id = links.head[Int(parent)]
-                    while id != .max {
+                    links.forEachChild(parent) { id in
                         base.setSuppressed(Int(id), true)
-                        if links.head[Int(id)] != .max { parents.append(id) }
-                        id = links.next[Int(id)]
+                        if links.head(id) != .max { parents.append(id) }
                     }
                 }
             }
@@ -273,7 +401,7 @@ struct LiveIndex {
             return []
         case .absent:
             removeSubtree(path, includingRoot: true)
-            if let id = baseChildren(parentPath(path))[leafName(path)] {
+            if let id = baseID(at: path) {
                 set(nil, path: path, original: id)
             }
             state.restricted = state.restricted.filter { !inside($0, path) }
@@ -283,28 +411,35 @@ struct LiveIndex {
             if path != state.root, let existing = entry(at: path) {
                 let owned = TrackedEntry(size: own.size, modified: own.modified,
                                          attribute: existing.attribute)
-                let id = baseChildren(parentPath(path))[leafName(path)]
+                let id = baseID(at: path)
                 if owned != existing { set(owned, path: path, original: id) }
             }
             let originals = baseChildren(path)
-            var prior = [String: TrackedEntry]()
-            prior.reserveCapacity(originals.count)
+            var addedDirectories: [String] = []
             for (name, id) in originals where base.attributes[Int(id)] & Kind.excluded == 0 && !base.isSuppressed(Int(id)) {
-                prior[name] = baseEntry(id)
+                let entry = baseEntry(id)
+                guard children[name] == nil || entry.directory && children[name]?.directory == false else { continue }
+                let location = joinedPath(path, name)
+                if entry.directory { removeSubtree(location, includingRoot: true) }
+                set(nil, path: location, original: id)
             }
             for location in changedChildren[path] ?? [] {
-                prior[leafName(location)] = state.changes[location]
-            }
-            var addedDirectories: [String] = []
-            for (name, entry) in prior where children[name] == nil || entry.directory && children[name]?.directory == false {
-                let location = joinedPath(path, name)
+                let name = leafName(location)
+                guard let entry = state.changes[location],
+                      children[name] == nil || entry.directory && children[name]?.directory == false else { continue }
                 if entry.directory { removeSubtree(location, includingRoot: true) }
                 set(nil, path: location, original: originals[name])
             }
             for (name, entry) in children {
+                let original = originals[name]
+                let baseValue = original.flatMap { id in
+                    base.attributes[Int(id)] & Kind.excluded == 0 && !base.isSuppressed(Int(id)) ? baseEntry(id) : nil
+                }
+                if !needsRestore, baseValue == entry { continue }
                 let location = joinedPath(path, name)
-                if prior[name] != entry { set(entry, path: location, original: originals[name]) }
-                if entry.directory && (needsRestore || prior[name]?.directory != true) && entry.attribute & Kind.pending == 0 {
+                let prior = state.changes[location] ?? baseValue
+                if prior != entry { set(entry, path: location, original: original) }
+                if entry.directory && (needsRestore || prior?.directory != true) && entry.attribute & Kind.pending == 0 {
                     addedDirectories.append(location)
                 }
             }
@@ -312,10 +447,38 @@ struct LiveIndex {
         }
     }
 
+    func readView() -> LiveSearchView {
+        LiveSearchView(base: base, overlays: state.changes.isEmpty ? [] : overlays)
+    }
+
+    func memoryBreakdown() -> [String: Int] {
+        var result = base.storageBreakdown()
+        result["directoryLinks"] = links?.bytes ?? 0
+        result["overlayRowPayload"] = state.changes.reduce(0) { $0 + $1.key.utf8.count + MemoryLayout<TrackedEntry>.stride }
+        result["overlayChildPathPayload"] = changedChildren.reduce(0) { sum, group in
+            sum + group.key.utf8.count + group.value.reduce(0) { $0 + $1.utf8.count }
+        }
+        result["overlaySearchTables"] = overlays.reduce(0) { sum, shard in
+            sum + shard.storageBreakdown().values.reduce(0, +)
+        }
+        return result
+    }
+
+    func search(_ query: String, mode: QueryMode, column: SearchColumn, direction: SearchDirection,
+                showAll: Bool, offset: Int, limit: Int) -> [SearchRow] {
+        readView().search(query, mode: mode, column: column, direction: direction,
+                          showAll: showAll, offset: offset, limit: limit)
+    }
+}
+
+struct LiveSearchView {
+    let base: SearchIndex
+    let overlays: [SearchIndex]
+
     func search(_ query: String, mode: QueryMode, column: SearchColumn, direction: SearchDirection,
                 showAll: Bool, offset: Int, limit: Int) -> [SearchRow] {
         guard offset >= 0, limit > 0, offset <= Int.max - limit else { return [] }
-        if state.changes.isEmpty {
+        if overlays.isEmpty {
             return base.search(query, mode: mode, column: column, direction: direction,
                                showAll: showAll, offset: offset, limit: limit)
         }

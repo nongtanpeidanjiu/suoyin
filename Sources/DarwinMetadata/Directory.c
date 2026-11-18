@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <string.h>
 #include <malloc/malloc.h>
+#include <libproc.h>
+#include <sys/resource.h>
 
 static int expected_error(int error, DMCounts *counts) {
     switch (error) {
@@ -176,6 +178,22 @@ uint64_t dm_resident_bytes(void) {
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
     return result == KERN_SUCCESS ? info.resident_size : 0;
+}
+
+DMProcessMetrics dm_process_metrics(void) {
+    DMProcessMetrics result = {0};
+    struct rusage_info_v4 usage = {0};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&usage) == 0) {
+        result.available = true;
+        result.footprint = usage.ri_phys_footprint;
+        result.footprint_peak = usage.ri_lifetime_max_phys_footprint;
+        result.written_bytes = usage.ri_diskio_byteswritten;
+    }
+    malloc_statistics_t heap = {0};
+    malloc_zone_statistics(NULL, &heap);
+    result.heap_used = heap.size_in_use;
+    result.heap_reserved = heap.size_allocated;
+    return result;
 }
 
 void dm_release_allocator_cache(void) {

@@ -72,6 +72,18 @@ struct PreparedSearch {
 }
 
 extension SearchIndex {
+    func storageBreakdown() -> [String: Int] {
+        let keyBytes = prepared.map { $0.keyBytes.capacity + 4 * ($0.keyOffsets.capacity + $0.changedRows.capacity) } ?? 0
+        let order = prepared.map {
+            4 * ($0.nameOrder.capacity + $0.pathOrder.capacity + $0.sizeOrder.capacity + $0.modifiedOrder.capacity)
+        } ?? 0
+        return [
+            "recordsAndAttributes": records.capacity * MemoryLayout<DMRecord>.stride + attributes.capacity,
+            "names": names.capacity, "foldedKeys": keyBytes, "sortTables": order,
+            "suppressedRows": suppressed.capacity,
+        ]
+    }
+
     /// Materialize shared folded keys and exact sort permutations for this index value.
     public mutating func prepare() {
         guard prepared == nil, !records.isEmpty else { return }

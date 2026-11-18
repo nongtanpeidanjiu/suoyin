@@ -355,7 +355,7 @@ extension WalkScope {
 
     /// Observe one directory. A denied read is distinct from an empty directory.
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String]) throws -> DirectoryObservation {
-        guard !insideProviderTrash(path) else { return .absent }
+        guard !insideProviderTrash(path), !excluded.contains(where: { inside(path, $0) }) else { return .absent }
         if cloudRoots.contains(where: { inside(path, $0) }) {
             // Avoid walking through an unloaded ancestor to inspect its child.
             var ancestors: [String] = [path]
@@ -391,20 +391,29 @@ extension WalkScope {
             throw ScanError.metadata(path: path, error: errno)
         }
         var children: [String: TrackedEntry] = [:]
+        children.reserveCapacity(batch.items.count)
         let package = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
             .contains { path.hasSuffix($0) }
         let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
+        let excludedChildren = Set(excluded.filter { parentPath($0) == path }.map(leafName))
+        let mirroredChildren = Set(mirrors.filter { parentPath($0) == path }.map(leafName))
+        let cloudChildren = Set(cloudRoots.filter { parentPath($0) == path }.map(leafName))
+        let providerTrash = isProviderTrash(logical)
+        let containsDataRoot = wholeDisk && path == parentPath(dataRoot)
+        let dataName = leafName(dataRoot)
+        let mayHideSystemChild = logical == "/" || logical == "/Library" || logical == "/private" ||
+                                 logical == "/Library/Developer" || logical == parentPath(homeCaches)
         batch.names.withUnsafeBufferPointer { pool in
             for item in batch.items {
                 let bytes = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: item.start), count: item.length)
                 let name = String(decoding: bytes, as: UTF8.self)
-                let target = joinedPath(path, name)
-                if excluded.contains(where: { inside(target, $0) }) || mirrors.contains(target) ||
-                    wholeDisk && target == dataRoot || isProviderTrash(logical) && name == ".Trash" { continue }
+                if excludedChildren.contains(name) || mirroredChildren.contains(name) ||
+                    containsDataRoot && name == dataName ||
+                    providerTrash && name == ".Trash" { continue }
                 var flags: UInt8 = item.type == 2 ? Kind.directory : item.type == 1 ? Kind.file : Kind.other
                 if inherited & Kind.hidden != 0 || name.hasPrefix(".") || item.flags & 0x8000 != 0 ||
-                    package || defaultHiddenDirectory(joinedPath(logical, name)) { flags |= Kind.hidden }
-                if cloudRoots.contains(target) || target == "/usr/local" { flags &= ~Kind.hidden }
+                    package || mayHideSystemChild && defaultHiddenDirectory(joinedPath(logical, name)) { flags |= Kind.hidden }
+                if cloudChildren.contains(name) || path == "/usr" && name == "local" { flags &= ~Kind.hidden }
                 if item.flags & 0x40000000 != 0 { flags |= Kind.pending }
                 children[name] = TrackedEntry(size: item.size, modified: item.modified, attribute: flags)
             }
@@ -414,5 +423,43 @@ extension WalkScope {
         let time = overflow || addOverflow ? (own.st_mtimespec.tv_sec < 0 ? Int64.min : Int64.max) : total
         return .readable(own: TrackedEntry(size: own.st_size, modified: time, attribute: Kind.directory),
                          children: children)
+    }
+
+    /// An explicit regular-file event never traverses a substituted leaf or
+    /// a cloud scope. Renames and ambiguous results use directory reconciliation.
+    func observeFile(_ path: String, inherited: UInt8) -> (file: TrackedEntry?, parent: TrackedEntry)? {
+        guard !cloudRoots.contains(where: { inside(path, $0) }) else { return nil }
+        let parent = parentPath(path)
+        let fd = Darwin.open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { _ = Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_flags & 0x40000000 == 0,
+              info.st_dev == primaryDevice || info.st_dev == dataDevice,
+              let folder = Self.fileEntry(info, attribute: inherited)
+        else { return nil }
+        var result: Int32
+        let name = leafName(path)
+        repeat { result = fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) } while result < 0 && errno == EINTR
+        if result < 0 && errno == ENOENT { return (nil, folder) }
+        guard result == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_dev == primaryDevice || info.st_dev == dataDevice
+        else { return nil }
+        var attribute = Kind.file | (inherited & Kind.hidden)
+        let package = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
+            .contains { parent.hasSuffix($0) }
+        if name.hasPrefix(".") || info.st_flags & 0x8000 != 0 || package || defaultHiddenDirectory(path) {
+            attribute |= Kind.hidden
+        }
+        if info.st_flags & 0x40000000 != 0 { attribute |= Kind.pending }
+        guard let entry = Self.fileEntry(info, attribute: attribute) else { return nil }
+        return (entry, folder)
+    }
+
+    private static func fileEntry(_ info: stat, attribute: UInt8) -> TrackedEntry? {
+        let (seconds, overflow) = Int64(info.st_mtimespec.tv_sec).multipliedReportingOverflow(by: 1_000_000_000)
+        let (modified, sumOverflow) = seconds.addingReportingOverflow(Int64(info.st_mtimespec.tv_nsec))
+        guard !overflow, !sumOverflow else { return nil }
+        return TrackedEntry(size: info.st_size, modified: modified, attribute: attribute)
     }
 }

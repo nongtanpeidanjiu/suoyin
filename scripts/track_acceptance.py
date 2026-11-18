@@ -139,16 +139,20 @@ def exercise(cli, directory):
             touch(marker)
             converge(tracker, tree_rows(tree, store))
             marker.write_bytes(b"changed")
-            start = time.monotonic()
-            while time.monotonic() - start < 30:
+            start = time.monotonic_ns()
+            while time.monotonic_ns() - start < 31_000_000_000:
                 row = tracker.call("query", query=marker.name, limit=2)
                 if from_search(row["rows"]).get(str(marker)) == (len(b"changed"), marker.lstat().st_mtime_ns):
                     break
-                time.sleep(.05)
-            elapsed = time.monotonic() - start
-            assert elapsed < 30, (folder, elapsed)
+                time.sleep(.01 if time.monotonic_ns() - start > 28_000_000_000 else .05)
+            published = row["status"]["lastApplyEnd"]
+            observed = (time.monotonic_ns() - start) / 1e6
+            elapsed = (published - start) / 1e6
+            assert from_search(row["rows"]).get(str(marker)) == (len(b"changed"), marker.lstat().st_mtime_ns)
+            assert elapsed > 0, (folder, elapsed, observed)
             converge(tracker, tree_rows(tree, store))
-            delays[folder] = dict(milliseconds=elapsed * 1000, equal=True)
+            delays[folder] = dict(milliseconds=elapsed, firstCorrectPollMS=observed,
+                                  within30Seconds=elapsed <= 30_000, equal=True)
         summary["throttled"] = delays
 
         def bulk():

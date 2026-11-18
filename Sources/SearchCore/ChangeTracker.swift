@@ -91,6 +91,7 @@ public final class ChangeTracker {
     private var directories = DirectorySchedule()
     private var deliveredHigh: [Int: UInt64] = [:]
     private var directoryWake: UInt64?
+    private var directoryTimer: DispatchSourceTimer?
     private static let pendingLimit = 50_000
     private var journal: ChangeJournal?
     private var durableImage: JournalImage?
@@ -435,14 +436,27 @@ public final class ChangeTracker {
     }
 
     private func scheduleDirectoryWake() {
-        guard let next = directories.next else { directoryWake = nil; return }
-        if let scheduled = directoryWake, scheduled <= next { return }
+        let next = directories.next
+        guard next != directoryWake else { return }
         directoryWake = next
-        update.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: next)) { [weak self] in
-            guard let self, self.directoryWake == next else { return }
-            self.directoryWake = nil
-            self.drain()
+        guard let next else {
+            directoryTimer?.schedule(deadline: .distantFuture)
+            return
         }
+        let timer: DispatchSourceTimer
+        if let existing = directoryTimer {
+            timer = existing
+        } else {
+            timer = DispatchSource.makeTimerSource(flags: .strict, queue: update)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.directoryWake = nil
+                self.drain()
+            }
+            directoryTimer = timer
+            timer.activate()
+        }
+        timer.schedule(deadline: DispatchTime(uptimeNanoseconds: next), leeway: .nanoseconds(0))
     }
 
     private func drain(force: Bool = false) {
@@ -927,6 +941,8 @@ public final class ChangeTracker {
             for stream in sources.values { stream.stop() }
             sources.removeAll()
             closed = true
+            directoryTimer?.cancel()
+            directoryTimer = nil
             if snapshotStatus().error == nil {
                 if needsBaseWrite { try persistPendingBase(onExit: true) }
                 else { try flushJournal() }

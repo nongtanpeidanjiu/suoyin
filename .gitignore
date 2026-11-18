@@ -3,6 +3,7 @@ spike/
 .build/
 .swiftpm/
 .m1-tmp/
+.m2-tmp/
 .DS_Store
 *.bin
 *.snapshot

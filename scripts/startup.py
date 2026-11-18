@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from measure import RSS_LIMIT, STALL_SECONDS
+from track_client import TrackClient
 
 
 def trial(cli, snapshot):
@@ -48,11 +49,30 @@ def trial(cli, snapshot):
                 metrics=metrics, rows=json.loads(rest))
 
 
+def tracking_trial(cli, snapshot, own_data):
+    tracker = TrackClient(cli, "/", snapshot.resolve(), own_data.resolve(),
+                          own_data / "warm-tracking-transcript.jsonl")
+    try:
+        first = tracker.wait("ready")
+        elapsed = (time.monotonic_ns() - tracker.started) / 1e6
+        assert first["status"]["recovery"] == "replay"
+        tracker.wait("caught-up")
+        peak = tracker.finish()
+        return dict(externalMilliseconds=elapsed, rssMax=peak, metrics={
+            "peakBytesAtReady": first["peakBytes"], "residentBytes": first["residentBytes"],
+            "rows": len(first["rows"]), "baseRecords": first["status"]["baseRecords"],
+            "overlayRows": first["status"]["overlayRows"], "route": first["status"]["recovery"],
+        }, rows=first["rows"])
+    finally:
+        tracker.terminate_fixture_if_needed()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("cli", type=Path)
     parser.add_argument("snapshot", type=Path)
+    parser.add_argument("--track", type=Path, metavar="OWN_DATA")
     opts = parser.parse_args()
     for sample in range(7):
-        print(json.dumps(dict(sequence=sample + 1, **trial(opts.cli, opts.snapshot)), ensure_ascii=False),
-              flush=True)
+        result = tracking_trial(opts.cli, opts.snapshot, opts.track) if opts.track else trial(opts.cli, opts.snapshot)
+        print(json.dumps(dict(sequence=sample + 1, **result), ensure_ascii=False), flush=True)

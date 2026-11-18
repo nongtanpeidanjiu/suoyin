@@ -11,6 +11,7 @@
 #include <malloc/malloc.h>
 #include <libproc.h>
 #include <sys/resource.h>
+#include <uuid/uuid.h>
 
 static int expected_error(int error, DMCounts *counts) {
     switch (error) {
@@ -183,6 +184,18 @@ int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
     // Opening the directory may ask the provider for its listing. Regular
     // files are only inspected with getattrlistbulk or fstatat.
     return list(path, device, device, false, true, callback, context, counts);
+}
+
+bool dm_volume_uuid(const char *path, char output[37]) {
+    struct attrlist attributes = {
+        .bitmapcount = ATTR_BIT_MAP_COUNT,
+        .volattr = ATTR_VOL_INFO | ATTR_VOL_UUID
+    };
+    struct { uint32_t length; uuid_t uuid; } result = {0};
+    if (getattrlist(path, &attributes, &result, sizeof(result), 0) != 0 ||
+        result.length < sizeof(result) || uuid_is_null(result.uuid)) return false;
+    uuid_unparse_upper(result.uuid, output);
+    return true;
 }
 
 uint64_t dm_resident_bytes(void) {

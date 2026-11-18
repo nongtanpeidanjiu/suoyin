@@ -116,6 +116,7 @@ struct DirectoryUpdate {
     var files: [String: Bool] = [:]
     var metadata = false
     var pending: [Int: UInt64] = [:]
+    var structural = false
 
     mutating func add(event: UInt64, volume: Int) {
         pending[volume] = min(pending[volume] ?? .max, event)
@@ -125,6 +126,7 @@ struct DirectoryUpdate {
         if let recursive = other.recursive { self.recursive = self.recursive == true || recursive }
         if recursive == nil { files.merge(other.files) { $0 || $1 }; metadata = metadata || other.metadata }
         else { files.removeAll() }
+        structural = structural || other.structural
         for (volume, event) in other.pending { add(event: event, volume: volume) }
     }
 }
@@ -139,8 +141,8 @@ struct DirectorySchedule {
     }
     private struct Pending {
         var update: DirectoryUpdate
-        let due: UInt64
-        let interval: UInt64
+        var due: UInt64
+        var interval: UInt64
         let hidden: Bool
     }
     private var visits: [String: Visit] = [:]
@@ -166,20 +168,32 @@ struct DirectorySchedule {
         pending[path]?.hidden ?? visits[path].flatMap { now - $0.time < Self.quiet ? $0.hidden : nil }
     }
 
-    mutating func enqueue(_ update: DirectoryUpdate, at path: String, hidden: Bool, now: UInt64) {
+    mutating func enqueue(_ update: DirectoryUpdate, at path: String, hidden: Bool, now: UInt64,
+                          externalFileEvents: Bool = false) {
+        let prompt = externalFileEvents && update.structural && !hidden
         if now - lastPrune >= Self.quiet {
             visits = visits.filter { now - $0.value.time < Self.quiet }
             lastPrune = now
         }
-        if pending[path] != nil {
-            pending[path]?.update.merge(update)
+        if var waiting = pending[path] {
+            waiting.update.merge(update)
+            if prompt {
+                waiting.due = min(now, waiting.due)
+                waiting.interval = 0
+            }
+            pending[path] = waiting
             return
         }
         let last = visits[path].flatMap { now - $0.time < Self.quiet ? $0 : nil }
-        let interval = hidden ? 30 * Self.second : last.map {
-            if $0.interval == 0, now - $0.time >= 5 * Self.second { return 0 }
-            return min(30 * Self.second, max(5 * Self.second, $0.interval * 2))
-        } ?? 0
+        let interval: UInt64
+        if prompt { interval = 0 }
+        else if hidden { interval = 30 * Self.second }
+        else {
+            interval = last.map {
+                if $0.interval == 0, now - $0.time >= 5 * Self.second { return 0 }
+                return min(30 * Self.second, max(5 * Self.second, $0.interval * 2))
+            } ?? 0
+        }
         let due = last.map { max(now, $0.time + interval) } ?? now
         pending[path] = Pending(update: update, due: due, interval: interval, hidden: hidden)
     }

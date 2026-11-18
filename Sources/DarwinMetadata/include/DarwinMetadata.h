@@ -20,6 +20,7 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
             DMEntryCallback callback, void *context, DMCounts *counts);
 int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
                   void *context, DMCounts *counts);
+bool dm_volume_uuid(const char *path, char output[37]);
 uint64_t dm_resident_bytes(void);
 typedef struct {
     uint64_t footprint, footprint_peak, written_bytes, heap_used, heap_reserved;

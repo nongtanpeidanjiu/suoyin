@@ -1,5 +1,6 @@
 import CoreServices
 import Darwin
+import DarwinMetadata
 import Foundation
 
 struct VolumeEvent {
@@ -49,7 +50,7 @@ struct VolumeIdentity {
     let log: String?
     let readOnly: Bool
 
-    init(root: String) throws {
+    init(root: String, preferFilesystemUUID: Bool = false) throws {
         self.root = root
         var info = statfs()
         guard statfs(root, &info) == 0 else { throw ScanError.metadata(path: root, error: errno) }
@@ -60,7 +61,9 @@ struct VolumeIdentity {
             }
         }
         device = info.f_fsid.val.0
-        uuid = (try? URL(fileURLWithPath: root).resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
+        let filesystemUUID = preferFilesystemUUID ? Self.filesystemUUID(at: root) : nil
+        uuid = filesystemUUID ??
+            (try? URL(fileURLWithPath: root).resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
         log = FSEventsCopyUUIDForDevice(device).map { CFUUIDCreateString(nil, $0) as String }
         readOnly = info.f_flags & UInt32(MNT_RDONLY) != 0
     }
@@ -72,6 +75,18 @@ struct VolumeIdentity {
         self.uuid = uuid
         self.log = log
         self.readOnly = readOnly
+    }
+
+    private static func filesystemUUID(at path: String) -> String? {
+        var output = [CChar](repeating: 0, count: 37)
+        return output.withUnsafeMutableBufferPointer { buffer in
+            guard dm_volume_uuid(path, buffer.baseAddress) else { return nil }
+            return String(cString: buffer.baseAddress!)
+        }
+    }
+
+    func sharesVolumeAndLog(with other: Self) -> Bool {
+        mount == other.mount && device == other.device && uuid == other.uuid && log == other.log
     }
 
     func observedBoundary(before time: TimeInterval = Date().timeIntervalSince1970) -> UInt64? {

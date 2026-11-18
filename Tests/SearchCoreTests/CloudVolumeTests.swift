@@ -261,6 +261,88 @@ struct CloudVolumeTests {
         #expect(tracker.search("cached-metadata").map(\.path) == [mounted.path + "/cached-metadata"])
     }
 
+    @Test func externalVolumeKeepsItsIdentityWithoutHistoricalEvents() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("mounted")
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try Data().write(to: path.appendingPathComponent("fixture"))
+        let actual = try VolumeIdentity(root: path.path)
+        let volumeUUID = UUID().uuidString
+        let oldLog = try #require(actual.log)
+        let newLog = UUID().uuidString
+        func observed(log: String?) -> ExternalMount {
+            let identity = VolumeIdentity(root: path.path, mount: path.path, device: actual.device,
+                                          uuid: volumeUUID, log: log, readOnly: false)
+            return ExternalMount(identity: identity, name: "Fixture",
+                                 fileEvents: ExternalMount.supportsFileEvents(on: "apfs"))
+        }
+        let formerlyMounted = observed(log: oldLog)
+        let unavailableHistory = observed(log: nil)
+        let replacedHistory = observed(log: newLog)
+        #expect(unavailableHistory.cacheKey == nil)
+        #expect(unavailableHistory.fileEvents)
+        #expect(!ExternalMount.supportsFileEvents(on: "exfat"))
+        #expect(formerlyMounted.cacheKey != replacedHistory.cacheKey)
+
+        let mounts = ExternalVolumes(directory: root.path)
+        defer { try? mounts.stop() }
+        mounts.updateMounts([formerlyMounted])
+        #expect(until { mounts.statuses().first?.caughtUp == true })
+        let first = try #require(mounts.searchable().first)
+        mounts.updateMounts([unavailableHistory])
+        #expect(mounts.searchable().first?.tracker === first.tracker)
+
+        mounts.updateMounts([])
+        #expect(mounts.statuses().map(\.id) == [volumeUUID])
+        #expect(mounts.statuses().first?.online == false)
+        mounts.updateMounts([unavailableHistory])
+        #expect(until {
+            mounts.statuses().count == 1 && mounts.statuses().first?.caughtUp == true
+        })
+        let attached = try #require(mounts.statuses().first)
+        #expect(attached.id == volumeUUID)
+        #expect(attached.eventLogUUID == nil)
+        #expect(!attached.slow)
+        #expect(attached.recovery == "missing")
+
+        mounts.updateMounts([replacedHistory])
+        #expect(until {
+            mounts.statuses().count == 1 && mounts.statuses().first?.caughtUp == true &&
+                mounts.statuses().first?.eventLogUUID == newLog
+        })
+        let replaced = try #require(mounts.statuses().first)
+        #expect(replaced.id == volumeUUID)
+        #expect(replaced.recovery == "missing")
+        #expect(!replaced.slow)
+    }
+
+    @Test func externalRecoveryHandsAChangedLogBackToTheMountManager() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mount = root.appendingPathComponent("mount")
+        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+        let actual = try VolumeIdentity(root: mount.path, preferFilesystemUUID: true)
+        try #require(actual.log != nil)
+        let old = VolumeIdentity(root: mount.path, mount: actual.mount, device: actual.device,
+                                 uuid: actual.uuid, log: UUID().uuidString, readOnly: false)
+        let tracker = try ChangeTracker(root: mount.path, snapshot: root.appendingPathComponent("index").path,
+                                        ownData: root.path, wallTime: { Date().timeIntervalSince1970 },
+                                        recoveryTiming: .init(quietWindow: 50_000_000, maximumWait: 100_000_000,
+                                                              minimumInterval: 0),
+                                        external: ExternalMount(identity: old, name: "Fixture", fileEvents: true),
+                                        externalPersistence: false)
+        defer { try? tracker.stop() }
+        let delegated = DispatchSemaphore(value: 0)
+        tracker.onExternalIdentityChange = { delegated.signal() }
+        tracker.start()
+        #expect(until { tracker.snapshotStatus().phase == "caught-up" })
+        tracker.simulateDroppedHistory()
+        #expect(delegated.wait(timeout: .now() + 3) == .success)
+        #expect(tracker.snapshotStatus().indexReconciling)
+        #expect(tracker.snapshotStatus().recoveries == 0)
+    }
+
     @Test func sameNameExternalMountsAreIndependentAndDetachHidesImmediately() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }

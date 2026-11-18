@@ -392,6 +392,37 @@ struct TrackingTests {
         #expect(schedule.floors().isEmpty)
     }
 
+    @Test func visibleExternalStructuralEventsBypassDirectoryBackoff() {
+        let second = ReplayLag.second
+        let mount = "/Volumes/TestDisk"
+        func request(_ event: UInt64, structural: Bool = true) -> DirectoryUpdate {
+            DirectoryUpdate(files: [mount + "/entry": structural], pending: [0: event], structural: structural)
+        }
+        var schedule = DirectorySchedule()
+        let start = 90 * second
+        for event in 1...10 {
+            let now = start + UInt64(event) * second
+            schedule.enqueue(request(UInt64(event)), at: mount, hidden: false, now: now, externalFileEvents: true)
+            #expect(schedule.take(at: now, force: false)[mount]?.pending == [0: UInt64(event)])
+        }
+
+        let metadataTime = start + 10 * second + second / 2
+        schedule.enqueue(request(11, structural: false), at: mount, hidden: false, now: metadataTime,
+                         externalFileEvents: true)
+        #expect(schedule.next == start + 15 * second)
+        schedule.enqueue(request(12), at: mount, hidden: false, now: metadataTime,
+                         externalFileEvents: true)
+        #expect(schedule.next == metadataTime)
+        #expect(schedule.take(at: metadataTime, force: false)[mount]?.pending == [0: 11])
+
+        let hidden = mount + "/.hidden"
+        schedule.enqueue(request(13), at: hidden, hidden: true, now: metadataTime, externalFileEvents: true)
+        _ = schedule.take(at: metadataTime, force: false)
+        schedule.enqueue(request(14), at: hidden, hidden: true, now: metadataTime + second,
+                         externalFileEvents: true)
+        #expect(schedule.next == metadataTime + 30 * second)
+    }
+
     @Test func writeBudgetSurvivesNewOwnerAndUsesRollingWindow() throws {
         let dir = try scratch()
         defer { try? FileManager.default.removeItem(at: dir) }

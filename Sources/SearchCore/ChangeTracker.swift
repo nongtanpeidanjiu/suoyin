@@ -84,6 +84,7 @@ public final class ChangeTracker {
     private let mounts: ExternalVolumes?
     private let external: ExternalMount?
     private let externalPersistence: Bool
+    var onExternalIdentityChange: (() -> Void)?
     private var externalCancelled = false
     private var directoryEvents = false
     private var pollTimer: DispatchSourceTimer?
@@ -409,7 +410,7 @@ public final class ChangeTracker {
         // External media receives no marker file. The observed pre-scan
         // boundary is safe after the scan and may cause overlap on replay.
         if external != nil {
-            return EventCursor(applied: directoryEvents ? nil : volume.observedBoundary())
+            return EventCursor(applied: !directoryEvents && volume.log != nil ? volume.observedBoundary() : nil)
         }
         return EventCursor(applied: nil, scanBaseline: volume.scanReplayBaseline())
     }
@@ -582,6 +583,7 @@ public final class ChangeTracker {
                   file: String? = nil, metadata: Bool = false) {
             var item = work.removeValue(forKey: path) ?? DirectoryUpdate()
             item.add(event: event.id, volume: volume)
+            item.structural = item.structural || event.structural
             if let recursive {
                 item.recursive = item.recursive == true || recursive
                 item.files.removeAll()
@@ -693,7 +695,8 @@ public final class ChangeTracker {
             } else {
                 hidden = scope.backgroundDirectory(path)
             }
-            directories.enqueue(item, at: path, hidden: hidden, now: now)
+            directories.enqueue(item, at: path, hidden: hidden, now: now,
+                                externalFileEvents: external != nil && !directoryEvents)
         }
         if !immediate, directories.pendingItems + fileContents.count > Self.pendingLimit {
             let volumes = directories.pendingVolumes.union(fileContents.pendingVolumes)
@@ -938,7 +941,7 @@ public final class ChangeTracker {
     }
 
     private func scheduleRecovery() {
-        guard !closed, snapshotStatus().error == nil, !recoveryInProgress, !paused,
+        guard !closed, !detached, snapshotStatus().error == nil, !recoveryInProgress, !paused,
               let deadline = recoveryDeadlines().values.min() else {
             recoveryTimer?.schedule(deadline: .distantFuture)
             return
@@ -984,13 +987,21 @@ public final class ChangeTracker {
             lock.withLock { receivingRecovery = false }
         }
         for i in affected {
+            let identity = identities[i]
+            let refreshed = try VolumeIdentity(root: identity.root, preferFilesystemUUID: external != nil)
+            if let onExternalIdentityChange, !identity.sharesVolumeAndLog(with: refreshed) {
+                // A different log needs a different cache owner and event position.
+                cancelExternalWork()
+                onExternalIdentityChange()
+                return
+            }
             // Retire the old stream before scanning. Work it already delivered
             // is covered by this scan. Only the new stream can request another.
             pendingRecovery.removeValue(forKey: i)
             directories.discard(volumes: [i])
             fileContents.discard(volumes: [i])
             deliveredHigh.removeValue(forKey: i)
-            identities[i] = try VolumeIdentity(root: identities[i].root)
+            identities[i] = refreshed
             cursors[i] = newCursor(for: identities[i])
             needsReplay.remove(i)
             if external != nil || !identities[i].readOnly { try watch(i) }

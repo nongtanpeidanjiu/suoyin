@@ -80,6 +80,10 @@ struct TrackingTests {
         live.prepareDelta()
         #expect(live.state.restricted == ["/fixture/b"])
         #expect(filePaths(live, query: "deep").isEmpty)
+        _ = live.reconcile(path: "/fixture/b/old", observed: .readable(own: folder,
+            children: ["deep": file]))
+        live.prepareDelta()
+        #expect(filePaths(live, query: "deep").isEmpty)
         let revisit = live.reconcile(path: "/fixture/b", observed: .readable(own: folder,
             children: ["old": folder]))
         #expect(revisit == ["/fixture/b/old"])

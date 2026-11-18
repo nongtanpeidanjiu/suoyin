@@ -131,8 +131,14 @@ struct WalkScope {
 
     static func device(_ path: String) throws -> dev_t {
         var info = stat()
-        guard lstat(path, &info) == 0 else { throw ScanError.metadata(path: path, error: errno) }
+        guard metadata(path, &info) == 0 else { throw ScanError.metadata(path: path, error: errno) }
         return info.st_dev
+    }
+
+    private static func metadata(_ path: String, _ storage: inout stat) -> Int32 {
+        var result: Int32
+        repeat { result = lstat(path, &storage) } while result < 0 && errno == EINTR
+        return result
     }
 
     func defaultHiddenDirectory(_ path: String) -> Bool {
@@ -348,7 +354,7 @@ extension WalkScope {
             }
             for ancestor in ancestors.reversed() {
                 var checked = stat()
-                if lstat(ancestor, &checked) != 0 {
+                if Self.metadata(ancestor, &checked) != 0 {
                     if errno == EACCES || errno == EPERM { return .restricted }
                     if errno == ENOTDIR || errno == ENOENT { return .absent }
                     throw ScanError.metadata(path: ancestor, error: errno)
@@ -357,7 +363,7 @@ extension WalkScope {
             }
         }
         var own = stat()
-        if lstat(path, &own) != 0 {
+        if Self.metadata(path, &own) != 0 {
             if errno == EACCES || errno == EPERM { return .restricted }
             if errno == ENOENT || errno == ENOTDIR || errno == ELOOP { return .absent }
             throw ScanError.metadata(path: path, error: errno)
@@ -369,7 +375,7 @@ extension WalkScope {
                             collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &counts)
         if error != 0 { throw ScanError.metadata(path: path, error: error) }
         if counts.denied != 0 || counts.pending != 0 || counts.other_mount != 0 { return .restricted }
-        if counts.disappeared != 0 && lstat(path, &own) != 0 {
+        if counts.disappeared != 0 && Self.metadata(path, &own) != 0 {
             if errno == ENOENT || errno == ENOTDIR { return .absent }
             if errno == EACCES || errno == EPERM { return .restricted }
             throw ScanError.metadata(path: path, error: errno)

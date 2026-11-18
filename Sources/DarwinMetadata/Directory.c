@@ -36,7 +36,9 @@ static uint32_t node_type(mode_t mode) {
 static int stat_entry(int fd, const char *name, DMEntryCallback callback,
                       void *context, DMCounts *counts) {
     struct stat st;
-    if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) < 0) return expected_error(errno, counts);
+    int result;
+    do { result = fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW); } while (result < 0 && errno == EINTR);
+    if (result < 0) return expected_error(errno, counts);
     callback(context, (const uint8_t *)name, strlen(name), st.st_size,
              timestamp(st.st_mtimespec), st.st_flags, node_type(st.st_mode));
     return 0;
@@ -53,6 +55,7 @@ static int ordinary_list(int fd, DMEntryCallback callback, void *context, DMCoun
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
+        if (!entry && errno == EINTR) continue;
         if (!entry) { error = expected_error(errno, counts); break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         error = stat_entry(dirfd(directory), entry->d_name, callback, context, counts);
@@ -109,14 +112,18 @@ static int bulk_record(int fd, const unsigned char *record, const unsigned char 
 int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
             DMEntryCallback callback, void *context, DMCounts *counts) {
     struct stat st;
-    if (lstat(path, &st) < 0) return expected_error(errno, counts);
+    int result;
+    do { result = lstat(path, &st); } while (result < 0 && errno == EINTR);
+    if (result < 0) return expected_error(errno, counts);
     if (!S_ISDIR(st.st_mode)) return expected_error(ENOTDIR, counts);
     if (st.st_dev != device_a && st.st_dev != device_b) { counts->other_mount++; return 0; }
     if (st.st_flags & SF_DATALESS) { counts->pending++; return 0; }
 
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int fd;
+    do { fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
     if (fd < 0) return expected_error(errno, counts);
-    if (fstat(fd, &st) < 0) { int error = errno; close(fd); return expected_error(error, counts); }
+    do { result = fstat(fd, &st); } while (result < 0 && errno == EINTR);
+    if (result < 0) { int error = errno; close(fd); return expected_error(error, counts); }
     if (st.st_dev != device_a && st.st_dev != device_b) { close(fd); counts->other_mount++; return 0; }
     if (st.st_flags & SF_DATALESS) { close(fd); counts->pending++; return 0; }
     if (ordinary) return ordinary_list(fd, callback, context, counts);
@@ -134,6 +141,7 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
         int number = getattrlistbulk(fd, &attrs, buffer, sizeof(buffer), 0);
         if (number < 0) {
             int code = errno;
+            if (code == EINTR) continue;
             if (!started && (code == ENOTSUP || code == EOPNOTSUPP || code == ENOSYS)) {
                 if (lseek(fd, 0, SEEK_SET) < 0) { error = errno; break; }
                 counts->fallback++;

@@ -249,6 +249,7 @@ struct LiveIndex {
 
     /// Return children requiring recursive enumeration because their subtree is new.
     mutating func reconcile(path: String, observed: DirectoryObservation) -> [String] {
+        if state.restricted.contains(where: { $0 != path && inside(path, $0) }) { return [] }
         switch observed {
         case .restricted:
             removeSubtree(path, includingRoot: false)

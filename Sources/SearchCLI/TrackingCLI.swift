@@ -24,6 +24,8 @@ private struct Line: Encodable {
     var queryEnd: UInt64?
     var beforeGeneration: UInt64?
     var beforeApplying: Bool?
+    var intervals: [ApplyInterval]?
+    var queuedEvent: UInt64?
 }
 
 func usageAtProcess() -> (Double, Int) {
@@ -39,12 +41,14 @@ func runTrackingCLI(_ args: [String]) throws {
     let tracker = try ChangeTracker(root: args[1], snapshot: args[2], ownData: args[3])
     let stdout = NSLock()
     func announce(_ name: String, rows: [SearchRow]? = nil, queryStart: UInt64? = nil,
-                  queryEnd: UInt64? = nil, before: TrackingStatus? = nil) {
+                  queryEnd: UInt64? = nil, before: TrackingStatus? = nil,
+                  intervals: [ApplyInterval]? = nil, queuedEvent: UInt64? = nil) {
         let info = usageAtProcess()
         let line = Line(event: name, time: DispatchTime.now().uptimeNanoseconds, cpu: info.0,
                         residentBytes: SearchIndex.residentBytes(), peakBytes: info.1,
                         status: tracker.snapshotStatus(), rows: rows, queryStart: queryStart,
-                        queryEnd: queryEnd, beforeGeneration: before?.generation, beforeApplying: before?.applying)
+                        queryEnd: queryEnd, beforeGeneration: before?.generation, beforeApplying: before?.applying,
+                        intervals: intervals, queuedEvent: queuedEvent)
         guard var data = try? JSONEncoder().encode(line) else { return }
         data.append(10)
         stdout.withLock { FileHandle.standardOutput.write(data) }
@@ -83,6 +87,10 @@ func runTrackingCLI(_ args: [String]) throws {
             case "status": announce("status")
             case "sync": tracker.synchronize(); announce("sync")
             case "save": try tracker.save(); announce("save")
+            case "trace-start": tracker.beginApplyTrace(); announce("trace-start")
+            case "trace-end": announce("trace-end", intervals: tracker.endApplyTrace())
+            case "queued-event" where allowedFaults:
+                announce("queued-event", queuedEvent: tracker.queuedEventID(at: command.query ?? ""))
             case "continue-scan" where holdPartial: scanGate.signal(); announce("continue-scan")
             case "hold" where allowedFaults: tracker.holdUpdates(true); announce("hold")
             case "resume" where allowedFaults: tracker.holdUpdates(false); announce("resume")

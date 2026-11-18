@@ -37,6 +37,7 @@ def overlap(tracker, test):
 
     thread = threading.Thread(target=mutate)
     first = tracker.call("status")["status"]
+    tracker.call("trace-start")
     thread.start()
     samples = []
     try:
@@ -47,10 +48,7 @@ def overlap(tracker, test):
                 assert comparable == control
                 begin, finish = result["queryStart"], result["queryEnd"]
                 status = result["status"]
-                touching_apply = result["beforeApplying"] or (
-                    status["lastApplyStart"] <= finish and status["lastApplyEnd"] >= begin
-                )
-                samples.append(dict(mode=mode, ms=(finish - begin) / 1e6, overlap=touching_apply,
+                samples.append(dict(mode=mode, ms=(finish - begin) / 1e6,
                                     generation=status["generation"], begin=begin, end=finish))
     finally:
         end.set()
@@ -58,8 +56,12 @@ def overlap(tracker, test):
     if errors:
         raise errors[0]
     tracker.call("sync")
+    intervals = tracker.call("trace-end")["intervals"]
+    for sample in samples:
+        sample["overlap"] = any(interval["start"] <= sample["end"] and interval["end"] >= sample["begin"]
+                                for interval in intervals)
     last = tracker.call("status")["status"]
-    return dict(before=first, after=last, samples=samples,
+    return dict(before=first, after=last, samples=samples, intervals=intervals,
                 allP95=nearest_rank([r["ms"] for r in samples], .95),
                 overlapP95=nearest_rank([r["ms"] for r in samples if r["overlap"]], .95),
                 byMode={m: nearest_rank([r["ms"] for r in samples if r["mode"] == m and r["overlap"]], .95)
@@ -111,7 +113,11 @@ if __name__ == "__main__":
             write_summary(state / "overlap.json", overlap(tracker, tree))
         result = idle(tracker, args.seconds)
         result["startup"] = ready
+        result["peakMonitoredRSS"] = tracker.maximum
+        result["normalExit"] = False
+        write_summary(state / "idle.json", result)
         result["peakMonitoredRSS"] = tracker.finish()
+        result["normalExit"] = True
         write_summary(state / "idle.json", result)
     finally:
         tracker.terminate_fixture_if_needed()

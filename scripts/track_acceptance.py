@@ -77,11 +77,13 @@ def exercise(cli, directory):
         (tree / "seed-00000.txt").rename(tree / "observed-during-scan.txt")
         tracker.call("continue-scan")
         first = tracker.wait("ready")
-        tracker.wait("caught-up")
-        aligned = converge(tracker, tree_rows(tree, store))
+        aligned = tracker.wait("caught-up")
+        expected_aligned = tree_rows(tree, store)
+        first_query = tracker.call("query", limit=len(expected_aligned) + 100)
+        assert from_search(first_query["rows"]) == expected_aligned
         summary["duringScan"] = dict(partial=partial["time"], ready=first["time"],
                                      partialRows=len(published), applied=aligned["status"]["appliedEvents"],
-                                     equal=True)
+                                     caughtUp=aligned["time"], firstQueryEqual=True, equal=True)
 
         def measure(kind, mutate):
             start = time.monotonic_ns()
@@ -149,19 +151,33 @@ def exercise(cli, directory):
         pending.touch()
         run = tracker.call("sync")
         until = time.monotonic() + 3
-        while run["status"]["bufferedEvents"] == 0 and time.monotonic() < until:
+        run = tracker.call("queued-event", query=str(pending))
+        pending_id = run.get("queuedEvent")
+        while pending_id is None and time.monotonic() < until:
             time.sleep(.03)
-            run = tracker.call("status")
-        assert run["status"]["bufferedEvents"] > 0
+            tracker.call("sync")
+            run = tracker.call("queued-event", query=str(pending))
+            pending_id = run.get("queuedEvent")
+        assert run["status"]["bufferedEvents"] > 0 and pending_id is not None and pending_id > before[str(tree)]
         assert run["status"]["appliedEvents"] == before
         tracker.call("save")
         durable, archive = inspect(cli, snap)
         assert durable and all(durable[volume] <= before[volume] for volume in durable)
+        assert durable[str(tree)] < pending_id
         assert str(pending) not in archive
+        fingerprint_at_hold = fingerprint(snap)
+        maximums.append(tracker.finish(kill=True))
+        assert fingerprint(snap) == fingerprint_at_hold
+        time.sleep(.25)
+        tracker = TrackClient(cli, tree, snap, store, log)
+        checkpoint_ready = tracker.wait("ready")
+        assert checkpoint_ready["status"]["recovery"] == "replay"
+        tracker.wait("caught-up")
+        recovered_pending = converge(tracker, tree_rows(tree, store))
         summary["pendingCheckpoint"] = dict(before=before, durable=durable,
-                                             queued=run["status"]["bufferedEvents"], withheld=True)
-        tracker.call("resume")
-        converge(tracker, tree_rows(tree, store))
+                                             queued=run["status"]["bufferedEvents"], pendingID=pending_id,
+                                             recoveredAt=recovered_pending["status"]["appliedEvents"],
+                                             withheld=True, restartedFromSameFile=True, replayEqual=True)
         maximums.append(tracker.finish())
 
         (tree / "ready-offline.txt").touch()

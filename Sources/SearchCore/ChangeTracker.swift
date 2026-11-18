@@ -23,6 +23,11 @@ public struct TrackingStatus: Codable {
     public var error: String?
 }
 
+public struct ApplyInterval: Codable {
+    public let start: UInt64
+    public let end: UInt64
+}
+
 private struct EventBatch {
     let volume: Int
     let epoch: UInt64
@@ -35,6 +40,7 @@ public final class ChangeTracker {
     private let root: String
     private let scope: WalkScope
     private let path: String
+    private let ownDirectory: String
     private let excluded: [String]
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
@@ -55,15 +61,18 @@ public final class ChangeTracker {
     private var closed = false
     private var observer: ((String) -> Void)?
     private var needsReplay: Set<Int> = []
+    private var scanBarriers: [Int: String] = [:]
+    private var applyTrace: [ApplyInterval]?
 
     public init(root: String, snapshot: String, ownData: String) throws {
         let root = URL(fileURLWithPath: root).resolvingSymlinksInPath().standardizedFileURL.path
         self.root = root
         self.path = snapshot
+        ownDirectory = URL(fileURLWithPath: ownData).resolvingSymlinksInPath().standardizedFileURL.path
         let walk = try WalkScope(root: root)
         scope = walk
         excluded = Array(walk.privateScratch.filter { !inside(root, $0) }) +
-            [URL(fileURLWithPath: ownData).standardizedFileURL.path].filter { !inside(root, $0) }
+            [ownDirectory].filter { !inside(root, $0) }
         identities = try (root == "/" ? ["/", dataRoot] : [root]).map { try VolumeIdentity(root: $0) }
         epochs = [UInt64](repeating: 0, count: identities.count)
     }
@@ -180,6 +189,27 @@ public final class ChangeTracker {
         }
     }
 
+    private func markScanBoundary(for volumes: Set<Int>) throws {
+        guard !volumes.isEmpty else { return }
+        let device = try WalkScope.device(ownDirectory)
+        for i in volumes where !identities[i].readOnly {
+            guard identities[i].device == device, excluded.contains(ownDirectory) else {
+                throw ScanError.listener(root: identities[i].root)
+            }
+            // An event written on the observed device after enumeration bounds
+            // the scan. The marker itself is excluded from the index.
+            let marker = joinedPath(ownDirectory, ".scan-boundary-" + UUID().uuidString)
+            scanBarriers[i] = marker
+            let fd = Darwin.open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw ScanError.metadata(path: ownDirectory, error: errno) }
+            let closed = Darwin.close(fd)
+            let closeError = errno
+            let removed = Darwin.unlink(marker)
+            if closed != 0 { throw ScanError.metadata(path: ownDirectory, error: closeError) }
+            if removed != 0 { throw ScanError.metadata(path: ownDirectory, error: errno) }
+        }
+    }
+
     private func enqueue(_ batch: EventBatch) {
         guard !closed, batch.epoch == epochs[batch.volume] else { return }
         if pendingEvents + batch.events.count > 50_000 {
@@ -215,10 +245,11 @@ public final class ChangeTracker {
         return suffix.isEmpty ? mount : joinedPath(mount, suffix)
     }
 
-    private func dirtyPaths(from events: [EventBatch]) -> ([String: Bool], [Int: UInt64], Set<Int>) {
+    private func dirtyPaths(from events: [EventBatch]) -> ([String: Bool], [Int: UInt64], Set<Int>, Set<Int>) {
         var work: [String: Bool] = [:]
         var high: [Int: UInt64] = [:]
         var reset = overflowed
+        var crossed = Set<Int>()
         for batch in events where batch.epoch == epochs[batch.volume] {
             let volume = batch.volume
             let prior = cursors[volume].lastSeen
@@ -237,6 +268,7 @@ public final class ChangeTracker {
                     reset.insert(volume)
                     continue
                 }
+                if scanBarriers[volume] == path { crossed.insert(volume) }
                 if excluded.contains(where: { inside(path, $0) }) || scope.insideProviderTrash(path) { continue }
                 guard inside(path, root) else {
                     if event.recursive && inside(root, path) { reset.insert(volume) }
@@ -252,7 +284,7 @@ public final class ChangeTracker {
                 }
             }
         }
-        return (work, high, reset)
+        return (work, high, reset, crossed)
     }
 
     private func drain() {
@@ -263,7 +295,7 @@ public final class ChangeTracker {
         pendingEvents = 0
         lock.withLock { status.bufferedEvents = 0 }
         let before = cursors
-        let (work, high, reset) = dirtyPaths(from: submitted)
+        let (work, high, reset, crossed) = dirtyPaths(from: submitted)
         overflowed.removeAll()
         if !reset.isEmpty {
             lock.withLock { status.receivedEvents += UInt64(submitted.reduce(0) { $0 + $1.events.count }) }
@@ -287,23 +319,27 @@ public final class ChangeTracker {
         }
         lock.withLock { status.receivedEvents += UInt64(submitted.reduce(0) { $0 + $1.events.count }) }
         if !work.isEmpty, var updated = current {
-            lock.withLock { status.applying = true; status.lastApplyStart = DispatchTime.now().uptimeNanoseconds }
+            let start = DispatchTime.now().uptimeNanoseconds
+            lock.withLock { status.applying = true; status.lastApplyStart = start }
             do {
                 try reconcile(work, in: &updated)
                 updated.prepareDelta()
                 for (i, top) in high { cursors[i].acknowledge(top) }
                 publish(updated, changed: true)
+                let end = DispatchTime.now().uptimeNanoseconds
                 lock.withLock {
                     status.applying = false
-                    status.lastApplyEnd = DispatchTime.now().uptimeNanoseconds
+                    status.lastApplyEnd = end
                     status.appliedBatches += 1
                 }
+                applyTrace?.append(ApplyInterval(start: start, end: end))
                 scheduleSave()
             } catch {
                 lock.withLock { status.applying = false }
                 fail(error)
             }
         }
+        for i in crossed { scanBarriers.removeValue(forKey: i) }
         finishReplayIfReady()
     }
 
@@ -352,6 +388,7 @@ public final class ChangeTracker {
         }
         index.prepare()
         publish(LiveIndex(base: index, root: root), changed: true)
+        try markScanBoundary(for: affected)
         note(initial ? "ready" : "rebuilt")
         update.async { dm_release_allocator_cache() }
         scheduleSave()
@@ -373,7 +410,7 @@ public final class ChangeTracker {
     private func finishReplayIfReady() {
         guard snapshotStatus().error == nil, !paused, batches.isEmpty else { return }
         needsReplay = needsReplay.filter { !cursors[$0].historyDelivered }
-        if needsReplay.isEmpty && snapshotStatus().phase != "caught-up" { note("caught-up") }
+        if needsReplay.isEmpty && scanBarriers.isEmpty && snapshotStatus().phase != "caught-up" { note("caught-up") }
     }
 
     private func scheduleSave() {
@@ -444,6 +481,26 @@ public final class ChangeTracker {
             sources.removeAll()
             closed = true
             if snapshotStatus().error == nil { try persist() }
+        }
+    }
+
+    public func beginApplyTrace() {
+        update.sync { applyTrace = [] }
+    }
+
+    public func endApplyTrace() -> [ApplyInterval] {
+        update.sync {
+            let captured = applyTrace ?? []
+            applyTrace = nil
+            return captured
+        }
+    }
+
+    public func queuedEventID(at path: String) -> UInt64? {
+        update.sync {
+            batches.lazy.flatMap { batch in
+                batch.events.lazy.filter { self.logicalPath($0.path, volume: batch.volume) == path }.map(\.id)
+            }.max()
         }
     }
 

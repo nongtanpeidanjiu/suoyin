@@ -18,6 +18,8 @@ typedef struct {
 typedef void (*DMEntryCallback)(void *, const uint8_t *, size_t, int64_t, int64_t, uint32_t, uint32_t);
 int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
             DMEntryCallback callback, void *context, DMCounts *counts);
+int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
+                  void *context, DMCounts *counts);
 uint64_t dm_resident_bytes(void);
 typedef struct {
     uint64_t footprint, footprint_peak, written_bytes, heap_used, heap_reserved;

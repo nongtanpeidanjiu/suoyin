@@ -10,6 +10,7 @@ private struct LineCommand: Decodable {
     let direction: SearchDirection?
     let limit: Int?
     let offset: Int?
+    let showAll: Bool?
 }
 
 private struct Line: Encodable {
@@ -28,6 +29,8 @@ private struct Line: Encodable {
     var queuedEvent: UInt64?
     var processMetrics: [String: UInt64]?
     var indexBytes: [String: Int]?
+    var externalVolumes: [ExternalVolumeStatus]?
+    var indexedEntries: Int?
 }
 
 func usageAtProcess() -> (Double, Int) {
@@ -53,12 +56,18 @@ func runTrackingCLI(_ args: [String]) throws {
                         status: tracker.snapshotStatus(), rows: rows, queryStart: queryStart,
                         queryEnd: queryEnd, beforeGeneration: before?.generation, beforeApplying: before?.applying,
                         intervals: intervals, queuedEvent: queuedEvent,
-                        processMetrics: measure ? ChangeTracker.processMetrics() : nil, indexBytes: components)
+                        processMetrics: measure ? ChangeTracker.processMetrics() : nil, indexBytes: components,
+                        externalVolumes: name == "status" ? tracker.externalVolumeStatuses() : nil,
+                        indexedEntries: name == "count" || name == "ready" ? tracker.indexedEntryCount() : nil)
         guard var data = try? JSONEncoder().encode(line) else { return }
         data.append(10)
         stdout.withLock { FileHandle.standardOutput.write(data) }
     }
     let allowedFaults = args[1].hasPrefix(FileManager.default.currentDirectoryPath + "/.m2-tmp/")
+    let testingRoot = FileManager.default.currentDirectoryPath + "/.m2-tmp/"
+    let allowFullPressureInjection = args[1] == "/" &&
+        ProcessInfo.processInfo.environment["M2_PRESSURE_INJECTION"] == "1" &&
+        [args[2], args[3]].allSatisfy { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path.hasPrefix(testingRoot) }
     let holdPartial = allowedFaults && ProcessInfo.processInfo.environment["M2_HOLD_PARTIAL"] == "1"
     let scanGate = DispatchSemaphore(value: 0)
     var gateUsed = false
@@ -86,10 +95,12 @@ func runTrackingCLI(_ args: [String]) throws {
                 let start = DispatchTime.now().uptimeNanoseconds
                 let rows = tracker.search(command.query ?? "", mode: command.mode ?? .name,
                                           column: command.column ?? .name, direction: command.direction ?? .ascending,
-                                          showAll: true, offset: command.offset ?? 0, limit: command.limit ?? 50)
+                                          showAll: command.showAll ?? true, offset: command.offset ?? 0, limit: command.limit ?? 50)
                 let end = DispatchTime.now().uptimeNanoseconds
                 announce("query", rows: rows, queryStart: start, queryEnd: end, before: before)
             case "status": announce("status")
+            case "count": announce("count")
+            case "retry-cloud": tracker.retryCloudCompletion(); announce("retry-cloud")
             case "sync": tracker.synchronize(); announce("sync")
             case "save": try tracker.save(); announce("save")
             case "trace-start": tracker.beginApplyTrace(); announce("trace-start")
@@ -99,7 +110,7 @@ func runTrackingCLI(_ args: [String]) throws {
             case "continue-scan" where holdPartial: scanGate.signal(); announce("continue-scan")
             case "hold" where allowedFaults: tracker.holdUpdates(true); announce("hold")
             case "resume" where allowedFaults: tracker.holdUpdates(false); announce("resume")
-            case "invalidate-history" where allowedFaults: tracker.simulateDroppedHistory(); announce("invalidated")
+            case "invalidate-history" where allowedFaults || allowFullPressureInjection: tracker.simulateDroppedHistory(); announce("invalidated")
             case "pause-before-replace" where allowedFaults:
                 try tracker.compactForTesting(beforeReplace: {
                     announce("before-replace")

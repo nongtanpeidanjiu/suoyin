@@ -173,7 +173,7 @@ extension SearchIndex {
                 if name.first == 46 || flags & 0x8000 != 0 { attr |= Kind.hidden }
                 if flags & 0x40000000 != 0 { attr |= Kind.pending }
                 if name.elementsEqual(".Trash".utf8), parent != .max,
-                   isProviderTrash(index.fullPath(parent)) { attr |= Kind.excluded }
+                   CloudRoots.matchesProviderRoot(index.fullPath(parent)) { attr |= Kind.excluded }
                 let (time, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
                 index.append(bytes: name, parent: parent, size: size,
                              modified: overflow ? (seconds < 0 ? .min : .max) : time, attribute: attr)
@@ -193,11 +193,4 @@ extension SearchIndex {
         }
         return index
     }
-}
-
-func isProviderTrash(_ parent: String) -> Bool {
-    let components = parent.split(separator: "/")
-    guard components.count >= 2 else { return false }
-    return components.last == "com~apple~CloudDocs" && components.dropLast().last == "Mobile Documents" ||
-        components.dropLast().last == "CloudStorage" && components.last!.hasPrefix("OneDrive")
 }

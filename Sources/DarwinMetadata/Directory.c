@@ -111,15 +111,15 @@ static int bulk_record(int fd, const unsigned char *record, const unsigned char 
     return 0;
 }
 
-int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
-            DMEntryCallback callback, void *context, DMCounts *counts) {
+static int list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
+                bool load_directory, DMEntryCallback callback, void *context, DMCounts *counts) {
     struct stat st;
     int result;
     do { result = lstat(path, &st); } while (result < 0 && errno == EINTR);
     if (result < 0) return expected_error(errno, counts);
     if (!S_ISDIR(st.st_mode)) return expected_error(ENOTDIR, counts);
     if (st.st_dev != device_a && st.st_dev != device_b) { counts->other_mount++; return 0; }
-    if (st.st_flags & SF_DATALESS) { counts->pending++; return 0; }
+    if (!load_directory && (st.st_flags & SF_DATALESS)) { counts->pending++; return 0; }
 
     int fd;
     do { fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
@@ -127,7 +127,7 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
     do { result = fstat(fd, &st); } while (result < 0 && errno == EINTR);
     if (result < 0) { int error = errno; close(fd); return expected_error(error, counts); }
     if (st.st_dev != device_a && st.st_dev != device_b) { close(fd); counts->other_mount++; return 0; }
-    if (st.st_flags & SF_DATALESS) { close(fd); counts->pending++; return 0; }
+    if (!load_directory && (st.st_flags & SF_DATALESS)) { close(fd); counts->pending++; return 0; }
     if (ordinary) return ordinary_list(fd, callback, context, counts);
 
     struct attrlist attrs = {
@@ -171,6 +171,18 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
     }
     close(fd);
     return error;
+}
+
+int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
+            DMEntryCallback callback, void *context, DMCounts *counts) {
+    return list(path, device_a, device_b, ordinary, false, callback, context, counts);
+}
+
+int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
+                  void *context, DMCounts *counts) {
+    // Opening the directory may ask the provider for its listing. Regular
+    // files are only inspected with getattrlistbulk or fstatat.
+    return list(path, device, device, false, true, callback, context, counts);
 }
 
 uint64_t dm_resident_bytes(void) {

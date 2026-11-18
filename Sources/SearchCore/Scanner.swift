@@ -114,13 +114,13 @@ struct WalkScope {
     let primaryDevice: dev_t
     let dataDevice: dev_t
     let mirrors: Set<String>
-    let cloudRoots: Set<String>
+    let clouds: CloudRoots
     let privateScratch: Set<String>
     let homeLibrary: String
     let homeCaches: String
     let wholeDisk: Bool
 
-    init(root: String) throws {
+    init(root: String, clouds: CloudRoots? = nil) throws {
         self.root = root
         wholeDisk = root == "/"
         primaryDevice = try Self.device(root)
@@ -133,7 +133,7 @@ struct WalkScope {
             })
         } else { mirrors = [] }
         let home = NSHomeDirectory()
-        cloudRoots = wholeDisk ? [home + "/Library/CloudStorage", home + "/Library/Mobile Documents"] : []
+        self.clouds = clouds ?? CloudRoots(home: wholeDisk ? home : nil)
         homeLibrary = home + "/Library"
         homeCaches = homeLibrary + "/Caches"
         let cwd = FileManager.default.currentDirectoryPath
@@ -153,7 +153,7 @@ struct WalkScope {
     }
 
     func defaultHiddenDirectory(_ path: String) -> Bool {
-        if cloudRoots.contains(path) { return false }
+        if clouds.isVisibleRoot(path) { return false }
         if path == homeCaches { return true }
         switch path {
         case "/System", "/bin", "/sbin", "/usr", "/private/etc", "/private/var", "/private/tmp",
@@ -166,7 +166,7 @@ struct WalkScope {
 
     func backgroundDirectory(_ path: String) -> Bool {
         let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
-        if inside(logical, homeLibrary) && !cloudRoots.contains(where: { inside(logical, $0) }) { return true }
+        if inside(logical, homeLibrary) && clouds.provider(containing: logical) == nil && logical != clouds.storage { return true }
         // An explicitly indexed fixture or external root is the reference point
         // for visibility. Only directories inside it affect that view.
         let visiblePrefix = wholeDisk && inside(logical, "/usr/local") ? "/usr/local" : ""
@@ -182,12 +182,28 @@ struct WalkScope {
         return false
     }
 
-    func insideProviderTrash(_ path: String) -> Bool {
-        let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
-        let components = logical.split(separator: "/")
-        guard let trash = components.firstIndex(of: ".Trash"), trash >= 2 else { return false }
-        return isProviderTrash("/" + components[..<trash].joined(separator: "/"))
+    func providerTrashParent(_ path: String) -> Bool {
+        clouds.provider(containing: path) == path || wholeDisk && CloudRoots.matchesProviderRoot(path)
     }
+
+    func insideProviderTrash(_ path: String) -> Bool {
+        var suffix = path[...]
+        while let range = suffix.range(of: "/.Trash") {
+            let end = range.upperBound
+            if (end == path.endIndex || path[end] == "/"),
+               providerTrashParent(String(path[..<range.lowerBound])) { return true }
+            suffix = path[end...]
+        }
+        return false
+    }
+}
+
+private let directoryReadSlots = DispatchSemaphore(value: 4)
+
+private func readDirectory<T>(_ read: () -> T) -> T {
+    directoryReadSlots.wait()
+    defer { directoryReadSlots.signal() }
+    return read()
 }
 
 private final class ScanSession {
@@ -210,15 +226,17 @@ private final class ScanSession {
     var local = true
     var nextPublication = 2_048
     let publish: (ScanMark, SearchIndex) throws -> Void
+    let cancelled: () -> Bool
 
     init(scope: WalkScope, ordinary: Bool, listeners: ListenerSet, excludedPaths: Set<String>, dataOnly: Bool,
-         keeping retained: consuming SearchIndex, publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
+         keeping retained: consuming SearchIndex, cancelled: @escaping () -> Bool, publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
         self.scope = scope
         self.ordinary = ordinary
         self.excludedPaths = excludedPaths
         self.dataTargets = dataOnly ? scope.dataVolumeRoots : []
         self.listeners = listeners
         self.publish = publish
+        self.cancelled = cancelled
         var bridgePaths: Set<String> = []
         if retained.recordCount > 0 {
             for target in dataTargets {
@@ -255,21 +273,27 @@ private final class ScanSession {
         while true {
             condition.lock()
             while jobs.isEmpty && workersActive > 0 && error == nil { condition.wait() }
+            if cancelled(), error == nil { error = CancellationError(); condition.broadcast() }
             guard error == nil, let job = jobs.popLast() else { condition.unlock(); return }
             workersActive += 1
             condition.unlock()
 
             let batch = DirectoryBatch()
             var delta = DMCounts()
-            let code = dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
-                               collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &delta)
+            let code = readDirectory {
+                dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
+                        collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &delta)
+            }
             condition.lock()
             counts.denied += delta.denied
             counts.disappeared += delta.disappeared
             counts.other_mount += delta.other_mount
             counts.pending += delta.pending
             counts.fallback += delta.fallback
-            if code != 0 {
+            if (code != 0 || delta.pending != 0), scope.clouds.provider(containing: job.path) != nil {
+                index.attributes[Int(job.parent)] |= Kind.pending
+                if delta.pending == 0 { pending += 1 }
+            } else if code != 0 {
                 if error == nil { error = ScanError.metadata(path: job.path, error: code) }
             } else if error == nil {
                 add(batch, job)
@@ -289,7 +313,7 @@ private final class ScanSession {
         let parentHidden = index.attributes[Int(job.parent)] & Kind.hidden
         let platformParent = job.path.hasPrefix(dataRoot + "/")
             ? String(job.path.dropFirst(dataRoot.count)) : job.path
-        let parentIsTrashRoot = !local && isProviderTrash(platformParent)
+        let parentIsTrashRoot = scope.providerTrashParent(platformParent)
         let parentIsPackage = WalkScope.packageSuffixes.contains { job.path.hasSuffix($0) }
         let parentPrefix = job.path == "/" ? "/" : job.path + "/"
         let includeFiles = dataTargets.isEmpty || dataTargets.contains { inside(job.path, $0) }
@@ -321,7 +345,7 @@ private final class ScanSession {
                     !dataTargets.contains(where: { inside(path, $0) || inside($0, path) }) { continue }
                 let logical = platformParent == "/" ? "/" + component : platformParent + "/" + component
                 if scope.defaultHiddenDirectory(logical) { attribute |= Kind.hidden }
-                let cloudRoot = scope.cloudRoots.contains(path)
+                let cloudRoot = scope.clouds.isVisibleRoot(logical)
                 if cloudRoot || logical == "/usr/local" { attribute &= ~Kind.hidden }
                 let id = retainedDirectories[path] ?? index.append(bytes: name, parent: job.parent, size: item.size,
                                                                    modified: item.modified, attribute: attribute)
@@ -330,7 +354,7 @@ private final class ScanSession {
                     pending += 1
                 } else if name.elementsEqual(component.utf8) {
                     let child = ScanJob(path: path, parent: id)
-                    if local && cloudRoot { cloudJobs.append(child) } else { jobs.append(child) }
+                    if local && scope.clouds.isScanBoundary(logical) { cloudJobs.append(child) } else { jobs.append(child) }
                 }
             }
         }
@@ -358,6 +382,14 @@ extension SearchIndex {
                  excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: SearchIndex(), onProgress: onProgress)
     }
 
+    static func scanForTracking(scope: WalkScope, workers: Int, excluding paths: Set<String>,
+                                cancelled: @escaping () -> Bool,
+                                onProgress: @escaping (ScanMark, SearchIndex) throws -> Void) throws -> SearchIndex {
+        try scan(root: scope.root, workers: workers, ordinary: false, establishListener: false,
+                 excludedPaths: paths, dataOnly: false, keeping: SearchIndex(), scope: scope,
+                 cancelled: cancelled, onProgress: onProgress)
+    }
+
     static func scanDataVolume(keeping sealed: consuming SearchIndex, excluding paths: Set<String>) throws -> SearchIndex {
         try scan(root: "/", workers: 4, ordinary: false, establishListener: false,
                  excludedPaths: paths, dataOnly: true, keeping: consume sealed, onProgress: { _, _ in })
@@ -365,17 +397,19 @@ extension SearchIndex {
 
     private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,
                              excludedPaths: Set<String>, dataOnly: Bool, keeping retained: consuming SearchIndex,
+                             scope supplied: WalkScope? = nil, cancelled: @escaping () -> Bool = { false },
                              onProgress: @escaping (ScanMark, SearchIndex) throws -> Void) throws -> SearchIndex {
         guard (1...4).contains(workers) else { throw ScanError.invalidWorkerCount }
         let root = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
-        let scope = try WalkScope(root: root)
+        let scope = try supplied ?? WalkScope(root: root)
         let listeners = ListenerSet()
         if establishListener {
             try listeners.add(root: root)
             if scope.wholeDisk { try listeners.add(root: dataRoot) }
         }
         let session = ScanSession(scope: scope, ordinary: ordinary, listeners: listeners,
-                                  excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: consume retained, publish: onProgress)
+                                  excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: consume retained,
+                                  cancelled: cancelled, publish: onProgress)
         try onProgress(session.mark("listener_ready"), session.index)
         session.addRoot(root)
         if scope.wholeDisk { session.addRoot(dataRoot) }
@@ -409,12 +443,13 @@ extension WalkScope {
     }
 
     /// Observe one directory. A denied read is distinct from an empty directory.
-    func observe(_ path: String, inherited: UInt8, excluding excluded: [String]) throws -> DirectoryObservation {
+    func observe(_ path: String, inherited: UInt8, excluding excluded: [String],
+                 loadCloud: Bool = false) throws -> DirectoryObservation {
         guard !insideProviderTrash(path), !excluded.contains(where: { inside(path, $0) }) else { return .absent }
-        if cloudRoots.contains(where: { inside(path, $0) }) {
+        if let provider = clouds.provider(containing: path) {
             // Avoid walking through an unloaded ancestor to inspect its child.
             var ancestors: [String] = [path]
-            while !cloudRoots.contains(ancestors.last!) {
+            while ancestors.last! != provider {
                 ancestors.append(parentPath(ancestors.last!))
             }
             for ancestor in ancestors.reversed() {
@@ -424,7 +459,10 @@ extension WalkScope {
                     if errno == ENOTDIR || errno == ENOENT { return .absent }
                     throw ScanError.metadata(path: ancestor, error: errno)
                 }
-                if checked.st_flags & 0x40000000 != 0 { return .restricted }
+                if checked.st_flags & 0x40000000 != 0 {
+                    if !loadCloud { return ancestor == path ? .pending : .deferred }
+                    if ancestor != path { return .deferred }
+                }
             }
         }
         var own = stat()
@@ -436,10 +474,17 @@ extension WalkScope {
         guard own.st_mode & S_IFMT == S_IFDIR else { return .absent }
         let batch = DirectoryBatch()
         var counts = DMCounts()
-        let error = dm_list(path, primaryDevice, dataDevice, false,
-                            collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &counts)
+        let context = Unmanaged.passUnretained(batch).toOpaque()
+        guard own.st_dev == primaryDevice || own.st_dev == dataDevice else { return .absent }
+        let error = readDirectory {
+            loadCloud
+                ? dm_list_cloud(path, own.st_dev, collectEntry, context, &counts)
+                : dm_list(path, primaryDevice, dataDevice, false, collectEntry, context, &counts)
+        }
         if error != 0 { throw ScanError.metadata(path: path, error: error) }
+        if counts.pending != 0, clouds.provider(containing: path) != nil { return .pending }
         if counts.denied != 0 || counts.pending != 0 || counts.other_mount != 0 { return .restricted }
+        if loadCloud && counts.disappeared != 0 { return .deferred }
         if counts.disappeared != 0 && Self.metadata(path, &own) != 0 {
             if errno == ENOENT || errno == ENOTDIR { return .absent }
             if errno == EACCES || errno == EPERM { return .restricted }
@@ -451,8 +496,7 @@ extension WalkScope {
         let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
         let excludedChildren = Set(excluded.filter { parentPath($0) == path }.map(leafName))
         let mirroredChildren = Set(mirrors.filter { parentPath($0) == path }.map(leafName))
-        let cloudChildren = Set(cloudRoots.filter { parentPath($0) == path }.map(leafName))
-        let providerTrash = isProviderTrash(logical)
+        let providerTrash = providerTrashParent(logical)
         let containsDataRoot = wholeDisk && path == parentPath(dataRoot)
         let dataName = leafName(dataRoot)
         let mayHideSystemChild = logical == "/" || logical == "/Library" || logical == "/private" ||
@@ -467,7 +511,8 @@ extension WalkScope {
                 var flags: UInt8 = item.type == 2 ? Kind.directory : item.type == 1 ? Kind.file : Kind.other
                 if inherited & Kind.hidden != 0 || name.hasPrefix(".") || item.flags & 0x8000 != 0 ||
                     package || mayHideSystemChild && defaultHiddenDirectory(joinedPath(logical, name)) { flags |= Kind.hidden }
-                if cloudChildren.contains(name) || path == "/usr" && name == "local" { flags &= ~Kind.hidden }
+                if flags & Kind.mask == Kind.directory && clouds.isVisibleRoot(joinedPath(logical, name)) ||
+                    path == "/usr" && name == "local" { flags &= ~Kind.hidden }
                 if item.flags & 0x40000000 != 0 { flags |= Kind.pending }
                 children[name] = TrackedEntry(size: item.size, modified: item.modified, attribute: flags)
             }
@@ -482,7 +527,7 @@ extension WalkScope {
     // Cloud observation must check unavailable ancestors before accessing a leaf.
     // Reconcile those paths using the guarded directory reader.
     func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false) -> EntryObservation {
-        guard !cloudRoots.contains(where: { inside(path, $0) }) else { return .unverified }
+        guard clouds.provider(containing: path) == nil else { return .unverified }
         var info = stat()
         if Self.metadata(path, &info) != 0 {
             return errno == ENOENT ? .missing : .unverified

@@ -11,6 +11,16 @@ public struct SearchRow: Codable, Equatable, Sendable {
     public let path: String
     public let size: Int64
     public let modified: Int64
+    public let volumeID: String?
+
+    init(id: UInt32, name: String, path: String, size: Int64, modified: Int64, volumeID: String? = nil) {
+        self.id = id
+        self.name = name
+        self.path = path
+        self.size = size
+        self.modified = modified
+        self.volumeID = volumeID
+    }
 }
 
 enum Kind {

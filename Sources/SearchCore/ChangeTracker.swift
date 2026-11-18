@@ -4,6 +4,8 @@ import CoreServices
 import DarwinMetadata
 
 public struct TrackingStatus: Codable {
+    public var cloud = CloudCompletionStatus()
+    public var slowVolume = false
     public var phase = "starting"
     public var recovery = "uninitialized"
     public var generation: UInt64 = 0
@@ -78,6 +80,14 @@ public final class ChangeTracker {
     let excluded: [String]
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
+    private var cloud: CloudCompletion?
+    private let mounts: ExternalVolumes?
+    private let external: ExternalMount?
+    private let externalPersistence: Bool
+    private var externalCancelled = false
+    private var directoryEvents = false
+    private var pollTimer: DispatchSourceTimer?
+    private var cloudChangedDuringCompaction = false
     private var view: LiveSearchView?
     private var publishedCoverage = Set<String>()
     private var status = TrackingStatus()
@@ -134,21 +144,44 @@ public final class ChangeTracker {
     }
 
     init(root: String, snapshot: String, ownData: String,
-         wallTime: @escaping () -> TimeInterval, recoveryTiming: RecoveryTiming = RecoveryTiming()) throws {
+         wallTime: @escaping () -> TimeInterval, recoveryTiming: RecoveryTiming = RecoveryTiming(),
+         cloudRoots: CloudRoots? = nil, cloudTiming: CloudCompletion.Timing = .init(),
+         cloudReader: CloudCompletion.Reader? = nil, external: ExternalMount? = nil,
+         externalPersistence: Bool = true, discoverExternal: Bool = true) throws {
         self.wallTime = wallTime
+        self.external = external
+        self.externalPersistence = externalPersistence
+        directoryEvents = external.map { !$0.fileEvents } ?? false
+        status.slowVolume = directoryEvents
         self.recoveryTiming = recoveryTiming
         budget = BaseWriteBudget(snapshot: snapshot)
         let root = try Self.canonicalPath(root)
         self.root = root
         self.path = snapshot
         ownDirectory = try Self.canonicalPath(ownData)
-        let walk = try WalkScope(root: root)
+        mounts = root == "/" && discoverExternal ? ExternalVolumes(directory: ownDirectory) : nil
+        let walk = try WalkScope(root: root, clouds: cloudRoots)
         scope = walk
         excluded = Array(walk.privateScratch.filter { !inside(root, $0) }) +
             [ownDirectory].filter { !inside(root, $0) }
-        identities = try (root == "/" ? ["/", dataRoot] : [root]).map { try VolumeIdentity(root: $0) }
+        identities = try external.map { [$0.identity] } ??
+            (root == "/" ? ["/", dataRoot] : [root]).map { try VolumeIdentity(root: $0) }
         injectionVolume = identities.enumerated().first { !$0.element.readOnly }.map { ($0.offset, $0.element.root) }
         epochs = [UInt64](repeating: 0, count: identities.count)
+        if walk.clouds.storage != nil {
+            let excluded = self.excluded
+            let queue = CloudCompletion(writer: update, roots: walk.clouds, timing: cloudTiming,
+                                        monitorNetwork: cloudReader == nil, read: cloudReader ?? { path, flags in
+                try walk.observe(path, inherited: flags, excluding: excluded, loadCloud: true)
+            })
+            queue.changed = { [weak self] value in
+                guard let self else { return }
+                self.lock.withLock { self.status.cloud = value }
+            }
+            queue.beforeApply = { [weak self] in self?.drain() }
+            queue.apply = { [weak self] path, result in self?.applyCloud(path, result) ?? false }
+            cloud = queue
+        }
     }
 
     private static func canonicalPath(_ path: String) throws -> String {
@@ -167,6 +200,24 @@ public final class ChangeTracker {
     public func snapshotStatus() -> TrackingStatus {
         lock.withLock { status }
     }
+
+    public func retryCloudCompletion() {
+        update.async { self.cloud?.retry() }
+    }
+
+    public func externalVolumeStatuses() -> [ExternalVolumeStatus] { mounts?.statuses() ?? [] }
+
+    public func indexedEntryCount() -> Int {
+        let local = lock.withLock { view }
+        return (local?.entryCount ?? 0) + (mounts?.searchable().reduce(0) { $0 + $1.tracker.indexedEntryCount() } ?? 0)
+    }
+
+    func cancelExternalWork() {
+        lock.withLock { externalCancelled = true; view = nil }
+    }
+
+    private var detached: Bool { external != nil && lock.withLock { externalCancelled } }
+
 
     public func memoryBreakdown() -> [String: Int] {
         update.sync { current?.memoryBreakdown() ?? [:] }
@@ -197,8 +248,29 @@ public final class ChangeTracker {
                        direction: SearchDirection = .ascending, showAll: Bool = false,
                        offset: Int = 0, limit: Int = 50) -> [SearchRow] {
         let captured = lock.withLock { view }
-        return captured?.search(query, mode: mode, column: column, direction: direction,
-                                showAll: showAll, offset: offset, limit: limit) ?? []
+        let volumes = mounts?.searchable() ?? []
+        if volumes.isEmpty {
+            return captured?.search(query, mode: mode, column: column, direction: direction,
+                                    showAll: showAll, offset: offset, limit: limit) ?? []
+        }
+        guard offset >= 0, limit > 0, offset <= Int.max - limit else { return [] }
+        let capacity = offset + limit
+        var groups: [[SearchRow]] = []
+        groups.append(captured?.search(query, mode: mode, column: column, direction: direction,
+                                       showAll: showAll, offset: 0, limit: capacity) ?? [])
+        for volume in volumes {
+            groups.append(volume.tracker.search(query, mode: mode, column: column, direction: direction,
+                                                 showAll: showAll, limit: capacity).map {
+                SearchRow(id: $0.id, name: $0.name, path: $0.path,
+                          size: $0.size, modified: $0.modified, volumeID: volume.key)
+            })
+        }
+        let rows = groups.enumerated().flatMap { group, rows in rows.map { (group, $0) } }.sorted { lhs, rhs in
+            let order = compareAcross(lhs.1, rhs.1, column: column)
+            return order == 0 ? lhs.0 < rhs.0 : (direction == .ascending ? order < 0 : order > 0)
+        }
+        return rows.lazy.filter { $0.0 == 0 || self.mounts?.isCurrent(volumes[$0.0 - 1]) == true }
+            .dropFirst(offset).prefix(limit).map { $0.1 }
     }
 
     private func publish(_ updated: LiveIndex, changed: Bool) {
@@ -211,6 +283,7 @@ public final class ChangeTracker {
         }
         let read = updated.readView()
         lock.withLock {
+            guard !externalCancelled else { return }
             view = read
             if changed { status.generation += 1 }
             status.appliedEvents = positions()
@@ -230,14 +303,23 @@ public final class ChangeTracker {
         var loaded: SearchIndex?
         var reason = "missing"
         do {
-            var value = try SearchIndex.load(from: path)
-            let identityMatches = identities.allSatisfy { volume in
-                value.volumes.contains { $0.root == volume.root && $0.volumeUUID == volume.uuid }
+            guard !detached else { return }
+            if !externalPersistence {
+                throw CocoaError(.fileReadNoSuchFile)
             }
-            if identityMatches && (value.tracking?.root == root || value.tracking == nil && hasRoot(value)) {
+            var value = try SearchIndex.load(from: path)
+            let archivedRoot = external == nil ? root : value.tracking?.root ?? value.volumes.first?.root ?? root
+            let identityMatches = identities.allSatisfy { volume in
+                value.volumes.contains {
+                    if external == nil { return $0.root == volume.root && $0.volumeUUID == volume.uuid }
+                    return $0.root == archivedRoot && volume.uuid != nil && $0.volumeUUID == volume.uuid &&
+                        volume.log != nil && $0.eventLogUUID == volume.log && $0.readOnly == volume.readOnly
+                }
+            }
+            if identityMatches && (value.tracking?.root == archivedRoot || value.tracking == nil && hasRoot(value, at: archivedRoot)) {
                 if value.loadedPrepared {
                     var loadedJournal = ChangeJournal(snapshot: path, identity: try SearchIndex.preparedIdentity(at: path))
-                    try loadedJournal.restore(into: &value, root: root)
+                    try loadedJournal.restore(into: &value, root: archivedRoot)
                     journal = loadedJournal
                     lock.withLock {
                         status.journalLength = loadedJournal.length
@@ -247,28 +329,41 @@ public final class ChangeTracker {
                 } else {
                     needsBaseWrite = true
                 }
-                loaded = value
-                reason = "replay"
+                if external != nil && !identities[0].permitsReplay(value.volumes.first) {
+                    reason = "invalid-checkpoint"
+                } else {
+                    if archivedRoot != root {
+                        value = try value.movedVolume(from: archivedRoot, to: root)
+                        needsBaseWrite = true
+                    }
+                    loaded = value
+                    reason = "replay"
+                }
             } else { reason = "scope-changed" }
         } catch SnapshotError.invalid { reason = "corrupt" }
         catch SnapshotError.unsupportedVersion { reason = "unsupported-version" }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile {}
-        firstBaseWrite = reason == "missing"
+        firstBaseWrite = reason == "missing" || external != nil && needsBaseWrite
         lock.withLock { status.automaticBaseWritesInWindow = budget.count(at: wallTime()) }
         let previous = loaded?.volumes ?? []
         var reset = Set<Int>()
         cursors = identities.enumerated().map { i, volume in
-            let prior = previous.first { $0.root == volume.root }
-            if volume.readOnly { return EventCursor(applied: nil) }
+            let prior = external != nil ? previous.first : previous.first { $0.root == volume.root }
+            if volume.readOnly && external == nil { return EventCursor(applied: nil) }
             if loaded != nil && volume.permitsReplay(prior) {
                 needsReplay.insert(i)
                 return EventCursor(applied: prior?.appliedEvent, replaying: true)
             }
             reset.insert(i)
-            return EventCursor(applied: nil, scanBaseline: volume.scanReplayBaseline())
+            return newCursor(for: volume)
         }
-        for i in identities.indices where !identities[i].readOnly {
+        for i in identities.indices where external != nil || !identities[i].readOnly {
             try watch(i)
+            if external != nil && directoryEvents {
+                reset.insert(i)
+                if loaded != nil { reason = "directory-events" }
+                loaded = nil
+            }
         }
         var reopened: [String] = []
         if var loaded {
@@ -282,6 +377,10 @@ public final class ChangeTracker {
             let scopes = Set(scope.protectedStartupRoots).union(validated.state.restricted).sorted()
             reopened = validated.verifyStartupCoverage(at: scopes) { folder in
                 try? scope.observe(folder, inherited: 0, excluding: excluded)
+            }
+            if let cloud {
+                validated.purgeProviderTrash(in: scope.clouds)
+                cloud.replacePending(validated.pendingCloudDirectories(in: scope.clouds))
             }
             publish(validated, changed: true)
             scheduleSave()
@@ -306,7 +405,16 @@ public final class ChangeTracker {
         }
     }
 
-    private func hasRoot(_ value: SearchIndex) -> Bool {
+    private func newCursor(for volume: VolumeIdentity) -> EventCursor {
+        // External media receives no marker file. The observed pre-scan
+        // boundary is safe after the scan and may cause overlap on replay.
+        if external != nil {
+            return EventCursor(applied: directoryEvents ? nil : volume.observedBoundary())
+        }
+        return EventCursor(applied: nil, scanBaseline: volume.scanReplayBaseline())
+    }
+
+    private func hasRoot(_ value: SearchIndex, at root: String) -> Bool {
         guard let i = value.records.firstIndex(where: { $0.parent == .max }) else { return false }
         return value.name(UInt32(i)) == root
     }
@@ -331,11 +439,38 @@ public final class ChangeTracker {
         // A scoped tracker whose recovery marker is inside its tree need not
         // receive unrelated events from the rest of the device.
         let relative = root != "/" && inside(ownDirectory, root) ? identities[volume].relativeScope(root) : ""
-        sources[volume] = try VolumeEventStream(volume: identities[volume], since: since, scope: relative) {
-            [weak self] events in
-            guard let self else { return }
-            self.receive(EventBatch(volume: volume, epoch: epoch, events: events), root: key)
+        func open(_ since: UInt64?, fileEvents: Bool) throws -> VolumeEventStream {
+            try VolumeEventStream(volume: identities[volume], since: since, scope: relative, fileEvents: fileEvents) {
+                [weak self] events in
+                self?.receive(EventBatch(volume: volume, epoch: epoch, events: events), root: key)
+            }
         }
+        do {
+            sources[volume] = try open(since, fileEvents: !directoryEvents)
+        } catch {
+            guard external != nil else { throw error }
+            directoryEvents = true
+            lock.withLock { status.slowVolume = true }
+            needsReplay.remove(volume)
+            cursors[volume] = newCursor(for: identities[volume])
+            sources[volume] = try? open(nil, fileEvents: false)
+        }
+        if external != nil, sources[volume] == nil || directoryEvents && identities[volume].log == nil {
+            startVolumePolling()
+        }
+    }
+
+    private func startVolumePolling() {
+        guard pollTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: update)
+        timer.schedule(deadline: .now() + .seconds(600), repeating: .seconds(600), leeway: .seconds(15))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.detached else { return }
+            do { try self.applyCoverage(at: [self.root], recursive: true) }
+            catch { self.fail(error) }
+        }
+        pollTimer = timer
+        timer.activate()
     }
 
     private func markScanBoundary(for volumes: Set<Int>) throws {
@@ -361,7 +496,7 @@ public final class ChangeTracker {
 
     private func receive(_ batch: EventBatch, root: String) {
         let wake = lock.withLock {
-            guard batch.epoch == epochs[batch.volume] else { return false }
+            guard !externalCancelled, batch.epoch == epochs[batch.volume] else { return false }
             let now = DispatchTime.now().uptimeNanoseconds
             activity[batch.volume, default: EventActivity()].received(batch.events.count, at: now)
             status.receivedEvents += UInt64(batch.events.count)
@@ -479,7 +614,19 @@ public final class ChangeTracker {
                     continue
                 }
                 if event.recursive {
+                    cloud?.invalidate(at: path)
+                } else if event.isDirectory {
+                    if event.structural {
+                        cloud?.invalidate(at: path)
+                        cloud?.invalidateListing(at: parentPath(path))
+                    }
+                } else {
+                    cloud?.invalidateListing(at: parentPath(path))
+                }
+                if event.recursive {
                     mark(path, event: event, volume: volume, recursive: true)
+                } else if directoryEvents {
+                    mark(path, event: event, volume: volume, recursive: false)
                 } else if event.isDirectory || path == root {
                     if event.structural && path != root {
                         mark(parentPath(path), event: event, volume: volume, recursive: false)
@@ -528,7 +675,7 @@ public final class ChangeTracker {
     }
 
     private func drain(force: Bool = false) {
-        guard !closed, !paused, current != nil, snapshotStatus().error == nil,
+        guard !closed, !detached, !paused, current != nil, snapshotStatus().error == nil,
               !inboxEmpty || directories.count > 0 || fileContents.count > 0 else { return }
         if !force, duringCompaction != nil, (current?.state.changes.count ?? 0) >= 2 * Self.compactionRows,
            lock.withLock({ invalidations.isEmpty }) { return }
@@ -672,14 +819,31 @@ public final class ChangeTracker {
         var observedDirectories: UInt64 = 0
         var recursive: UInt64 = 0
         while position < ordered.count {
+            if detached { throw CancellationError() }
             let folder = ordered[position]
             position += 1
             guard inside(folder, root), !excluded.contains(where: { inside(folder, $0) }),
                   visited.insert(folder).inserted else { continue }
             let inherited = index.entry(at: folder)?.attribute ?? 0
             observedDirectories += 1
-            let observed = try scope.observe(folder, inherited: inherited, excluding: excluded)
+            let inCloud = scope.clouds.provider(containing: folder) != nil
+            let observed: DirectoryObservation
+            do { observed = try scope.observe(folder, inherited: inherited, excluding: excluded) }
+            catch where inCloud { observed = .pending }
             var more = index.reconcile(path: folder, observed: observed)
+            if inCloud {
+                switch observed {
+                case .absent, .restricted: cloud?.discard(at: folder)
+                case .pending: cloud?.enqueue(folder, inherited: inherited)
+                case .deferred: break
+                case .readable:
+                    cloud?.invalidate(at: folder)
+                    if inherited & Kind.pending != 0 { index.clearCloudPending(at: folder); cloud?.discardOnly(folder) }
+                }
+            }
+            if case let .readable(_, contents) = observed {
+                enqueueCloudChildren(of: folder, contents: contents, in: &index)
+            }
             if work[folder] == true, case let .readable(_, contents) = observed {
                 recursive += 1
                 for (name, entry) in contents where entry.directory && entry.attribute & Kind.pending == 0 {
@@ -696,6 +860,44 @@ public final class ChangeTracker {
         }
     }
 
+    private func enqueueCloudChildren(of folder: String, contents: [String: TrackedEntry],
+                                      in index: inout LiveIndex) {
+        guard let cloud else { return }
+        for (name, entry) in contents where entry.directory {
+            let path = joinedPath(folder, name)
+            if entry.attribute & Kind.pending != 0 ||
+                scope.clouds.provider(containing: folder) != nil && index.entry(at: path).map({
+                    $0.attribute & Kind.pending != 0
+                }) == true {
+                cloud.enqueue(path, inherited: entry.attribute)
+            }
+        }
+    }
+
+    private func applyCloud(_ path: String, _ result: DirectoryObservation) -> Bool {
+        guard !closed, !recoveryUnresolved, var revised = current else { return false }
+        guard revised.entry(at: path).map({ $0.directory && $0.attribute & Kind.pending != 0 }) == true,
+              !revised.state.restricted.contains(where: { $0 != path && inside(path, $0) }) else {
+            cloud?.discardOnly(path)
+            return false
+        }
+        switch result {
+        case let .readable(_, children):
+            _ = revised.reconcile(path: path, observed: result, completingCloud: true)
+            enqueueCloudChildren(of: path, contents: children, in: &revised)
+        case .absent:
+            _ = revised.reconcile(path: path, observed: .absent)
+            cloud?.discard(at: path)
+        case .pending, .deferred, .restricted:
+            return false
+        }
+        revised.prepareDelta()
+        publish(revised, changed: true)
+        if duringCompaction != nil { cloudChangedDuringCompaction = true }
+        scheduleSave()
+        return true
+    }
+
     private func releaseTemporaryPages() {
         let now = DispatchTime.now().uptimeNanoseconds
         guard now - lastAllocatorRelief >= 10_000_000_000 else { return }
@@ -705,6 +907,7 @@ public final class ChangeTracker {
 
     private func requestRecovery(_ invalid: [Int: UInt64]) -> Bool {
         guard !invalid.isEmpty else { return true }
+        cloud?.setEnabled(false)
         do { try revokeCheckpoints(for: invalid.keys.map { identities[$0].root }) }
         catch { fail(error); return false }
         for (volume, received) in invalid {
@@ -760,7 +963,7 @@ public final class ChangeTracker {
     }
 
     private func recoverWhenReady() {
-        guard !closed, !paused, !recoveryInProgress, duringCompaction == nil,
+        guard !closed, !detached, !paused, !recoveryInProgress, duringCompaction == nil,
               snapshotStatus().error == nil else { return }
         drain()
         guard snapshotStatus().error == nil else { return }
@@ -775,6 +978,7 @@ public final class ChangeTracker {
 
     private func recover(_ affected: Set<Int>, reason: String) throws {
         recoveryInProgress = true
+        cloud?.setEnabled(false)
         defer {
             recoveryInProgress = false
             lock.withLock { receivingRecovery = false }
@@ -787,9 +991,9 @@ public final class ChangeTracker {
             fileContents.discard(volumes: [i])
             deliveredHigh.removeValue(forKey: i)
             identities[i] = try VolumeIdentity(root: identities[i].root)
-            cursors[i] = EventCursor(applied: nil, scanBaseline: identities[i].scanReplayBaseline())
+            cursors[i] = newCursor(for: identities[i])
             needsReplay.remove(i)
-            if !identities[i].readOnly { try watch(i) }
+            if external != nil || !identities[i].readOnly { try watch(i) }
         }
         let start = DispatchTime.now().uptimeNanoseconds
         lastRecoveryStart = start
@@ -836,7 +1040,8 @@ public final class ChangeTracker {
             index = try SearchIndex.scanDataVolume(keeping: consume sealed, excluding: Set(excluded))
         } else {
             var lastPartial: Double = 0
-            index = try SearchIndex.scan(root: root, establishListener: false, excludedPaths: Set(excluded)) {
+            index = try SearchIndex.scanForTracking(scope: scope, workers: external == nil ? 4 : 1,
+                                                    excluding: Set(excluded), cancelled: { self.detached }) {
                 mark, partial in
                 if initial && (mark.phase == "partial" || mark.phase == "local_complete" ||
                                mark.phase == "batch" && mark.seconds >= lastPartial + 0.5) {
@@ -850,9 +1055,11 @@ public final class ChangeTracker {
         if initial || root != "/" { index.tightenScannedStorage() }
         else { index.prepare() }
         dm_release_allocator_cache()
-        publish(LiveIndex(base: index, root: root), changed: true)
-        try markScanBoundary(for: affected)
-        needsBaseWrite = true
+        let rebuilt = LiveIndex(base: index, root: root)
+        if let cloud { cloud.replacePending(rebuilt.pendingCloudDirectories(in: scope.clouds)) }
+        publish(rebuilt, changed: true)
+        if external == nil { try markScanBoundary(for: affected) }
+        needsBaseWrite = externalPersistence && !directoryEvents
         note(initial ? "ready" : "rebuilt")
         update.async { dm_release_allocator_cache() }
     }
@@ -860,7 +1067,7 @@ public final class ChangeTracker {
     private var recoveryUnresolved: Bool { recoveryInProgress || !pendingRecovery.isEmpty }
 
     private func finishReplayIfReady() {
-        guard snapshotStatus().error == nil, !paused, inboxEmpty else { return }
+        guard !closed, !detached, snapshotStatus().error == nil, !paused, inboxEmpty else { return }
         needsReplay = needsReplay.filter { !cursors[$0].historyDelivered }
         guard needsReplay.isEmpty, scanBarriers.isEmpty, !recoveryUnresolved else { return }
         let reconciling = snapshotStatus().indexReconciling
@@ -878,6 +1085,8 @@ public final class ChangeTracker {
             return true
         }
         if caughtUp {
+            cloud?.setEnabled(true)
+            mounts?.start()
             releaseTemporaryPages()
             observer?("caught-up")
         }
@@ -903,8 +1112,10 @@ public final class ChangeTracker {
         }
         let now = DispatchTime.now().uptimeNanoseconds
         return identities.enumerated().map { i, volume in
-            let safe = !volume.readOnly && snapshot.1[i] == nil
-                ? cursors[i].lag.position(at: now, observed: volume.observedBoundary(), pending: pending[i])
+            let observed = detached ? cursors[i].applied : volume.observedBoundary()
+            let eligible = external == nil ? !volume.readOnly : !directoryEvents
+            let safe = eligible && snapshot.1[i] == nil
+                ? cursors[i].lag.position(at: now, observed: observed, pending: pending[i])
                 : nil
             return volume.checkpoint(safe)
         }
@@ -1033,7 +1244,7 @@ public final class ChangeTracker {
     }
 
     private func flushJournal() throws {
-        guard !needsBaseWrite, !recoveryUnresolved, lock.withLock({ invalidations.isEmpty }),
+        guard externalPersistence, !needsBaseWrite, !recoveryUnresolved, lock.withLock({ invalidations.isEmpty }),
               let current, journal != nil, let durableImage else {
             saveScheduled = false
             return
@@ -1046,6 +1257,7 @@ public final class ChangeTracker {
 
     public func save() throws {
         try update.sync { try flushJournal() }
+        for volume in mounts?.searchable() ?? [] { try volume.tracker.save() }
     }
 
     private func recordDuringCompaction(_ work: [String: Bool]) {
@@ -1058,7 +1270,7 @@ public final class ChangeTracker {
     }
 
     private func scheduleCompaction() {
-        guard !closed, !needsBaseWrite, !recoveryUnresolved, duringCompaction == nil,
+        guard !closed, !detached, externalPersistence, !needsBaseWrite, !recoveryUnresolved, duringCompaction == nil,
               let original = current,
               original.state.changes.count >= Self.compactionRows || (journal?.length ?? 0) >= Self.compactionBytes
         else { return }
@@ -1066,6 +1278,7 @@ public final class ChangeTracker {
         let token = compactionToken
         let started = DispatchTime.now().uptimeNanoseconds
         duringCompaction = [:]
+        cloudChangedDuringCompaction = false
         lock.withLock { status.compacting = true }
         compactor.async { [weak self] in
             let base = original.compacted()
@@ -1073,7 +1286,7 @@ public final class ChangeTracker {
             self.update.async {
                 guard !self.closed, self.compactionToken == token, let work = self.duringCompaction else { return }
                 self.duringCompaction = nil
-                if self.recoveryUnresolved || !self.lock.withLock({ self.invalidations.isEmpty }) {
+                if self.cloudChangedDuringCompaction || self.recoveryUnresolved || !self.lock.withLock({ self.invalidations.isEmpty }) {
                     self.lock.withLock { self.status.compacting = false }
                     // Schedule after this closure releases its candidate base.
                     self.update.async {
@@ -1119,6 +1332,7 @@ public final class ChangeTracker {
     public func synchronize() {
         update.sync { for stream in sources.values { stream.flush() } }
         update.sync { drain(); finishReplayIfReady() }
+        mounts?.synchronize()
     }
 
     /// The application can request a metadata-only reconciliation of a scope
@@ -1130,9 +1344,9 @@ public final class ChangeTracker {
         }
     }
 
-    private func applyCoverage(at paths: [String]) throws {
-        guard !closed, var updated = current else { return }
-        let work = paths.reduce(into: [String: Bool]()) { $0[$1] = false }
+    private func applyCoverage(at paths: [String], recursive: Bool = false) throws {
+        guard !closed, !detached, var updated = current else { return }
+        let work = paths.reduce(into: [String: Bool]()) { $0[$1] = recursive }
         try reconcile(work, in: &updated)
         updated.prepareDelta()
         publish(updated, changed: true)
@@ -1142,9 +1356,11 @@ public final class ChangeTracker {
     }
 
     public func stop() throws {
+        try mounts?.stop()
         try update.sync {
+            cloud?.stop()
             for stream in sources.values {
-                stream.flush()
+                if !detached { stream.flush() }
                 stream.stop()
             }
             sources.removeAll()
@@ -1154,8 +1370,10 @@ public final class ChangeTracker {
             directoryTimer = nil
             recoveryTimer?.cancel()
             recoveryTimer = nil
+            pollTimer?.cancel()
+            pollTimer = nil
             if snapshotStatus().error == nil {
-                if needsBaseWrite { try persistPendingBase(onExit: true) }
+                if needsBaseWrite && !detached { try persistPendingBase(onExit: true) }
                 else { try flushJournal() }
             }
         }

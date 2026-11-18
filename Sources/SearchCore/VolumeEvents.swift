@@ -60,9 +60,18 @@ struct VolumeIdentity {
             }
         }
         device = info.f_fsid.val.0
-        uuid = try URL(fileURLWithPath: root).resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        uuid = (try? URL(fileURLWithPath: root).resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
         log = FSEventsCopyUUIDForDevice(device).map { CFUUIDCreateString(nil, $0) as String }
         readOnly = info.f_flags & UInt32(MNT_RDONLY) != 0
+    }
+
+    init(root: String, mount: String, device: Int32, uuid: String?, log: String?, readOnly: Bool) {
+        self.root = root
+        self.mount = mount
+        self.device = device
+        self.uuid = uuid
+        self.log = log
+        self.readOnly = readOnly
     }
 
     func observedBoundary(before time: TimeInterval = Date().timeIntervalSince1970) -> UInt64? {
@@ -88,10 +97,14 @@ struct VolumeIdentity {
     }
 
     func permitsReplay(_ checkpoint: VolumeCheckpoint?) -> Bool {
-        guard let checkpoint, let applied = checkpoint.appliedEvent, let current = observedBoundary(),
-              let uuid, let log, checkpoint.volumeUUID == uuid, checkpoint.eventLogUUID == log
-        else { return false }
-        return applied <= current
+        Self.permitsReplay(checkpoint, uuid: uuid, log: log, latest: observedBoundary())
+    }
+
+    static func permitsReplay(_ checkpoint: VolumeCheckpoint?, uuid: String?, log: String?,
+                              latest: UInt64?) -> Bool {
+        guard let checkpoint, let applied = checkpoint.appliedEvent, let latest,
+              let uuid, let log, checkpoint.volumeUUID == uuid, checkpoint.eventLogUUID == log else { return false }
+        return applied <= latest
     }
 }
 
@@ -101,12 +114,12 @@ final class VolumeEventStream {
     let volume: VolumeIdentity
     let deliver: ([VolumeEvent]) -> Void
 
-    init(volume: VolumeIdentity, since: UInt64?, scope: String, deliver: @escaping ([VolumeEvent]) -> Void) throws {
+    init(volume: VolumeIdentity, since: UInt64?, scope: String, fileEvents: Bool = true, deliver: @escaping ([VolumeEvent]) -> Void) throws {
         self.volume = volume
         self.deliver = deliver
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
                                            retain: nil, release: nil, copyDescription: nil)
-        let flags = UInt32(kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagFileEvents)
+        let flags = UInt32(kFSEventStreamCreateFlagWatchRoot) | (fileEvents ? UInt32(kFSEventStreamCreateFlagFileEvents) : 0)
         guard let value = FSEventStreamCreateRelativeToDevice(
             nil, { _, info, count, paths, flags, ids in
                 guard let info else { return }

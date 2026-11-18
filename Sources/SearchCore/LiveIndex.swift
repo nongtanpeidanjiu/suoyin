@@ -24,6 +24,8 @@ enum DirectoryObservation {
     case readable(own: TrackedEntry, children: [String: TrackedEntry])
     case absent
     case restricted
+    case pending
+    case deferred
 }
 
 struct DirectoryLinks {
@@ -91,7 +93,7 @@ struct DirectoryLinks {
 /// Separately published immutable base/change views let queries proceed during enumeration.
 struct LiveIndex {
     var base: SearchIndex
-    private static let partitionCount = 8
+    private static let partitionCount = 16
     private var overlays = [SearchIndex](repeating: SearchIndex(), count: partitionCount)
     private var changedChildren: [String: Set<String>] = [:]
     private var dirtyPartitions: Set<Int> = []
@@ -252,7 +254,8 @@ struct LiveIndex {
             case .readable:
                 if state.restricted.contains(path) { reopened.append(path) }
             case .absent: _ = reconcile(path: path, observed: .absent)
-            case .restricted, nil: _ = reconcile(path: path, observed: .restricted)
+            case .pending: _ = reconcile(path: path, observed: .pending)
+            case .deferred, .restricted, nil: _ = reconcile(path: path, observed: .restricted)
             }
         }
         prepareDelta()
@@ -409,10 +412,55 @@ struct LiveIndex {
         for location in removed { change(nil, at: location) }
     }
 
+    mutating func clearCloudPending(at path: String) {
+        guard let former = entry(at: path), former.attribute & Kind.pending != 0 else { return }
+        set(TrackedEntry(size: former.size, modified: former.modified, attribute: former.attribute & ~Kind.pending),
+            path: path, original: baseID(at: path))
+    }
+
+    func pendingCloudDirectories(in roots: CloudRoots) -> [String: UInt8] {
+        var pending: [String: UInt8] = [:]
+        for i in base.attributes.indices {
+            let attribute = base.attributes[i]
+            guard attribute & (Kind.mask | Kind.pending | Kind.excluded) == Kind.directory | Kind.pending,
+                  !base.isSuppressed(i) else { continue }
+            let path = base.fullPath(UInt32(i))
+            if roots.provider(containing: path) != nil && !roots.isTrash(path) { pending[path] = attribute }
+        }
+        for (path, entry) in state.changes where entry.directory && entry.attribute & Kind.pending != 0 {
+            if roots.provider(containing: path) != nil && !roots.isTrash(path) { pending[path] = entry.attribute }
+        }
+        return pending
+    }
+
+    mutating func purgeProviderTrash(in roots: CloudRoots) {
+        var providers = roots.iCloud.map { [$0] } ?? []
+        if let storage = roots.storage {
+            providers += baseChildren(storage).keys.map { joinedPath(storage, $0) }
+            providers += changedChildren[storage] ?? []
+        }
+        for provider in providers {
+            let trash = joinedPath(provider, ".Trash")
+            _ = reconcile(path: trash, observed: .absent)
+            for anchor in links?.anchors.keys.filter({ inside($0, trash) }) ?? [] {
+                removeSubtree(anchor, includingRoot: true)
+            }
+        }
+        prepareDelta()
+    }
+
     /// Return children requiring recursive enumeration because their subtree is new.
-    mutating func reconcile(path: String, observed: DirectoryObservation) -> [String] {
+    mutating func reconcile(path: String, observed: DirectoryObservation, completingCloud: Bool = false) -> [String] {
         if state.restricted.contains(where: { $0 != path && inside(path, $0) }) { return [] }
         switch observed {
+        case .deferred:
+            return []
+        case .pending:
+            if let former = entry(at: path), former.directory, former.attribute & Kind.pending == 0 {
+                set(TrackedEntry(size: former.size, modified: former.modified, attribute: former.attribute | Kind.pending),
+                    path: path, original: baseID(at: path))
+            }
+            return []
         case .restricted:
             removeSubtree(path, includingRoot: false)
             state.restricted.insert(path)
@@ -428,7 +476,7 @@ struct LiveIndex {
             let needsRestore = state.restricted.remove(path) != nil
             if path != state.root, let existing = entry(at: path) {
                 let owned = TrackedEntry(size: own.size, modified: own.modified,
-                                         attribute: existing.attribute)
+                                         attribute: completingCloud ? existing.attribute & ~Kind.pending : existing.attribute)
                 let id = baseID(at: path)
                 if owned != existing { set(owned, path: path, original: id) }
             }
@@ -448,16 +496,20 @@ struct LiveIndex {
                 if entry.directory { removeSubtree(location, includingRoot: true) }
                 set(nil, path: location, original: originals[name])
             }
-            for (name, entry) in children {
+            for (name, observed) in children {
+                var entry = observed
                 let original = originals[name]
                 let baseValue = original.flatMap { id in
                     base.attributes[Int(id)] & Kind.excluded == 0 && !base.isSuppressed(Int(id)) ? baseEntry(id) : nil
                 }
-                if !needsRestore, baseValue == entry { continue }
                 let location = joinedPath(path, name)
                 let prior = state.changes[location] ?? baseValue
+                if completingCloud, entry.directory, prior?.directory != true {
+                    entry = TrackedEntry(size: entry.size, modified: entry.modified, attribute: entry.attribute | Kind.pending)
+                }
                 if prior != entry { set(entry, path: location, original: original) }
-                if entry.directory && (needsRestore || prior?.directory != true) && entry.attribute & Kind.pending == 0 {
+                if entry.directory && (needsRestore || prior?.directory != true || prior.map { $0.attribute & Kind.pending != 0 } == true) &&
+                    entry.attribute & Kind.pending == 0 {
                     addedDirectories.append(location)
                 }
             }
@@ -492,6 +544,8 @@ struct LiveIndex {
 struct LiveSearchView {
     let base: SearchIndex
     let overlays: [SearchIndex]
+
+    var entryCount: Int { base.visibleEntryCount + overlays.reduce(0) { $0 + $1.visibleEntryCount } }
 
     func search(_ query: String, mode: QueryMode, column: SearchColumn, direction: SearchDirection,
                 showAll: Bool, offset: Int, limit: Int) -> [SearchRow] {
@@ -531,7 +585,7 @@ struct LiveSearchView {
     }
 }
 
-private func compareAcross(_ lhs: SearchRow, _ rhs: SearchRow, column: SearchColumn) -> Int {
+func compareAcross(_ lhs: SearchRow, _ rhs: SearchRow, column: SearchColumn) -> Int {
     func compare<T: Comparable>(_ x: T, _ y: T) -> Int { x == y ? 0 : x < y ? -1 : 1 }
     func bytes(_ x: [UInt8], _ y: [UInt8]) -> Int { x == y ? 0 : x.lexicographicallyPrecedes(y) ? -1 : 1 }
     let main: Int
@@ -545,7 +599,44 @@ private func compareAcross(_ lhs: SearchRow, _ rhs: SearchRow, column: SearchCol
     let normalized = bytes(SearchIndex.key(lhs.name), SearchIndex.key(rhs.name))
     if normalized != 0 { return normalized }
     let raw = bytes(Array(lhs.name.utf8), Array(rhs.name.utf8))
-    return raw != 0 ? raw : compare(lhs.id, rhs.id)
+    if raw != 0 { return raw }
+    let volume = compare(lhs.volumeID ?? "", rhs.volumeID ?? "")
+    return volume != 0 ? volume : compare(lhs.id, rhs.id)
+}
+
+extension SearchIndex {
+    /// Keep row IDs (including suppression bits) while rebasing absolute anchors.
+    func movedVolume(from old: String, to new: String) throws -> SearchIndex {
+        func rebase(_ path: String) throws -> String {
+            guard inside(path, old) else { throw SnapshotError.invalid }
+            return new + path.dropFirst(old.count)
+        }
+        var relocated = SearchIndex()
+        relocated.reserve(recordCount, nameBytes: names.count)
+        try names.withUnsafeBufferPointer { pool in
+            for (i, row) in records.enumerated() {
+                let end = i + 1 < recordCount ? Int(records[i + 1].offset) : pool.count
+                if row.parent == .max {
+                    relocated.append(try rebase(name(UInt32(i))), size: row.size, modified: row.modified,
+                                     attribute: attributes[i])
+                } else {
+                    let bytes = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: Int(row.offset)),
+                                                    count: end - Int(row.offset) - 1)
+                    relocated.append(bytes: bytes, parent: row.parent, size: row.size,
+                                     modified: row.modified, attribute: attributes[i])
+                }
+            }
+        }
+        if let tracking {
+            let changes = try Dictionary(uniqueKeysWithValues: tracking.changes.map { (try rebase($0.key), $0.value) })
+            relocated.tracking = TrackingState(root: new, changes: changes,
+                                               restricted: try Set(tracking.restricted.map(rebase)))
+        }
+        relocated.volumes = volumes
+        relocated.suppressed = suppressed
+        relocated.prepare()
+        return relocated
+    }
 }
 
 extension SearchIndex {

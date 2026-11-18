@@ -302,7 +302,8 @@ static uint32_t advance(const char *pattern, uint32_t length, const uint32_t *fa
 
 // A slash-bearing word can end in a basename only when its stem ends at
 // the parent slash and its remaining tail is a prefix of the basename.
-static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
+static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits,
+                       bool all, size_t *visible_matches, uint32_t *sole_match) {
     const char *tail = strrchr(word, '/') + 1;
     uint32_t stem = (uint32_t)(tail - word);
     size_t tail_length = strlen(tail);
@@ -310,6 +311,7 @@ static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
     size_t states_bytes = v->row_count * sizeof(uint32_t);
     uint32_t *states = scratch_map(states_bytes);
     if (!fallback || !states) { free(fallback); scratch_release(states, states_bytes); return false; }
+    *visible_matches = 0;
     for (uint32_t i = 1; i < stem; i++)
         fallback[i] = advance(word, stem, fallback, fallback[i - 1], word[i]);
 
@@ -322,8 +324,14 @@ static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
         const char *name = key(v, i);
         hits[i] = (uint8_t)(prior_match || (root ? folded_contains(name, word) :
                    inherited == stem && folded_prefix(name, tail, tail_length)));
+        if (hits[i]) {
+            if (visible(v->attributes[i], all) &&
+                (!v->suppressed_rows || !(v->suppressed_rows[i >> 3] & (1U << (i & 7))))) {
+                if ((*visible_matches)++ == 0) *sole_match = i;
+            }
+            continue;
+        }
         if (kind != ANCHOR && kind != DIRECTORY) continue;
-        if (hits[i]) continue;
         uint32_t state = inherited;
         const char *p = name;
         for (; *p; p++) state = advance(word, stem, fallback, state, (char)ascii_fold((uint8_t)*p));
@@ -364,6 +372,9 @@ typedef struct {
     uint8_t *hits;
     bool ok;
     bool any;
+    bool all;
+    size_t visible_matches;
+    uint32_t sole_match;
 } PathWord;
 
 static void *path_word(void *argument) {
@@ -373,10 +384,11 @@ static void *path_word(void *argument) {
     memset(hits, 0, view->row_count);
     task->ok = true;
     if (strchr(task->word, '/')) {
-        task->ok = slash_hits(view, task->word, hits);
-        task->any = task->ok;
+        task->ok = slash_hits(view, task->word, hits, task->all, &task->visible_matches, &task->sole_match);
+        task->any = task->ok && task->visible_matches != 0;
         return NULL;
     }
+    task->visible_matches = SIZE_MAX;
     task->any = name_hits(view, task->word, hits) != 0;
     if (task->any) {
         for (uint32_t i = 0; i < view->row_count; i++) {
@@ -407,6 +419,7 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         return SIZE_MAX;
     }
     bool ok = true, any = true;
+    uint32_t only_path_hit = UINT32_MAX;
     if (!path) {
         const char *longest = (const char *)patterns + offsets[0];
         for (size_t i = 1; i < words; i++) {
@@ -419,10 +432,10 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
                 if (matches[i] && !all_words(key(v, i), patterns, offsets, words)) matches[i] = 0;
         }
     } else {
-        PathWord first = {v, (const char *)patterns + offsets[0], matches, false, false};
+        PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all};
         size_t next = 1;
         if (words > 1 && n >= 50000) {
-            PathWord second = {v, (const char *)patterns + offsets[1], single, false, false};
+            PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all};
             pthread_t thread;
             bool started = pthread_create(&thread, NULL, path_word, &second) == 0;
             path_word(&first);
@@ -436,16 +449,28 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
             ok = first.ok;
             any = first.any;
         }
+        if (words == 1 && first.visible_matches != SIZE_MAX) {
+            size_t available = first.visible_matches > offset ? first.visible_matches - offset : 0;
+            if (available < limit) limit = available;
+            if (first.visible_matches == 1 && limit == 1) only_path_hit = first.sole_match;
+        }
         for (size_t j = next; j < words && ok && any; j++) {
-            PathWord task = {v, (const char *)patterns + offsets[j], single, false, false};
+            PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all};
             path_word(&task);
             ok = task.ok;
             any = task.any;
             if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
         }
     }
-    size_t result = !ok ? SIZE_MAX : !any ? 0 :
-        select_order(v, order, matches, NULL, NULL, 0, descending, all, offset, limit, n, results);
+    size_t result;
+    if (only_path_hit != UINT32_MAX) {
+        // One visible candidate has the same rank for every column and direction.
+        results[0] = only_path_hit;
+        result = 1;
+    } else {
+        result = !ok ? SIZE_MAX : !any ? 0 :
+            select_order(v, order, matches, NULL, NULL, 0, descending, all, offset, limit, n, results);
+    }
     if (single != matches) scratch_release(single, n);
     scratch_release(matches, n);
     return result;

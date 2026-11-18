@@ -68,6 +68,7 @@ extension SearchIndex {
     }
 
     public static func load(from path: String) throws -> SearchIndex {
+        if let hot = try loadPrepared(from: path) { return hot }
         let input = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
         guard input.count >= headerSize, input.prefix(8).elementsEqual(snapshotMagic) else {
             throw SnapshotError.invalid
@@ -107,7 +108,7 @@ extension SearchIndex {
         }
     }
 
-    private func structureIsValid() -> Bool {
+    func structureIsValid() -> Bool {
         if records.isEmpty { return names.isEmpty }
         return names.withUnsafeBufferPointer { pool in
             var expected = 0

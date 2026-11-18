@@ -11,6 +11,8 @@ struct PreparedSearch {
     var sizeOrder: [UInt32] = []
     var modifiedOrder: [UInt32] = []
 
+    init(keyOffsets: [UInt32]) { self.keyOffsets = keyOffsets }
+
     init(index: SearchIndex) {
         keyOffsets = [UInt32](repeating: .max, count: index.recordCount)
         index.names.withUnsafeBufferPointer { pool in
@@ -41,12 +43,16 @@ struct PreparedSearch {
                     keyBytes.withUnsafeBufferPointer { folded in
                         keyOffsets.withUnsafeBufferPointer { offsets in
                             changedRows.withUnsafeBufferPointer { changed in
-                                var view = DMQueryView(rows: rows.baseAddress,
-                                    attributes: attributes.baseAddress, names: names.baseAddress,
-                                    folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
-                                    fold_rows: changed.baseAddress, row_count: rows.count,
-                                    name_bytes: names.count, fold_bytes: folded.count, fold_count: changed.count)
-                                return body(&view)
+                                index.suppressed.withUnsafeBufferPointer { suppressed in
+                                    var view = DMQueryView(rows: rows.baseAddress,
+                                        attributes: attributes.baseAddress, names: names.baseAddress,
+                                        folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
+                                        fold_rows: changed.baseAddress,
+                                        suppressed_rows: suppressed.isEmpty ? nil : suppressed.baseAddress,
+                                        row_count: rows.count, name_bytes: names.count,
+                                        fold_bytes: folded.count, fold_count: changed.count)
+                                    return body(&view)
+                                }
                             }
                         }
                     }

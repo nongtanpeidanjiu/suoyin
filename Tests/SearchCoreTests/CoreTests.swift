@@ -53,7 +53,7 @@ struct CoreTests {
 
     private func scratch() throws -> URL {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent(".m1-tmp", isDirectory: true)
+            .appendingPathComponent(".m2-tmp", isDirectory: true)
             .appendingPathComponent("test-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root

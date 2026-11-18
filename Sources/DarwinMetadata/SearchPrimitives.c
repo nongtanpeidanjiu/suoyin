@@ -14,7 +14,7 @@ static void scratch_release(void *ptr, size_t size) {
     if (ptr) munmap(ptr, size);
 }
 
-enum { KIND_MASK = 3, ANCHOR = 0, DIRECTORY = 2, HIDDEN = 4, EXCLUDED = 16 };
+enum { KIND_MASK = 3, ANCHOR = 0, DIRECTORY = 2, HIDDEN = 4, EXCLUDED = 16 | 32 };
 
 static const char *original(const DMQueryView *v, uint32_t id) {
     return (const char *)v->names + v->rows[id].offset;
@@ -22,6 +22,27 @@ static const char *original(const DMQueryView *v, uint32_t id) {
 static const char *key(const DMQueryView *v, uint32_t id) {
     uint32_t offset = v->fold_offsets[id];
     return offset == UINT32_MAX ? original(v, id) : (const char *)v->folded_names + offset;
+}
+
+uint32_t dm_directory_candidate(const DMRecord *records, const uint8_t *attributes,
+                                const uint8_t *names, size_t count, uint32_t start,
+                                const char *leaf, const char *path) {
+    for (uint32_t row = start; row < count; row++) {
+        uint8_t kind = attributes[row] & KIND_MASK;
+        if ((kind == DIRECTORY || kind == ANCHOR) &&
+            strcmp((const char *)names + records[row].offset, kind == ANCHOR ? path : leaf) == 0) return row;
+    }
+    return UINT32_MAX;
+}
+
+uint32_t dm_child_directory(const DMRecord *records, const uint8_t *attributes,
+                            const uint8_t *names, const uint32_t *next, uint32_t first,
+                            const char *leaf) {
+    for (uint32_t row = first; row != UINT32_MAX; row = next[row]) {
+        if ((attributes[row] & KIND_MASK) == DIRECTORY &&
+            strcmp((const char *)names + records[row].offset, leaf) == 0) return row;
+    }
+    return UINT32_MAX;
 }
 
 int dm_key_class(const uint8_t *name, size_t length) {
@@ -289,7 +310,8 @@ static size_t select_order(const DMQueryView *v, const uint32_t *ids, const uint
     size_t emitted = 0, skipped = 0;
     for (size_t i = 0; i < budget && emitted < limit; i++) {
         uint32_t id = ids[descending ? v->row_count - i - 1 : i];
-        if (!visible(v->attributes[id], all)) continue;
+        if (!visible(v->attributes[id], all) ||
+            (v->suppressed_rows && (v->suppressed_rows[id >> 3] & (1U << (id & 7))))) continue;
         if (matches ? !matches[id] : words && !all_words(key(v, id), patterns, offsets, words)) continue;
         if (skipped < offset) { skipped++; continue; }
         out[emitted++] = id;

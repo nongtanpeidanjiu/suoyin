@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <malloc/malloc.h>
 
 static int expected_error(int error, DMCounts *counts) {
     switch (error) {
@@ -167,4 +168,8 @@ uint64_t dm_resident_bytes(void) {
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
     return result == KERN_SUCCESS ? info.resident_size : 0;
+}
+
+void dm_release_allocator_cache(void) {
+    malloc_zone_pressure_relief(NULL, 0);
 }

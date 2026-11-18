@@ -22,6 +22,7 @@ enum Kind {
     static let hidden: UInt8 = 4
     static let pending: UInt8 = 8
     static let excluded: UInt8 = 16
+    static let suppressed: UInt8 = 32
 }
 
 public struct VolumeCheckpoint: Codable, Sendable, Equatable {
@@ -30,7 +31,7 @@ public struct VolumeCheckpoint: Codable, Sendable, Equatable {
     public let eventLogUUID: String?
     public let mountedDevice: Int32?
     public let readOnly: Bool?
-    // Milestone 1 establishes streams but applies no events.
+    /// Last applied event recorded in this snapshot, when a safe position exists.
     public let appliedEvent: UInt64?
 }
 
@@ -39,11 +40,14 @@ public struct SearchIndex {
     var attributes: [UInt8] = []
     var names: [UInt8] = []
     var prepared: PreparedSearch?
+    var suppressed: [UInt8] = []
+    var tracking: TrackingState?
+    var loadedPrepared = false
     public internal(set) var volumes: [VolumeCheckpoint] = []
 
     public init() {}
     public var recordCount: Int { records.count }
-    public var visibleEntryCount: Int { attributes.reduce(0) { $0 + (visible($1, true) ? 1 : 0) } }
+    public var visibleEntryCount: Int { attributes.indices.count { visible(attributes[$0], true) && !isSuppressed($0) } }
 
     mutating func reserve(_ count: Int, nameBytes: Int) {
         records.reserveCapacity(count)
@@ -100,8 +104,19 @@ public struct SearchIndex {
     }
 
     func visible(_ attribute: UInt8, _ showAll: Bool) -> Bool {
-        attribute & Kind.mask != Kind.anchor && attribute & Kind.excluded == 0 &&
+        attribute & Kind.mask != Kind.anchor && attribute & (Kind.excluded | Kind.suppressed) == 0 &&
             (showAll || attribute & Kind.hidden == 0)
+    }
+
+    func isSuppressed(_ index: Int) -> Bool {
+        !suppressed.isEmpty && suppressed[index >> 3] & (1 << (index & 7)) != 0
+    }
+
+    mutating func setSuppressed(_ index: Int, _ value: Bool) {
+        guard isSuppressed(index) != value else { return }
+        if suppressed.isEmpty { suppressed = [UInt8](repeating: 0, count: (recordCount + 7) / 8) }
+        if value { suppressed[index >> 3] |= 1 << (index & 7) }
+        else { suppressed[index >> 3] &= ~(1 << (index & 7)) }
     }
 
     static func key(_ text: String) -> [UInt8] {
@@ -146,7 +161,7 @@ public struct SearchIndex {
         }
         var first: [UInt32] = []
         first.reserveCapacity(min(capacity, records.count))
-        for i in records.indices where visible(attributes[i], showAll) {
+        for i in records.indices where visible(attributes[i], showAll) && !isSuppressed(i) {
             let id = UInt32(i)
             if !words.isEmpty {
                 let text = mode == .name ? name(id) : fullPath(id)

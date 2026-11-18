@@ -19,6 +19,13 @@ typedef void (*DMEntryCallback)(void *, const uint8_t *, size_t, int64_t, int64_
 int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
             DMEntryCallback callback, void *context, DMCounts *counts);
 uint64_t dm_resident_bytes(void);
+void dm_release_allocator_cache(void);
+uint32_t dm_directory_candidate(const DMRecord *records, const uint8_t *attributes,
+                                const uint8_t *names, size_t count, uint32_t start,
+                                const char *leaf, const char *path);
+uint32_t dm_child_directory(const DMRecord *records, const uint8_t *attributes,
+                            const uint8_t *names, const uint32_t *next, uint32_t first,
+                            const char *leaf);
 
 typedef struct {
     const DMRecord *rows;
@@ -27,6 +34,7 @@ typedef struct {
     const uint8_t *folded_names;
     const uint32_t *fold_offsets;
     const uint32_t *fold_rows;
+    const uint8_t *suppressed_rows;
     size_t row_count, name_bytes, fold_bytes, fold_count;
 } DMQueryView;
 

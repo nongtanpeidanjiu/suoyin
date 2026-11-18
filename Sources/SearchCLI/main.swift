@@ -58,6 +58,25 @@ private struct Progress: Encodable {
 private func run(_ args: [String]) throws {
     guard let command = args.first else { throw CommandError.usage }
     switch command {
+    case "track":
+        try runTrackingCLI(args)
+    case "prepare-cache":
+        guard args.count == 3 else { throw CommandError.usage }
+        var index = try SearchIndex.load(from: args[1])
+        let loaded = SearchIndex.residentBytes()
+        let loadTime = elapsed(started)
+        index.prepare()
+        let prepared = SearchIndex.residentBytes()
+        let prepareTime = elapsed(started)
+        try index.savePrepared(to: args[2])
+        try report(["loadedBytes": Double(loaded), "preparedBytes": Double(prepared),
+                    "maxBytes": Double(usageAtProcess().1), "loadMS": loadTime,
+                    "preparedMS": prepareTime, "savedMS": elapsed(started)])
+    case "inspect-cache":
+        guard args.count == 2 else { throw CommandError.usage }
+        let index = try SearchIndex.load(from: args[1])
+        try report(index.volumes)
+        try report(index.restoredRows())
     case "scan":
         guard (5...6).contains(args.count) else { throw CommandError.usage }
         let ordinary = args.count == 6 && args[5] == "--ordinary"
@@ -91,14 +110,15 @@ private func run(_ args: [String]) throws {
         var index = try SearchIndex.load(from: args[1])
         let loaded = elapsed(started)
         index.prepare()
-        let rows = firstPage(index, request: probe, direct: false)
+        let rows = index.restoredSearch("a", showAll: true)
         let ready = elapsed(started)
         try report(["loadedMilliseconds": loaded, "readyMilliseconds": ready,
-                    "rows": Double(rows.count), "residentBytes": Double(SearchIndex.residentBytes())])
+                    "rows": Double(rows.count), "residentBytes": Double(SearchIndex.residentBytes()),
+                    "peakBytes": Double(usageAtProcess().1)])
         try report(rows)
         if command == "roundtrip" {
             let saveStart = DispatchTime.now().uptimeNanoseconds
-            try index.save(to: args[2])
+            try index.saveAsLoaded(to: args[2])
             try report(["saveMilliseconds": elapsed(saveStart)])
         }
     case "verify-recovery":

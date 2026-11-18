@@ -33,7 +33,7 @@ def start(args, snapshot, folder, label):
 def rebuild(args, state, probe):
     snapshot = state / "rebuild-index.tmp"
     clone(args.base, snapshot)
-    marker = probe / "rebuild-search-proof.tmp"
+    marker = probe / (probe.name + "-search-proof.tmp")
     marker.touch()
     run = start(args, snapshot, state, "rebuild")
     try:
@@ -53,7 +53,15 @@ def rebuild(args, state, probe):
 def compaction(args, state, probe):
     snapshot = state / "compaction-index.tmp"
     clone(args.base, snapshot)
+    previous_log = Path(str(args.base) + ".changes")
+    if previous_log.is_file():
+        clone(previous_log, Path(str(snapshot) + ".changes"))
     run = start(args, snapshot, state, "compaction")
+    marker = "mergeproof-" + probe.name
+
+    def entry(suffix):
+        return probe / f"{marker}-{suffix}.tmp"
+
     try:
         run.wait("ready", timeout=60)
         run.wait("caught-up", timeout=90)
@@ -61,29 +69,38 @@ def compaction(args, state, probe):
         target = 33_000
         for total in range(0, target, 5_500):
             for i in range(total, total + 5_500):
-                (probe / f"mergeproof-{i:05}.tmp").touch()
+                entry(f"{i:05}").touch()
             run.call("sync")
         until = time.monotonic() + 45
         samples = []
         changed_while_busy = False
-        late = probe / "mergeproof-late.tmp"
+        checked_while_busy = 0
+        mutable = entry("00000")
+        stable = {}
+        for i in range(1, 10):
+            path = entry(f"{i:05}")
+            info = path.lstat()
+            stable[path] = (info.st_size, info.st_mtime_ns)
         while time.monotonic() < until:
-            result = run.call("query", query="mergeproof-0000")
+            result = run.call("query", query=marker + "-0000")
             status = result["status"]
-            assert result["rows"] and all(Path(row["path"]).is_relative_to(probe) for row in result["rows"])
+            observed = folded_metadata(result["rows"])
+            assert observed.keys() == stable.keys() | {mutable}
+            assert all(observed[path] == metadata for path, metadata in stable.items())
+            checked_while_busy += int(status["compacting"])
             samples.append(dict(status=status, rss=result["residentBytes"],
                                 elapsedMS=(result["queryEnd"] - result["queryStart"]) / 1e6))
             if status["compacting"] and not changed_while_busy:
-                late.touch()
-                (probe / "mergeproof-00000.tmp").write_bytes(b"late update")
+                entry("late").touch()
+                mutable.write_bytes(b"late update")
                 changed_while_busy = True
             if status["compactions"] > initial["status"]["compactions"]:
                 break
-        assert changed_while_busy and status["compactions"] > initial["status"]["compactions"]
+        assert changed_while_busy and checked_while_busy and status["compactions"] > initial["status"]["compactions"]
         expected = reference(probe)
         until = time.monotonic() + 12
         while time.monotonic() < until:
-            rows = run.call("query", query="mergeproof-", limit=target + 50)["rows"]
+            rows = run.call("query", query=marker, limit=target + 50)["rows"]
             if folded_metadata(rows) == expected and len(rows) == len(expected):
                 break
             time.sleep(.1)
@@ -91,6 +108,7 @@ def compaction(args, state, probe):
         final = run.call("status")
         peak = run.finish()
         return dict(original=target, intervalSamples=samples, final=final, peakRSS=peak,
+                    parallelIndependentQueries=checked_while_busy, stableRowsPerQuery=len(stable),
                     concurrentEdit=True, equal=True, fixture=str(probe), snapshot=str(snapshot))
     finally:
         run.terminate_fixture_if_needed()
@@ -143,8 +161,9 @@ def write_long_journal(source, rows):
 def long_journal(args, state, probe):
     snapshot = state / "long-journal-index.tmp"
     clone(args.base, snapshot)
+    marker = "longjournalproof-" + probe.name
     for i in range(512):
-        (probe / f"longjournalproof-{i:04}.tmp").write_bytes(bytes(i % 31))
+        (probe / f"{marker}-{i:04}.tmp").write_bytes(bytes(i % 31))
     expected = reference(probe)
     size, frames = write_long_journal(snapshot, expected)
     trials = []
@@ -153,7 +172,7 @@ def long_journal(args, state, probe):
         try:
             cached = run.wait("ready", timeout=60)
             ready_ms = (time.monotonic_ns() - run.started) / 1e6
-            rows = run.call("query", query="longjournalproof-", limit=600)["rows"]
+            rows = run.call("query", query=marker, limit=600)["rows"]
             assert folded_metadata(rows) == expected
             assert cached["status"]["journalRestoredFrames"] == frames
             trials.append(dict(milliseconds=ready_ms, correct=True, ready=cached["status"]))

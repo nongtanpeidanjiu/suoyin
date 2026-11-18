@@ -672,7 +672,9 @@ public final class ChangeTracker {
     private func recordDuringCompaction(_ work: [String: Bool]) {
         guard duringCompaction != nil else { return }
         for (path, recursive) in work {
-            duringCompaction?[path] = recursive || duringCompaction?[path] == true
+            if recursive || duringCompaction?[path] == nil {
+                duringCompaction?[path] = recursive
+            }
         }
     }
 

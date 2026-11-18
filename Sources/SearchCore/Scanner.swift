@@ -198,7 +198,8 @@ private final class ScanSession {
     let condition = NSCondition()
     let start = DispatchTime.now().uptimeNanoseconds
     let listeners: ListenerSet
-    var index = SearchIndex()
+    var index: SearchIndex
+    let retainedDirectories: [String: UInt32]
     var jobs: [ScanJob] = []
     var cloudJobs: [ScanJob] = []
     var workersActive = 0
@@ -211,13 +212,27 @@ private final class ScanSession {
     let publish: (ScanMark, SearchIndex) throws -> Void
 
     init(scope: WalkScope, ordinary: Bool, listeners: ListenerSet, excludedPaths: Set<String>, dataOnly: Bool,
-         publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
+         keeping retained: consuming SearchIndex, publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
         self.scope = scope
         self.ordinary = ordinary
         self.excludedPaths = excludedPaths
         self.dataTargets = dataOnly ? scope.dataVolumeRoots : []
         self.listeners = listeners
         self.publish = publish
+        var bridgePaths: Set<String> = []
+        if retained.recordCount > 0 {
+            for target in dataTargets {
+                var parent = parentPath(target)
+                while bridgePaths.insert(parent).inserted && parent != "/" { parent = parentPath(parent) }
+            }
+        }
+        do {
+            var navigator = LiveIndex(base: copy retained, root: scope.root, linkChildren: false)
+            retainedDirectories = Dictionary(uniqueKeysWithValues: bridgePaths.compactMap { path in
+                navigator.directoryID(path).map { (path, $0) }
+            })
+        }
+        index = consume retained
         index.volumes = listeners.checkpoints
         if scope.wholeDisk { index.reserve(2_250_000, nameBytes: 52_000_000) }
     }
@@ -232,7 +247,7 @@ private final class ScanSession {
     }
 
     func addRoot(_ path: String) {
-        let id = index.append(path, attribute: Kind.anchor)
+        let id = retainedDirectories[path] ?? index.append(path, attribute: Kind.anchor)
         jobs.append(ScanJob(path: path, parent: id))
     }
 
@@ -308,8 +323,8 @@ private final class ScanSession {
                 if scope.defaultHiddenDirectory(logical) { attribute |= Kind.hidden }
                 let cloudRoot = scope.cloudRoots.contains(path)
                 if cloudRoot || logical == "/usr/local" { attribute &= ~Kind.hidden }
-                let id = index.append(bytes: name, parent: job.parent, size: item.size,
-                                      modified: item.modified, attribute: attribute)
+                let id = retainedDirectories[path] ?? index.append(bytes: name, parent: job.parent, size: item.size,
+                                                                   modified: item.modified, attribute: attribute)
                 entries += 1
                 if dataless {
                     pending += 1
@@ -339,6 +354,18 @@ extension SearchIndex {
                             establishListener: Bool = true,
                             excludedPaths: Set<String> = [], dataOnly: Bool = false,
                             onProgress: @escaping (ScanMark, SearchIndex) throws -> Void = { _, _ in }) throws -> SearchIndex {
+        try scan(root: root, workers: workers, ordinary: ordinary, establishListener: establishListener,
+                 excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: SearchIndex(), onProgress: onProgress)
+    }
+
+    static func scanDataVolume(keeping sealed: consuming SearchIndex, excluding paths: Set<String>) throws -> SearchIndex {
+        try scan(root: "/", workers: 4, ordinary: false, establishListener: false,
+                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, onProgress: { _, _ in })
+    }
+
+    private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,
+                             excludedPaths: Set<String>, dataOnly: Bool, keeping retained: consuming SearchIndex,
+                             onProgress: @escaping (ScanMark, SearchIndex) throws -> Void) throws -> SearchIndex {
         guard (1...4).contains(workers) else { throw ScanError.invalidWorkerCount }
         let root = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
         let scope = try WalkScope(root: root)
@@ -348,7 +375,7 @@ extension SearchIndex {
             if scope.wholeDisk { try listeners.add(root: dataRoot) }
         }
         let session = ScanSession(scope: scope, ordinary: ordinary, listeners: listeners,
-                                  excludedPaths: excludedPaths, dataOnly: dataOnly, publish: onProgress)
+                                  excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: consume retained, publish: onProgress)
         try onProgress(session.mark("listener_ready"), session.index)
         session.addRoot(root)
         if scope.wholeDisk { session.addRoot(dataRoot) }

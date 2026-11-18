@@ -116,13 +116,17 @@ struct JournalTests {
         #expect(cursor.maximumRegression == 1 && cursor.lastSeen == 90)
     }
 
-    @Test func rebuildCooldownIsPerVolume() {
-        var rule = RebuildThrottle()
-        let first = rule.allow(volume: 0, now: 100)
-        let early = rule.allow(volume: 0, now: 101)
-        let other = rule.allow(volume: 1, now: 101)
-        let later = rule.allow(volume: 0, now: 100 + RebuildThrottle.interval)
-        #expect(first && !early && other && later)
+    @Test func recoveryRequiresFewerThan200EventsAndHonorsBothDeadlines() {
+        let second = ReplayLag.second
+        let timing = RecoveryTiming()
+        var activity = EventActivity()
+        activity.received(199, at: 14 * second)
+        #expect(activity.deadline(since: 10 * second, lastStart: nil, timing: timing) == 15 * second)
+        activity.received(1, at: 14 * second)
+        #expect(activity.deadline(since: 10 * second, lastStart: nil, timing: timing) == 19 * second)
+        activity.received(250, at: 128 * second)
+        #expect(activity.deadline(since: 10 * second, lastStart: nil, timing: timing) == 130 * second)
+        #expect(activity.deadline(since: 10 * second, lastStart: 9 * second, timing: timing) == 609 * second)
     }
 
     @Test func historicalBatchesCanArriveOutOfOrderWithoutSkippingUnappliedHistory() {

@@ -1,5 +1,35 @@
 import Foundation
 
+struct RecoveryTiming {
+    var quietWindow: UInt64 = 5 * ReplayLag.second
+    var maximumWait: UInt64 = 120 * ReplayLag.second
+    var minimumInterval: UInt64 = 600 * ReplayLag.second
+}
+
+/// Only the arrival time of the 200th most recent event can delay recovery.
+/// Keep counts per callback so a large batch takes a single slot.
+struct EventActivity {
+    private static let threshold = 200
+    private var receipts: [(time: UInt64, count: Int)] = []
+    private var count = 0
+
+    mutating func received(_ events: Int, at time: UInt64) {
+        guard events > 0 else { return }
+        let added = min(events, Self.threshold)
+        receipts.append((time, added))
+        count += added
+        while let first = receipts.first, count - first.count >= Self.threshold {
+            count -= receipts.removeFirst().count
+        }
+    }
+
+    func deadline(since: UInt64, lastStart: UInt64?, timing: RecoveryTiming) -> UInt64 {
+        let busyUntil = count >= Self.threshold ? receipts[0].time + timing.quietWindow : 0
+        let quiet = max(since + timing.quietWindow, busyUntil)
+        return max(lastStart.map { $0 + timing.minimumInterval } ?? 0, min(quiet, since + timing.maximumWait))
+    }
+}
+
 struct ReplayLag {
     static let second: UInt64 = 1_000_000_000
     static let margin = 10 * second

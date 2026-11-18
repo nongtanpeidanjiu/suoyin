@@ -306,15 +306,15 @@ def exercise(cli, directory):
         tracker.call("sync")
         tracker.call("invalidate-history", expected="invalidated")
         tracker.call("resume")
+        caught = tracker.wait("caught-up")
         row = converge(tracker, tree_rows(tree, store))
         assert row["status"]["recovery"] == "history-invalid"
         summary["invalidHistory"] = dict(route=row["status"]["recovery"], equal=True)
-        tracker.wait("caught-up") if row["status"]["phase"] != "caught-up" else None
-        initial_rebuilds = tracker.call("status")["status"]["rebuilds"]
         tracker.call("invalidate-history", expected="invalidated")
-        degraded = tracker.call("status")["status"]
-        assert degraded["degradedVolumes"] and degraded["rebuilds"] == initial_rebuilds
-        summary["rebuildThrottle"] = dict(degraded=True, rebuilds=degraded["rebuilds"])
+        waiting = tracker.call("sync")["status"]
+        assert waiting["phase"] == "recovery-pending" and waiting["indexReconciling"]
+        assert waiting["nextRecoveryAt"] and waiting["recoveries"] == caught["status"]["recoveries"]
+        summary["rebuildThrottle"] = dict(pending=True, recoveries=waiting["recoveries"])
         maximums.append(tracker.finish())
 
         data = bytearray(snap.read_bytes())

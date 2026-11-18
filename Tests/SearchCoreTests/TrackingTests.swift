@@ -339,12 +339,11 @@ struct TrackingTests {
         let oldUsers = old.append("Users", parent: oldRoot, attribute: Kind.directory)
         old.append("old.txt", parent: oldUsers)
         old.append("sealed", parent: oldRoot)
-        var fresh = SearchIndex()
-        let newRoot = fresh.append("/", attribute: Kind.anchor)
-        let newUsers = fresh.append("Users", parent: newRoot, attribute: Kind.directory)
-        fresh.append("new.txt", parent: newUsers)
-        let result = mergeDataVolume(old: LiveIndex(base: old, root: "/"), new: fresh, targets: ["/Users"])
-        #expect(Set(result.restoredRows().map(\.path)) == ["/sealed", "/Users", "/Users/new.txt"])
+        let compactedParent = old.append("/Users/fixture/removed", attribute: Kind.anchor)
+        old.append("removed-with-parent.txt", parent: compactedParent)
+        let result = sealedVolume(from: old, excluding: ["/Users"])
+        #expect(result.records.count == 2)
+        #expect(result.restoredRows().map(\.path) == ["/sealed"])
     }
 
     @Test func lagAgesAppliedPositionsAndCannotOvertakeDeferredWork() {
@@ -446,7 +445,8 @@ struct TrackingTests {
         let local = fixture.appendingPathComponent("local")
         let sibling = fixture.appendingPathComponent("sibling")
         let recursive = fixture.appendingPathComponent("recursive")
-        for dir in [own, local, sibling, recursive] {
+        let untouched = fixture.appendingPathComponent("untouched")
+        for dir in [own, local, sibling, recursive, untouched] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         let path = own.appendingPathComponent("index.tmp").path
@@ -478,12 +478,96 @@ struct TrackingTests {
 
         let dropped = UInt32(kFSEventStreamEventFlagKernelDropped)
         try tracker.deliverForTesting([VolumeEvent(path: local.path, id: high + 2, flags: flag | dropped)])
-        try awaitStatus(tracker) { $0.rebuilds == 1 && $0.phase == "caught-up" }
+        let pending = tracker.snapshotStatus()
+        #expect(pending.phase == "recovery-pending")
+        #expect(pending.indexReconciling && pending.nextRecoveryAt != nil)
+        #expect(pending.recoveries == 0 && pending.droppedEvents == 1)
         #expect(tracker.search("late-applied").map(\.path) == [marker.path])
-        let userDropped = UInt32(kFSEventStreamEventFlagUserDropped)
-        try tracker.deliverForTesting([VolumeEvent(path: local.path, id: high + 3, flags: flag | userDropped)])
-        #expect(tracker.snapshotStatus().phase == "degraded")
-        #expect(tracker.snapshotStatus().rebuilds == 1)
+        let duringWait = untouched.appendingPathComponent("visible-while-pending.tmp")
+        try tracker.deliverForTesting([VolumeEvent(path: duringWait.path, id: high + 3, flags: 0)],
+                                     writing: { try Data([9]).write(to: duringWait) })
+        #expect(tracker.search("visible-while-pending").map(\.path) == [duringWait.path])
+        try awaitStatus(tracker) { $0.recoveries == 1 && $0.phase == "caught-up" }
+        #expect(tracker.search("late-applied").map(\.path) == [marker.path])
+        #expect(!tracker.snapshotStatus().indexReconciling)
+    }
+
+    @Test func recoveryKeepsSearchAvailableAndCoalescesLossUntilCooldownExpires() throws {
+        let fixture = try scratch()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let own = fixture.appendingPathComponent("owned")
+        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        let existing = fixture.appendingPathComponent("stable.tmp")
+        try Data([1]).write(to: existing)
+        let added = fixture.appendingPathComponent("added-in-recovery.tmp")
+        let timing = RecoveryTiming(quietWindow: 150_000_000, maximumWait: 800_000_000,
+                                    minimumInterval: 2 * ReplayLag.second)
+        let tracker = try ChangeTracker(root: fixture.path, snapshot: own.appendingPathComponent("index").path,
+                                        ownData: own.path, wallTime: { Date().timeIntervalSince1970 },
+                                        recoveryTiming: timing)
+        tracker.start { phase in
+            let status = tracker.snapshotStatus()
+            guard phase == "scan-start", status.recoveries == 1 else { return }
+            #expect(status.indexReconciling)
+            #expect(tracker.search("stable").map(\.path) == [existing.path])
+            #expect(throws: Never.self) { try Data([2, 3]).write(to: added) }
+            tracker.simulateDroppedHistory()
+            tracker.simulateDroppedHistory()
+        }
+        defer { try? tracker.stop() }
+        try awaitStatus(tracker) { $0.phase == "caught-up" }
+        tracker.simulateDroppedHistory()
+        tracker.synchronize()
+        #expect(tracker.snapshotStatus().recoveries == 0)
+        #expect(tracker.search("stable").map(\.path) == [existing.path])
+        try awaitStatus(tracker) { $0.recoveries == 1 && $0.phase == "recovery-pending" && $0.nextRecoveryAt != nil }
+        let cooling = tracker.snapshotStatus()
+        #expect(cooling.indexReconciling)
+        #expect(cooling.droppedEvents == 3 && cooling.droppedDuringRecovery == 2)
+        #expect(cooling.lastRecoveryNanoseconds.map { $0 > 0 } == true)
+        #expect(cooling.nextRecoveryAt.map { $0 > Date().timeIntervalSince1970 + 0.5 } == true)
+        #expect(tracker.search("stable").map(\.path) == [existing.path])
+
+        // No sync, event injection or poll on the writer is needed to wake recovery.
+        try awaitStatus(tracker) { $0.recoveries == 2 && $0.phase == "caught-up" }
+        let expected = try FileManager.default.contentsOfDirectory(at: fixture, includingPropertiesForKeys: nil)
+            .filter { $0.path != own.path }.map(\.path).sorted()
+        #expect(tracker.search("", showAll: true).map(\.path).sorted() == expected)
+        #expect(tracker.search("added-in-recovery").first?.size == 2)
+        let settled = tracker.snapshotStatus()
+        #expect(!settled.indexReconciling && settled.nextRecoveryAt == nil && settled.degradedVolumes.isEmpty)
+        #expect(settled.droppedEvents == 3 && settled.recoveries == 2)
+    }
+
+    @Test func stoppingDuringRecoveryWaitRevokesTheSavedCheckpoint() throws {
+        let fixture = try scratch()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let own = fixture.appendingPathComponent("owned")
+        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        let snapshot = own.appendingPathComponent("index").path
+        let identity = try VolumeIdentity(root: fixture.path)
+        let checkpoint = try #require(identity.observedBoundary())
+        var base = try SearchIndex.scan(root: fixture.path, establishListener: false, excludedPaths: [own.path])
+        base.volumes = [identity.checkpoint(checkpoint)]
+        base.prepare()
+        try base.savePrepared(to: snapshot)
+
+        let first = try ChangeTracker(root: fixture.path, snapshot: snapshot, ownData: own.path)
+        first.start()
+        defer { try? first.stop() }
+        try awaitStatus(first) { $0.phase == "caught-up" }
+        #expect(first.snapshotStatus().durableEvents[fixture.path] == checkpoint)
+        first.simulateDroppedHistory()
+        try first.stop()
+        #expect(first.snapshotStatus().recoveries == 0)
+        #expect(first.snapshotStatus().durableEvents.isEmpty)
+
+        let restarted = try ChangeTracker(root: fixture.path, snapshot: snapshot, ownData: own.path)
+        restarted.start()
+        defer { try? restarted.stop() }
+        try awaitStatus(restarted) { $0.phase == "caught-up" }
+        #expect(restarted.snapshotStatus().recovery == "invalid-checkpoint")
+        #expect(restarted.snapshotStatus().recoveries == 1)
     }
 
     private final class WallClock {
@@ -517,7 +601,8 @@ struct TrackingTests {
         let clock = WallClock()
         let idle = mode == "idle"
         let second = try ChangeTracker(root: fixture.path, snapshot: snapshot.path,
-                                       ownData: own.path, wallTime: { clock.read() })
+                                       ownData: own.path, wallTime: { clock.read() },
+                                       recoveryTiming: RecoveryTiming(quietWindow: 150_000_000))
         second.start()
         defer { try? second.stop() }
         try awaitStatus(second) { $0.phase == "caught-up" }
@@ -535,7 +620,9 @@ struct TrackingTests {
         try second.save()
         #expect(second.snapshotStatus().baseWrites == initialWrites)
         #expect(try Data(contentsOf: snapshot) == baseline)
-        #expect(try Data(contentsOf: journal) == prefix)
+        let checkpointJournal = try Data(contentsOf: journal)
+        #expect(checkpointJournal.starts(with: prefix))
+        #expect(second.snapshotStatus().durableEvents.isEmpty)
 
         if mode == "exit" {
             second.holdUpdates(true)

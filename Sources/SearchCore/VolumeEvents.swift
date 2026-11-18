@@ -24,6 +24,12 @@ struct VolumeEvent {
         flags & UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped |
                        kFSEventStreamEventFlagEventIdsWrapped | kFSEventStreamEventFlagRootChanged) != 0
     }
+
+    var dropped: Bool {
+        flags & UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped) != 0
+    }
+
+    var invalidPosition: Bool { invalidatesHistory || !historyDone && (id == 0 || id == .max) }
 }
 
 struct ScanBoundary {
@@ -167,9 +173,8 @@ struct EventCursor {
         var boundary: UInt64?
         var done = historyDelivered
         for event in events {
-            if event.invalidatesHistory { return false }
+            if event.invalidPosition { return false }
             if event.historyDone { done = true; continue }
-            if event.id == 0 || event.id == UInt64.max { return false }
             // Historical directory coalescing can deliver separate batches
             // out of ID order. HistoryDone delimits live stream comparisons.
             if replaying && !done { continue }
@@ -194,16 +199,5 @@ struct EventCursor {
             lag.record(safe, at: time)
         }
         pendingHistory = nil
-    }
-}
-
-struct RebuildThrottle {
-    static let interval: UInt64 = 600_000_000_000
-    private var lastStart: [Int: UInt64] = [:]
-
-    mutating func allow(volume: Int, now: UInt64) -> Bool {
-        if let previous = lastStart[volume], now - previous < Self.interval { return false }
-        lastStart[volume] = now
-        return true
     }
 }

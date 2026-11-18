@@ -476,8 +476,14 @@ public final class ChangeTracker {
         let immediate = force || snapshotStatus().phase != "caught-up"
         if reset.isEmpty {
             for (path, item) in observations {
-                let hidden = directories.knownVisibility(at: path, now: now) ??
-                    (scope.backgroundDirectory(path) || (current?.entry(at: path)?.attribute ?? 0) & Kind.hidden != 0)
+                let hidden: Bool
+                if let known = directories.knownVisibility(at: path, now: now) {
+                    hidden = known
+                } else if let indexed = current?.entry(at: path) {
+                    hidden = indexed.attribute & Kind.hidden != 0
+                } else {
+                    hidden = scope.backgroundDirectory(path)
+                }
                 directories.enqueue(item, at: path, hidden: hidden, now: now)
             }
             if directories.pendingItems > Self.pendingLimit, !immediate {
@@ -983,11 +989,14 @@ public final class ChangeTracker {
         }
     }
 
-    func deliverForTesting(_ events: [VolumeEvent]) {
-        update.sync {
+    func deliverForTesting(_ events: [VolumeEvent], writing: () throws -> Void = {},
+                           check: () -> Void = {}) rethrows {
+        try update.sync {
             guard let i = identities.firstIndex(where: { !$0.readOnly }) else { return }
+            try writing()
             enqueue(EventBatch(volume: i, epoch: epochs[i], events: events))
             drain()
+            check()
         }
     }
 

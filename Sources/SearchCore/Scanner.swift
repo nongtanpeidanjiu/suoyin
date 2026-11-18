@@ -103,6 +103,7 @@ private final class ListenerSet {
 let dataRoot = "/System/Volumes/Data"
 
 struct WalkScope {
+    static let packageSuffixes = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
     let root: String
     let primaryDevice: dev_t
     let dataDevice: dev_t
@@ -162,11 +163,18 @@ struct WalkScope {
         if inside(logical, homeLibrary) && !cloudRoots.contains(where: { inside(logical, $0) }) { return true }
         // An explicitly indexed fixture or external root is the reference point
         // for visibility. Only directories inside it affect that view.
-        let relative = wholeDisk ? logical : String(path.dropFirst(root.count))
+        let relative: Substring
+        if wholeDisk && inside(logical, "/usr/local") {
+            relative = logical.dropFirst("/usr/local".count)
+        } else {
+            relative = wholeDisk ? logical[...] : path.dropFirst(root.count)
+        }
         var prefix = ""
-        for component in relative.split(separator: "/") {
+        let components = relative.split(separator: "/")
+        for (index, component) in components.enumerated() {
             prefix += "/" + component
-            if component.hasPrefix(".") || component.hasSuffix(".app") ||
+            let insidePackage = index < components.count - 1 && Self.packageSuffixes.contains { component.hasSuffix($0) }
+            if component.hasPrefix(".") || insidePackage ||
                 wholeDisk && defaultHiddenDirectory(prefix) { return true }
         }
         return false
@@ -265,7 +273,7 @@ private final class ScanSession {
         let platformParent = job.path.hasPrefix(dataRoot + "/")
             ? String(job.path.dropFirst(dataRoot.count)) : job.path
         let parentIsTrashRoot = !local && isProviderTrash(platformParent)
-        let parentIsPackage = Self.packageSuffixes.contains { job.path.hasSuffix($0) }
+        let parentIsPackage = WalkScope.packageSuffixes.contains { job.path.hasSuffix($0) }
         let parentPrefix = job.path == "/" ? "/" : job.path + "/"
         let includeFiles = dataTargets.isEmpty || dataTargets.contains { inside(job.path, $0) }
         batch.names.withUnsafeBufferPointer { pool in
@@ -311,7 +319,6 @@ private final class ScanSession {
         }
     }
 
-    private static let packageSuffixes = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
 
     func run(_ workers: Int) throws {
         let group = DispatchGroup()
@@ -411,8 +418,7 @@ extension WalkScope {
         }
         var children: [String: TrackedEntry] = [:]
         children.reserveCapacity(batch.items.count)
-        let package = [".app", ".appex", ".bundle", ".framework", ".plugin", ".kext", ".xpc"]
-            .contains { path.hasSuffix($0) }
+        let package = Self.packageSuffixes.contains { path.hasSuffix($0) }
         let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
         let excludedChildren = Set(excluded.filter { parentPath($0) == path }.map(leafName))
         let mirroredChildren = Set(mirrors.filter { parentPath($0) == path }.map(leafName))

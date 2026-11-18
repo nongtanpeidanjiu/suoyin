@@ -287,13 +287,26 @@ struct TrackingTests {
         #expect(index.search("abc") == original)
     }
 
+    @Test func throttlingRespectsVisibleSystemAndCloudExceptions() throws {
+        let disk = try WalkScope(root: "/")
+        #expect(disk.backgroundDirectory("/usr/bin"))
+        #expect(!disk.backgroundDirectory("/usr/local"))
+        #expect(!disk.backgroundDirectory("/usr/local/share"))
+        #expect(disk.backgroundDirectory("/usr/local/.hidden"))
+        #expect(!disk.backgroundDirectory(disk.homeLibrary + "/CloudStorage/Documents"))
+        #expect(disk.backgroundDirectory(disk.homeLibrary + "/Caches"))
+        #expect(!disk.backgroundDirectory("/Applications/Example.app"))
+        #expect(disk.backgroundDirectory("/Applications/Example.app/Contents"))
+    }
+
     @Test func lateBatchAppliesAndOnlyDroppedEventsRebuildTheSubscription() throws {
         let fixture = try scratch()
         defer { try? FileManager.default.removeItem(at: fixture) }
         let own = fixture.appendingPathComponent("owned")
         let local = fixture.appendingPathComponent("local")
         let sibling = fixture.appendingPathComponent("sibling")
-        for dir in [own, local, sibling] {
+        let recursive = fixture.appendingPathComponent("recursive")
+        for dir in [own, local, sibling, recursive] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         let path = own.appendingPathComponent("index.tmp").path
@@ -304,21 +317,31 @@ struct TrackingTests {
 
         let flag = UInt32(kFSEventStreamEventFlagMustScanSubDirs)
         let marker = local.appendingPathComponent("late-applied.tmp")
-        try Data([1, 2, 3]).write(to: marker)
         let observed = tracker.snapshotStatus().appliedEvents.values.max() ?? 1
-        tracker.deliverForTesting([VolumeEvent(path: sibling.path, id: observed + 20_000, flags: flag)])
-        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 19_999, flags: flag)])
-        try awaitStatus(tracker) { $0.outOfOrderBatches > 0 && !tracker.search("late-applied").isEmpty }
+        let high = observed + 100_000_000
+        let siblingFile = sibling.appendingPathComponent("unrelated.tmp")
+        try tracker.deliverForTesting([VolumeEvent(path: siblingFile.path, id: high, flags: 0)])
+        let prior = tracker.snapshotStatus().outOfOrderBatches
+        #expect(tracker.search("late-applied").isEmpty)
+        try tracker.deliverForTesting([VolumeEvent(path: marker.path, id: high - 1, flags: 0)],
+            writing: { try Data([1, 2, 3]).write(to: marker) }, check: {
+                let status = tracker.snapshotStatus()
+                #expect(status.outOfOrderBatches == prior + 1)
+                #expect(status.rebuilds == 0)
+                #expect(tracker.search("late-applied").first?.size == 3)
+            })
+
+        let previous = tracker.snapshotStatus().recursiveDirectoriesObserved
+        try tracker.deliverForTesting([VolumeEvent(path: recursive.path, id: high + 1, flags: flag)])
+        #expect(tracker.snapshotStatus().recursiveDirectoriesObserved > previous)
         #expect(tracker.snapshotStatus().rebuilds == 0)
-        #expect(tracker.search("late-applied").first?.size == 3)
-        #expect(tracker.snapshotStatus().recursiveDirectoriesObserved > 0)
 
         let dropped = UInt32(kFSEventStreamEventFlagKernelDropped)
-        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 20_001, flags: flag | dropped)])
+        try tracker.deliverForTesting([VolumeEvent(path: local.path, id: high + 2, flags: flag | dropped)])
         try awaitStatus(tracker) { $0.rebuilds == 1 && $0.phase == "caught-up" }
         #expect(tracker.search("late-applied").map(\.path) == [marker.path])
         let userDropped = UInt32(kFSEventStreamEventFlagUserDropped)
-        tracker.deliverForTesting([VolumeEvent(path: local.path, id: observed + 20_002, flags: flag | userDropped)])
+        try tracker.deliverForTesting([VolumeEvent(path: local.path, id: high + 3, flags: flag | userDropped)])
         #expect(tracker.snapshotStatus().phase == "degraded")
         #expect(tracker.snapshotStatus().rebuilds == 1)
     }

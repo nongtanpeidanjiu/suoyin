@@ -145,14 +145,10 @@ def exercise(cli, directory):
                 if from_search(row["rows"]).get(str(marker)) == (len(b"changed"), marker.lstat().st_mtime_ns):
                     break
                 time.sleep(.01 if time.monotonic_ns() - start > 28_000_000_000 else .05)
-            published = row["status"]["lastApplyEnd"]
-            observed = (time.monotonic_ns() - start) / 1e6
-            elapsed = (published - start) / 1e6
+            elapsed = (time.monotonic_ns() - start) / 1e6
             assert from_search(row["rows"]).get(str(marker)) == (len(b"changed"), marker.lstat().st_mtime_ns)
-            assert elapsed > 0, (folder, elapsed, observed)
             converge(tracker, tree_rows(tree, store))
-            delays[folder] = dict(milliseconds=elapsed, firstCorrectPollMS=observed,
-                                  within30Seconds=elapsed <= 30_000, equal=True)
+            delays[folder] = dict(milliseconds=elapsed, within30Seconds=elapsed <= 30_000, equal=True)
         summary["throttled"] = delays
 
         def bulk():

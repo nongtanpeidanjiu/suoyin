@@ -137,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--write-cap", type=int, default=4_500_000_000)
     parser.add_argument("--caught-up-timeout", type=int, default=70)
+    parser.add_argument("--ready-timeout", type=int, default=55)
     args = parser.parse_args()
     state = args.state.resolve()
     tree = args.tree.resolve()
@@ -153,7 +154,7 @@ if __name__ == "__main__":
     snapshot = args.snapshot.resolve() if args.snapshot else state / "full.snapshot"
     tracker = TrackClient(args.cli, "/", snapshot, state, state / "full-transcript.tmp")
     try:
-        ready = tracker.wait("ready", timeout=55)
+        ready = tracker.wait("ready", timeout=args.ready_timeout)
         tracker.wait("caught-up", timeout=args.caught_up_timeout)
         if not args.idle_only:
             write_summary(state / "overlap.json", overlap(tracker, tree))

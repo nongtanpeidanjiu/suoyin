@@ -46,12 +46,14 @@ final class DemoSearchService: SearchService {
     private var scanTimer: Timer?
 
     var onExternalVolumesChange: (() -> Void)?
-    var supportsExternalVolumeControl: Bool { true }
     var externalVolumes: [ExternalVolume] { volumes }
+    /// `--demo-volume-error` shows how a settings error of the core looks.
+    let externalVolumeSettingsError: String? =
+        CommandLine.arguments.contains("--demo-volume-error") ? "Unable to save external volume settings" : nil
 
-    var includesNewExternalVolumes: Bool {
-        get { ExternalVolumePreferences.includeNew }
-        set { ExternalVolumePreferences.includeNew = newValue }
+    /// Kept in memory only, so the demo never touches the real choice.
+    var includesNewExternalVolumes = false {
+        didSet { onExternalVolumesChange?() }
     }
 
     func setExternalVolume(_ id: String, included: Bool) {
@@ -64,13 +66,10 @@ final class DemoSearchService: SearchService {
 
     func removeExternalVolumeData(_ id: String) {
         guard let index = volumes.firstIndex(where: { $0.id == id }) else { return }
-        if volumes[index].isOnline {
-            volumes[index].isIncluded = false
-            volumes[index].isScanning = false
-            volumes[index].indexedCount = 0
-        } else {
-            volumes.remove(at: index)
-        }
+        // As the core does: the volume stays listed, left out.
+        volumes[index].isIncluded = false
+        volumes[index].isScanning = false
+        volumes[index].indexedCount = 0
         changedVolumes()
     }
 

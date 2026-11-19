@@ -1,70 +1,76 @@
 import AppKit
 import SearchCore
 
-// MARK: - Waiting for the core: attached volumes
-//
-// The settings window and the setup guide already offer these choices. Until
-// the core provides them, this bridge only remembers them in the user
-// defaults (`ExternalVolumePreferences`) and `supportsExternalVolumeControl`
-// is false, so the interface says under the controls that they take effect
-// in the next version. To connect them, the core needs:
-//
-// 1. A list of every attached volume it knows, including ones not attached
-//    right now whose entries it still keeps: a stable id (the volume UUID
-//    where there is one), the name, whether it is attached, whether it is
-//    included, whether it is being scanned or brought up to date, and its
-//    entry count. `EngineStatus.sources` (kind `.externalVolume`) on the
-//    main branch has the id, name and count; it lacks the attached,
-//    included and scanning flags. It is read below by reflection only
-//    because this branch's core does not have it yet: after merging, read
-//    `status.sources` directly and delete `reportedSources`.
-// 2. A setting for volumes attached for the first time: add them by
-//    themselves, or leave them out until the user adds them. Today every
-//    attached volume is scanned at once. Default: leave them out.
-// 3. Including or leaving out one volume by id, kept across launches and
-//    across detaching and attaching. Leaving one out stops its scan at once
-//    and takes its entries out of search results (they may stay on disk).
-//    Including one starts or resumes its scan.
-// 4. Deleting what was indexed for one volume by id: its entries, scan log
-//    and event-log position. Afterwards the volume counts as left out; a
-//    volume that is not attached is forgotten.
-// 5. A status update whenever any of the above changes, so the list stays
-//    current; counts while scanning at the usual half-second pace.
-//
-// Then make `supportsExternalVolumeControl` true and pass the calls on.
+/// User-defaults key of the previous version, read once to move the choice
+/// to the core.
+enum LegacyVolumeKeys {
+    static let includeNew = "includeNewExternalVolumes"
+}
 
 /// Bridges the interface protocol to the real search core running in-process.
+///
+/// The core keeps the choices about attached volumes itself (in
+/// `external-volumes.json` in its data directory). Reading them waits on the
+/// core's volume queue, which can be busy for a moment with a slow disk, so
+/// this bridge keeps a copy for the interface, refreshes it off the main
+/// thread and shows a change the user just made at once.
 final class CoreSearchService: SearchService {
     private let engine: SearchEngine
     var onStatusChange: ((IndexStatus) -> Void)?
     var onIndexChange: (() -> Void)?
     var onExternalVolumesChange: (() -> Void)?
-    private let volumeLock = NSLock()
-    private var mounted: [MountedVolume] = []
-    private var lastVolumes: [ExternalVolume] = []
 
-    init() throws {
-        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                               appropriateFor: nil, create: true)
-        let directory = base.appendingPathComponent("dev.local.filesearch", isDirectory: true)
+    private let volumeQueue = DispatchQueue(label: "ui.external-volumes", qos: .userInitiated)
+    private let volumeLock = NSLock()
+    private var volumes: [ExternalVolume] = []
+    private var includesNew = false
+    private var settingsError: String?
+    /// Choices sent to the core and not yet reflected in what it reports.
+    private var pendingChoices: [String: Bool] = [:]
+    private var pendingIncludesNew: Bool?
+
+    /// `dataDirectory` replaces the usual one; for tests only.
+    init(dataDirectory: URL? = nil) throws {
+        let directory: URL
+        if let dataDirectory {
+            directory = dataDirectory
+        } else {
+            let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                   appropriateFor: nil, create: true)
+            directory = base.appendingPathComponent("dev.local.filesearch", isDirectory: true)
+        }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         engine = try SearchEngine(dataDirectory: directory)
+        // A separate test directory leaves the user's own choice alone.
+        if dataDirectory == nil { Self.moveLegacyChoice(to: engine) }
+        readVolumes()
+    }
+
+    /// The previous version kept “add new volumes by themselves” in the user
+    /// defaults, before the core could act on it. Hands a choice made there
+    /// to the core once, before it registers any volume, then forgets it.
+    private static func moveLegacyChoice(to engine: SearchEngine) {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: LegacyVolumeKeys.includeNew) != nil {
+            engine.includesNewExternalVolumes = defaults.bool(forKey: LegacyVolumeKeys.includeNew)
+            defaults.removeObject(forKey: LegacyVolumeKeys.includeNew)
+        }
+        // The per-volume keys (`externalVolumeChoices`, `knownExternalVolumes`)
+        // were never acted on and are no longer read; they are left in place
+        // only as a record of what the previous version had seen.
     }
 
     func start() {
         engine.onStatusChange = { [weak self] status in
             guard let self else { return }
             self.onStatusChange?(Self.convert(status))
-            self.noteVolumesMayHaveChanged()
+            // Counts of the volumes move with the status.
+            self.refreshVolumes()
         }
         engine.onIndexChange = { [weak self] in self?.onIndexChange?() }
+        engine.onExternalVolumesChange = { [weak self] in self?.refreshVolumes() }
         engine.start()
-        refreshMounted()
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification,
-                     NSWorkspace.didRenameVolumeNotification] {
-            center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.refreshMounted() }
-        }
+        refreshVolumes()
     }
 
     func stop() { engine.stop() }
@@ -99,117 +105,104 @@ final class CoreSearchService: SearchService {
 
     // MARK: Attached volumes
 
-    /// See the list at the top of this file.
-    var supportsExternalVolumeControl: Bool { false }
-
     var includesNewExternalVolumes: Bool {
-        get { ExternalVolumePreferences.includeNew }
-        set { ExternalVolumePreferences.includeNew = newValue }
+        get { volumeLock.withLock { pendingIncludesNew ?? includesNew } }
+        set {
+            volumeLock.withLock { pendingIncludesNew = newValue }
+            onExternalVolumesChange?()
+            volumeQueue.async { [weak self] in
+                guard let self else { return }
+                self.engine.includesNewExternalVolumes = newValue
+                self.volumeLock.withLock { self.pendingIncludesNew = nil }
+                self.readVolumes(notify: true)
+            }
+        }
     }
 
     var externalVolumes: [ExternalVolume] {
-        let mounted = volumeLock.withLock { self.mounted }
-        let status = engine.status
-        let reported = Self.reportedSources(status)
-        var scanning: String?
-        var scanningCount = 0
-        if case .supplementing(let name, let indexed) = status.phase { (scanning, scanningCount) = (name, indexed) }
-        let choices = UserDefaults.standard.dictionary(forKey: ExternalVolumePreferences.choicesKey) as? [String: Bool] ?? [:]
-        var known = Self.knownVolumes()
-
-        var volumes: [ExternalVolume] = []
-        var seen = Set<String>()
-        func add(id: String, name: String, online: Bool, count: Int?, detail: String?) {
-            guard seen.insert(id).inserted else { return }
-            let isScanning = online && name == scanning
-            // Without a choice of its own a volume is shown as the core
-            // actually treats it today: included.
-            volumes.append(ExternalVolume(id: id, name: name, isOnline: online, isIncluded: choices[id] ?? true,
-                                          isScanning: isScanning,
-                                          indexedCount: count ?? (isScanning ? scanningCount : 0), detail: detail))
+        volumeLock.withLock {
+            volumes.map { volume in
+                guard let included = pendingChoices[volume.id], included != volume.isIncluded else { return volume }
+                var shown = volume
+                shown.isIncluded = included
+                if !included { shown.isScanning = false }
+                return shown
+            }
         }
-        for volume in mounted {
-            let source = reported?.first { $0.id == volume.id }
-            add(id: volume.id, name: volume.name, online: true, count: source?.indexed, detail: volume.detail)
-            known[volume.id] = ["name": volume.name, "detail": volume.detail ?? ""]
-        }
-        for source in reported ?? [] {
-            let detail = known[source.id]?["detail"].flatMap { $0.isEmpty ? nil : $0 }
-            add(id: source.id, name: source.name, online: false, count: source.indexed, detail: detail)
-        }
-        for (id, record) in known.sorted(by: { $0.key < $1.key }) {
-            let detail = record["detail"].flatMap { $0.isEmpty ? nil : $0 }
-            add(id: id, name: record["name"] ?? id, online: false, count: nil, detail: detail)
-        }
-        if known != Self.knownVolumes() { UserDefaults.standard.set(known, forKey: ExternalVolumePreferences.knownKey) }
-        return volumes
     }
 
+    var externalVolumeSettingsError: String? { volumeLock.withLock { settingsError } }
+
+    /// Leaving a volume out takes its files out of the results as soon as
+    /// the core returns; its data stays until deleted.
     func setExternalVolume(_ id: String, included: Bool) {
-        var choices = UserDefaults.standard.dictionary(forKey: ExternalVolumePreferences.choicesKey) as? [String: Bool] ?? [:]
-        choices[id] = included
-        UserDefaults.standard.set(choices, forKey: ExternalVolumePreferences.choicesKey)
-        noteVolumesMayHaveChanged(force: true)
+        volumeLock.withLock { pendingChoices[id] = included }
+        onExternalVolumesChange?()
+        volumeQueue.async { [weak self] in
+            guard let self else { return }
+            self.engine.setExternalVolume(id, included: included)
+            self.volumeLock.withLock { _ = self.pendingChoices.removeValue(forKey: id) }
+            self.readVolumes(notify: true)
+            // Results shown already may hold the volume's files.
+            self.onIndexChange?()
+        }
     }
 
-    /// Not offered while `supportsExternalVolumeControl` is false: nothing
-    /// can be deleted yet, so pretending would mislead.
-    func removeExternalVolumeData(_ id: String) {}
-
-    private static func knownVolumes() -> [String: [String: String]] {
-        UserDefaults.standard.dictionary(forKey: ExternalVolumePreferences.knownKey) as? [String: [String: String]] ?? [:]
+    func removeExternalVolumeData(_ id: String) {
+        volumeLock.withLock { pendingChoices[id] = false }
+        onExternalVolumesChange?()
+        volumeQueue.async { [weak self] in
+            guard let self else { return }
+            self.engine.removeExternalVolumeData(id)
+            self.volumeLock.withLock { _ = self.pendingChoices.removeValue(forKey: id) }
+            self.readVolumes(notify: true)
+            self.onIndexChange?()
+        }
     }
 
-    private func noteVolumesMayHaveChanged(force: Bool = false) {
-        let current = externalVolumes
+    private func refreshVolumes() {
+        volumeQueue.async { [weak self] in self?.readVolumes(notify: true) }
+    }
+
+    /// Reads the volumes from the core and tells the interface if anything
+    /// it shows changed.
+    private func readVolumes(notify: Bool = false) {
+        let list = engine.externalVolumes.map(Self.convert)
+        let addsNew = engine.includesNewExternalVolumes
+        let error = engine.externalVolumeSettingsError
         let changed = volumeLock.withLock { () -> Bool in
-            defer { lastVolumes = current }
-            return current != lastVolumes
+            defer { (volumes, includesNew, settingsError) = (list, addsNew, error) }
+            return list != volumes || addsNew != includesNew || error != settingsError
         }
-        if changed || force { onExternalVolumesChange?() }
+        if changed && notify { onExternalVolumesChange?() }
     }
 
-    // MARK: Mounted volumes
-
-    private struct MountedVolume {
-        let id: String
-        let name: String
-        let detail: String?
+    private static func convert(_ volume: EngineVolume) -> ExternalVolume {
+        ExternalVolume(id: volume.id,
+                       // A volume known only from an earlier version's files
+                       // has a stand-in name until it is attached again.
+                       name: volume.name == "External disk" ? "外接磁盘" : volume.name,
+                       isOnline: volume.isOnline, isIncluded: volume.isIncluded, isScanning: volume.isScanning,
+                       indexedCount: volume.indexedCount, detail: volume.detail.map(readableDetail))
     }
 
-    /// Local, browsable volumes that are not part of this Mac, read from the
-    /// volume properties only; nothing on them is opened.
-    private func refreshMounted() {
-        let keys: [URLResourceKey] = [.volumeNameKey, .volumeLocalizedNameKey, .volumeIsInternalKey, .volumeIsLocalKey,
-                                      .volumeIsBrowsableKey, .volumeUUIDStringKey, .volumeTotalCapacityKey,
-                                      .volumeIsRootFileSystemKey, .volumeTypeNameKey]
-        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys,
-                                                         options: [.skipHiddenVolumes]) ?? []
-        var found: [MountedVolume] = []
-        for url in urls {
-            guard let values = try? url.resourceValues(forKeys: Set(keys)),
-                  values.volumeIsRootFileSystem != true, values.volumeIsLocal == true,
-                  values.volumeIsBrowsable != false, values.volumeIsInternal != true else { continue }
-            let name = values.volumeLocalizedName ?? values.volumeName ?? url.lastPathComponent
-            found.append(MountedVolume(id: values.volumeUUIDString ?? url.path, name: name,
-                                       detail: Self.detail(type: values.volumeTypeName,
-                                                           capacity: values.volumeTotalCapacity)))
-        }
-        volumeLock.withLock { mounted = found }
-        noteVolumesMayHaveChanged()
+    /// “exfat · 999.96 GB” as “exFAT · 1 TB”: the file system as Disk
+    /// Utility names it, the size as printed on the box.
+    private static func readableDetail(_ detail: String) -> String {
+        let names = ["apfs": "APFS", "hfs": "Mac OS 扩展", "exfat": "exFAT", "msdos": "FAT", "ntfs": "NTFS"]
+        var parts = detail.components(separatedBy: " · ")
+        if let first = parts.first, let name = names[first.lowercased()] { parts[0] = name }
+        if parts.count > 1, let size = boxSize(parts[1]) { parts[1] = size }
+        return parts.joined(separator: " · ")
     }
 
-    /// “exFAT · 1 TB”.
-    private static func detail(type: String?, capacity: Int?) -> String? {
-        let names = ["apfs": "APFS", "hfs": "Mac OS 扩展", "exfat": "exFAT", "msdos": "FAT32", "ntfs": "NTFS"]
-        var parts: [String] = []
-        if let type { parts.append(names[type.lowercased()] ?? type) }
-        if let capacity, capacity > 0 { parts.append(roundedCapacity(Double(capacity))) }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    /// The size printed on the box: “1 TB” rather than “999.96 GB”.
-    private static func roundedCapacity(_ bytes: Double) -> String {
+    /// “999.96 GB” → “1 TB”, “63.9 GB” → “64 GB”; nil when not understood.
+    private static func boxSize(_ text: String) -> String? {
+        let pieces = text.split(separator: " ")
+        let units: [String: Double] = ["KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15]
+        guard pieces.count == 2, let factor = units[String(pieces[1])],
+              let value = Double(pieces[0].replacingOccurrences(of: ",", with: "")) else { return nil }
+        let bytes = value * factor
         func trimmed(_ value: Double) -> String {
             let rounded = (value * 10).rounded() / 10
             return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
@@ -217,23 +210,6 @@ final class CoreSearchService: SearchService {
         if bytes >= 995e9 { return trimmed(bytes / 1e12) + " TB" }
         if bytes >= 995e6 { return String(Int((bytes / 1e9).rounded())) + " GB" }
         return String(Int((bytes / 1e6).rounded())) + " MB"
-    }
-
-    /// The attached volumes the core reports in `EngineStatus.sources`, or
-    /// nil when this core has no such list. Temporary; see the top of the file.
-    private static func reportedSources(_ status: EngineStatus) -> [(id: String, name: String, indexed: Int)]? {
-        guard let list = Mirror(reflecting: status).children.first(where: { $0.label == "sources" })?.value else {
-            return nil
-        }
-        return Mirror(reflecting: list).children.compactMap { element in
-            var fields: [String: Any] = [:]
-            for child in Mirror(reflecting: element.value).children {
-                if let label = child.label { fields[label] = child.value }
-            }
-            guard let id = fields["id"] as? String, let name = fields["name"] as? String,
-                  fields["kind"].map({ "\($0)" }) == "externalVolume" else { return nil }
-            return (id, name, fields["indexed"] as? Int ?? 0)
-        }
     }
 
     // MARK: Conversions
@@ -245,7 +221,7 @@ final class CoreSearchService: SearchService {
         case .scanning(let indexed): phase = .scanning(indexed: indexed)
         case .ready: phase = .ready
         case .recovering: phase = .recovering
-        case .supplementing(let name, let indexed): phase = .supplementing(name: name, indexed: indexed)
+        case .supplementing(let name, let indexed): phase = .supplementing(name: cloudName(name), indexed: indexed)
         case .failed(let reason): phase = .degraded(reason: reason)
         }
         return IndexStatus(phase: phase, indexedCount: status.indexedCount,
@@ -253,7 +229,23 @@ final class CoreSearchService: SearchService {
                            inaccessiblePlaces: status.inaccessibleLocations.map(convert),
                            pendingFullDiskAccessPaths: status.pendingFullDiskAccessPaths,
                            inaccessibleVerified: status.inaccessibleLocationsVerified,
-                           indexBytesOnDisk: status.indexBytesOnDisk)
+                           indexBytesOnDisk: status.indexBytesOnDisk,
+                           localIndexedCount: status.localIndexedCount,
+                           sources: status.sources.map(convert))
+    }
+
+    private static func convert(_ source: EngineSourceStatus) -> IndexSource {
+        IndexSource(id: source.id, name: source.kind == .cloudProvider ? cloudName(source.name) : source.name,
+                    kind: source.kind == .externalVolume ? .externalVolume : .cloudProvider,
+                    indexed: source.indexed, isComplete: source.inaccessibleLocationsVerified,
+                    failure: source.error)
+    }
+
+    /// The core names a cloud provider after its folder; iCloud Drive's
+    /// folder name means nothing to a user.
+    private static func cloudName(_ folder: String) -> String {
+        if folder == "com~apple~CloudDocs" || folder == "Mobile Documents" { return "iCloud 云盘" }
+        return folder
     }
 
     private static func convert(_ kind: SearchKind) -> EngineKind {

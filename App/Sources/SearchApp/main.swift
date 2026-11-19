@@ -1,11 +1,21 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// The real core by default; `--demo` keeps the stand-in data for interface work.
+    /// The real core by default; `--demo` keeps the stand-in data for interface
+    /// work. `--data-dir <path>` points the core at another data directory, so
+    /// tests that change the index leave the user's own alone.
     private let service: SearchService = {
-        if !CommandLine.arguments.contains("--demo"), let real = try? CoreSearchService() { return real }
+        if !CommandLine.arguments.contains("--demo"),
+           let real = try? CoreSearchService(dataDirectory: AppDelegate.testDataDirectory) { return real }
         return DemoSearchService()
     }()
+
+    private static var testDataDirectory: URL? {
+        guard let flag = CommandLine.arguments.firstIndex(of: "--data-dir"),
+              CommandLine.arguments.indices.contains(flag + 1) else { return nil }
+        let path = (CommandLine.arguments[flag + 1] as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
     private var panel: SearchPanelController!
     private var statusItem: NSStatusItem!
     private var hotKey: HotKey!
@@ -79,6 +89,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.show"),
                                                             object: nil, queue: .main) { [weak self] _ in
             self?.panel.show(anchor: nil)
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.hide"),
+                                                            object: nil, queue: .main) { [weak self] _ in
+            self?.panel.hide()
+        }
+        // Opens the confirmation for deleting a volume's data (object: its
+        // id), as its “…” menu does; a pop-up menu cannot be driven by tests.
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.deleteVolume"),
+                                                            object: nil, queue: .main) { [weak self] note in
+            guard let id = note.object as? String else { return }
+            self?.settings.askToDeleteVolumeForTesting(id)
         }
         // Test hooks for Quick Look: the same path as Option-Space, and the
         // arrow keys (object "1" or "-1").

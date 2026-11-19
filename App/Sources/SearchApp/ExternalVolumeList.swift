@@ -12,8 +12,6 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
     /// Called with a volume whose indexed data the user asked to delete;
     /// nil hides the menu.
     var onDelete: ((ExternalVolume) -> Void)?
-    /// Whether deleting is possible at all.
-    var canDelete = true
     /// Called after the list changed height.
     var onHeightChange: (() -> Void)?
 
@@ -129,8 +127,9 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         let item = NSMenuItem(title: "删除已收录的数据…", action: #selector(deleteChosen(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = volume.id
-        // Nothing to delete for a volume never scanned that is still attached.
-        item.isEnabled = canDelete && (volume.indexedCount > 0 || !volume.isOnline)
+        // Always offered: the core counts the entries of a volume that is
+        // left out or detached as zero, though they may still be kept.
+        item.isEnabled = true
         menu.addItem(item)
     }
 
@@ -148,7 +147,7 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
     }
 
     /// The “…” button shows only where its one item can be used at all.
-    var showsMenu: Bool { onDelete != nil && canDelete }
+    var showsMenu: Bool { onDelete != nil }
 }
 
 /// One volume: symbol, name with its detail, state line, switch and an
@@ -267,9 +266,7 @@ enum ExternalVolumeConfirmation {
         var text = "只删除本软件为这块磁盘建立的索引"
         if volume.indexedCount > 0 { text += "（\(formattedCount(volume.indexedCount)) 个条目）" }
         text += "，磁盘上的文件不受任何影响。"
-        text += volume.isOnline
-            ? "删除后不再搜索这块磁盘；以后可以重新加入，届时需要重新扫描。"
-            : "这块磁盘目前未连接，删除后会从列表中移除；以后再插上时按新磁盘处理。"
+        text += "删除后不再搜索这块磁盘，它仍留在列表中，显示为“未加入”；以后可以重新加入，届时需要重新扫描。"
         alert.informativeText = text
         let delete = alert.addButton(withTitle: "删除")
         delete.hasDestructiveAction = true

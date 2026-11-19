@@ -47,6 +47,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         scope.updateVolumes()
     }
 
+    func askToDeleteVolumeForTesting(_ id: String) {
+        guard isVisible else { return }
+        scope.askToDelete(id)
+    }
+
     func update(_ status: IndexStatus) {
         guard isVisible else { return }
         scope.update(status)
@@ -442,7 +447,8 @@ private final class ScopePane: SettingsPane {
     private let newVolumes = NSButton(checkboxWithTitle: "自动把新插入的外接磁盘加入搜索", target: nil, action: nil)
     private let volumeList = ExternalVolumeList(width: InaccessibleOutline.width, maxRows: 3,
                                                 emptyText: "还没有接入过外接磁盘")
-    private var pendingVersionRow: NSGridRow!
+    private var volumeErrorRow: NSGridRow!
+    private var volumeError: NSTextField!
     private let accessIcon = NSImageView()
     private let accessLabel = NSTextField(labelWithString: "")
     private let accessButton = NSButton(title: "前往授权…", target: nil, action: nil)
@@ -450,6 +456,8 @@ private final class ScopePane: SettingsPane {
     private let placesSpinner = NSProgressIndicator()
     private let placesOutline = InaccessibleOutline()
     private var placesNote: NSTextField!
+    /// Which attached volumes or cloud providers are still being scanned.
+    private let sourcesNote = NSTextField(wrappingLabelWithString: "")
     private var pendingRow: NSGridRow!
     private let pendingList = PlacesList()
     private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace], verified: Bool)?
@@ -475,18 +483,11 @@ private final class ScopePane: SettingsPane {
             self?.service.setExternalVolume(id, included: included)
             self?.updateVolumes()
         }
-        volumeList.onDelete = { [weak self] volume in
-            guard let self else { return }
-            ExternalVolumeConfirmation.askToDelete(volume, in: self.view.window) { [weak self] in
-                self?.service.removeExternalVolumeData(volume.id)
-                self?.updateVolumes()
-            }
-        }
+        volumeList.onDelete = { [weak self] volume in self?.askToDelete(volume) }
         volumeList.onHeightChange = { [weak self] in self?.onSizeChange?() }
         addRow(nil, volumeList, gap: 4)
-        let nextVersion = note("此选项将在下一个版本生效。")
-        nextVersion.textColor = .tertiaryLabelColor
-        pendingVersionRow = addRow(nil, nextVersion)
+        (volumeErrorRow, volumeError) = messageRow(after: 2)
+        volumeError.isSelectable = true
 
         accessIcon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         accessButton.target = self
@@ -508,7 +509,12 @@ private final class ScopePane: SettingsPane {
         let heading = NSStackView(views: [placesCount, placesSpinner])
         heading.spacing = 6
         heading.alignment = .centerY
-        let places = NSStackView(views: [heading, placesOutline, placesNote])
+        sourcesNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        sourcesNote.textColor = .secondaryLabelColor
+        sourcesNote.preferredMaxLayoutWidth = Self.noteWidth
+        sourcesNote.isSelectable = false
+        sourcesNote.isHidden = true
+        let places = NSStackView(views: [heading, placesOutline, placesNote, sourcesNote])
         places.orientation = .vertical
         places.alignment = .leading
         places.spacing = 6
@@ -535,13 +541,25 @@ private final class ScopePane: SettingsPane {
     /// The attached volumes, refreshed in place as their state changes.
     func updateVolumes() {
         newVolumes.state = service.includesNewExternalVolumes ? .on : .off
-        let supported = service.supportsExternalVolumeControl
-        volumeList.canDelete = supported
         volumeList.show(service.externalVolumes)
-        if pendingVersionRow.isHidden != supported {
-            pendingVersionRow.isHidden = supported
+        let error = service.externalVolumeSettingsError.map(externalVolumeErrorText)
+        if volumeError.stringValue != error ?? "" { volumeError.stringValue = error ?? "" }
+        if volumeErrorRow.isHidden != (error == nil) {
+            volumeErrorRow.isHidden = error == nil
             onSizeChange?()
         }
+    }
+
+    private func askToDelete(_ volume: ExternalVolume) {
+        ExternalVolumeConfirmation.askToDelete(volume, in: view.window) { [weak self] in
+            self?.service.removeExternalVolumeData(volume.id)
+            self?.updateVolumes()
+        }
+    }
+
+    func askToDelete(_ id: String) {
+        guard let volume = service.externalVolumes.first(where: { $0.id == id }) else { return }
+        askToDelete(volume)
     }
 
     @objc private func toggleNewVolumes() {
@@ -559,6 +577,7 @@ private final class ScopePane: SettingsPane {
     }
 
     func update(_ status: IndexStatus) {
+        showScanningSources(status.sources)
         if status.pendingFullDiskAccessPaths != pendingPaths {
             pendingPaths = status.pendingFullDiskAccessPaths
             pendingList.paths = pendingPaths
@@ -589,6 +608,22 @@ private final class ScopePane: SettingsPane {
         if isEmpty != wasEmpty { onSizeChange?() }
     }
 
+    /// The list above covers this Mac only. Attached volumes and cloud
+    /// storage still being scanned may add locations once they finish.
+    private func showScanningSources(_ sources: [IndexSource]) {
+        let names = sources.filter { !$0.isComplete && $0.failure == nil }.map(\.name)
+        let text: String?
+        switch names.count {
+        case 0: text = nil
+        case 1...3: text = "\(names.map { "“\($0)”" }.joined(separator: "、"))仍在扫描，完成后这里可能增加。"
+        default: text = "“\(names[0])”等 \(names.count) 处仍在扫描，完成后这里可能增加。"
+        }
+        if sourcesNote.stringValue != text ?? "" { sourcesNote.stringValue = text ?? "" }
+        guard sourcesNote.isHidden != (text == nil) else { return }
+        sourcesNote.isHidden = text == nil
+        onSizeChange?()
+    }
+
     /// The pending folders matter only until access is granted.
     private func showPending() {
         let hidden = pendingPaths.isEmpty || DiskAccess.isGranted
@@ -616,6 +651,8 @@ private final class IndexPane: SettingsPane {
     private let count = NSTextField(labelWithString: "")
     private let size = NSTextField(labelWithString: "")
     private let rebuild = NSButton(title: "立即重建索引…", target: nil, action: nil)
+    private var countParts: NSTextField!
+    private var countPartsRow: NSGridRow!
 
     init(service: SearchService) {
         self.service = service
@@ -623,6 +660,10 @@ private final class IndexPane: SettingsPane {
         for field in [state, count, size] { field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
         addRow("状态：", state)
         addRow("已收录文件：", count)
+        countParts = note("")
+        countParts.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        countPartsRow = addRow(nil, countParts)
+        countPartsRow.isHidden = true
         addRow("占用空间：", size)
         rebuild.target = self
         rebuild.action = #selector(confirmRebuild)
@@ -634,10 +675,22 @@ private final class IndexPane: SettingsPane {
 
     func update(_ status: IndexStatus) {
         state.stringValue = status.summary
-        count.stringValue = NumberFormatter.localizedString(from: NSNumber(value: status.indexedCount),
-                                                            number: .decimal) + " 个"
+        count.stringValue = "\(formattedCount(status.indexedCount)) 个"
+        let parts = Self.countParts(status)
+        if countParts.stringValue != parts ?? "" { countParts.stringValue = parts ?? "" }
+        if countPartsRow.isHidden != (parts == nil) {
+            countPartsRow.isHidden = parts == nil
+            onSizeChange?()
+        }
         size.stringValue = ByteCountFormatter.string(fromByteCount: status.indexBytesOnDisk, countStyle: .file)
         rebuild.isEnabled = !status.isBusy
+    }
+
+    /// “其中本机 1,950,000 个，外接磁盘 700,000 个” while attached volumes
+    /// are searched; nil otherwise.
+    private static func countParts(_ status: IndexStatus) -> String? {
+        guard let local = status.localIndexedCount, local < status.indexedCount else { return nil }
+        return "其中本机 \(formattedCount(local)) 个，外接磁盘 \(formattedCount(status.indexedCount - local)) 个"
     }
 
     @objc private func confirmRebuild() {

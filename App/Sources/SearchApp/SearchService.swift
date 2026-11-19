@@ -112,8 +112,27 @@ struct IndexStatus {
     /// the lists are then empty or about to change and must not be counted.
     var inaccessibleVerified = true
     var indexBytesOnDisk: Int64
+    /// Entries of this Mac alone, cloud storage included; nil when the core
+    /// does not tell them apart. `indexedCount` adds the attached volumes.
+    var localIndexedCount: Int? = nil
+    /// Attached volumes being searched and cloud providers, each with its own
+    /// progress. The lists of unreadable locations above cover this Mac only.
+    var sources: [IndexSource] = []
 
     var inaccessibleCount: Int { rawInaccessiblePlaces.count }
+}
+
+/// An attached volume or a cloud provider the index is filling in.
+struct IndexSource: Equatable {
+    enum Kind { case externalVolume, cloudProvider }
+    var id: String
+    var name: String
+    var kind: Kind
+    var indexed: Int
+    /// False while it is still being scanned or brought up to date.
+    var isComplete: Bool
+    /// Set when the source stopped with an error.
+    var failure: String?
 }
 
 /// An attached volume the index knows about, attached now or remembered
@@ -157,9 +176,9 @@ protocol SearchService: AnyObject {
     /// Deletes what was indexed for the volume and stops searching it. A
     /// volume that is not attached is then forgotten.
     func removeExternalVolumeData(_ id: String)
-    /// False while the choices above are only remembered and the core does
-    /// not act on them yet; the interface says so next to the controls.
-    var supportsExternalVolumeControl: Bool { get }
+    /// What went wrong when keeping these choices or deleting data, in the
+    /// core's own words; nil when nothing did.
+    var externalVolumeSettingsError: String? { get }
     /// Called, on any thread, when the list or a volume's state changed.
     var onExternalVolumesChange: (() -> Void)? { get set }
 }
@@ -178,19 +197,21 @@ extension ExternalVolume {
     }
 }
 
-/// Where the choices about attached volumes are kept while the core cannot
-/// keep them itself, and the default the demo data starts from.
-enum ExternalVolumePreferences {
-    static let includeNewKey = "includeNewExternalVolumes"
-    static let choicesKey = "externalVolumeChoices"
-    static let knownKey = "knownExternalVolumes"
-
-    /// New volumes are not added by default: a large spinning disk can take
-    /// half an hour or more to scan, and not everyone wants to search it.
-    static var includeNew: Bool {
-        get { UserDefaults.standard.bool(forKey: includeNewKey) }
-        set { UserDefaults.standard.set(newValue, forKey: includeNewKey) }
+/// Explains a settings error of the core in words a user understands; the
+/// core's own text follows in brackets.
+func externalVolumeErrorText(_ raw: String) -> String {
+    let lowered = raw.lowercased()
+    let meaning: String
+    if lowered.contains("remove") {
+        meaning = "删除外接磁盘已收录的数据时出错，下次启动时会再试一次。"
+    } else if lowered.contains("save") {
+        meaning = "外接磁盘的设置没能保存，刚才的更改在重新打开软件后可能失效。"
+    } else if lowered.contains("read") || lowered.contains("inspect") {
+        meaning = "读不到外接磁盘的设置，暂时无法更改；可以退出后重新打开软件再试。"
+    } else {
+        meaning = "外接磁盘的设置出了问题。"
     }
+    return "\(meaning)（原始信息：\(raw)）"
 }
 
 /// The query text as sent to the core: every kind of space becomes a plain

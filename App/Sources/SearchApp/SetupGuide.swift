@@ -39,7 +39,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
     private let addNew = NSButton(radioButtonWithTitle: "自动加入新插入的外接磁盘", target: nil, action: nil)
     private let attachedHeading = NSTextField(labelWithString: "当前接入的外接磁盘：")
     private let attachedList = ExternalVolumeList(width: SetupGuideController.bodyWidth, maxRows: 2, emptyText: "")
-    private let volumesPending = NSTextField(labelWithString: "此选项将在下一个版本生效。")
+    private let volumesError = NSTextField(wrappingLabelWithString: "")
 
     // Shortcut step.
     private let recorder = ShortcutRecorder(name: ShortcutRole.global.title, shortcut: ShortcutRole.global.standard)
@@ -266,11 +266,13 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
             self?.service.setExternalVolume(id, included: included)
             self?.refreshVolumes()
         }
-        volumesPending.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        volumesPending.textColor = .tertiaryLabelColor
+        volumesError.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        volumesError.textColor = .systemRed
+        volumesError.preferredMaxLayoutWidth = Self.bodyWidth
+        volumesError.isHidden = true
 
         let options = NSStackView(views: [option(leaveOut, leaveOutNote), option(addNew, addNewNote),
-                                          attachedHeading, attachedList, volumesPending])
+                                          attachedHeading, attachedList, volumesError])
         options.orientation = .vertical
         options.alignment = .leading
         options.spacing = 12
@@ -449,7 +451,9 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         attachedHeading.isHidden = attached.isEmpty
         attachedList.isHidden = attached.isEmpty
         attachedList.show(attached)
-        volumesPending.isHidden = service.supportsExternalVolumeControl
+        let error = service.externalVolumeSettingsError.map(externalVolumeErrorText)
+        volumesError.stringValue = error ?? ""
+        volumesError.isHidden = error == nil
     }
 
     private func refreshShortcut() {

@@ -147,6 +147,69 @@ struct CoreTests {
         }
     }
 
+    @Test func slashBranchProbePreservesLeafAnchorsAndLongStems() {
+        var index = SearchIndex()
+        let anchor = index.append("/root", attribute: Kind.anchor)
+        let parts = (0..<9).map { String(repeating: "x", count: 30) + String($0) }
+        var directory = anchor
+        for part in parts {
+            directory = index.append(part, parent: directory, attribute: Kind.directory)
+        }
+        index.append("target.txt", parent: directory)
+        index.append("target-later.txt", parent: directory, size: 100)
+        index.prepare()
+        let long = "/" + parts.joined(separator: "/") + "/tar"
+        for query in [long, "/missing/target", "/root/ target", "/root/ missing"] {
+            #expect(index.search(query, mode: .path) == index.directSearch(query, mode: .path))
+        }
+        #expect(index.search(long, mode: .path).count == 2)
+        #expect(index.search(long, mode: .path, column: .size, direction: .descending, limit: 1).map(\.name)
+            == ["target-later.txt"])
+        let previous = index.prepared
+        let bytes = index.names.count
+        index.prepared = nil
+        index.append("/leaf-root/partial.txt")
+        index.prepare(extending: previous, previousNameBytes: bytes)
+        #expect(index.search("/leaf-root/par", mode: .path).map(\.name) == ["/leaf-root/partial.txt"])
+    }
+
+    @Test func slashOrderedPrefixPreservesFilteringAndOffsets() {
+        var index = SearchIndex()
+        let root = index.append("/fixture", attribute: Kind.anchor)
+        let located = index.append("branch", parent: root, attribute: Kind.directory)
+        var suppressed: [UInt32] = []
+        for i in 0..<100 {
+            let row = index.append("a-\(i).txt", parent: located,
+                                   attribute: i.isMultiple(of: 5) ? Kind.file | Kind.hidden : Kind.file)
+            if i.isMultiple(of: 7) { suppressed.append(row) }
+        }
+        for i in 0..<50_000 { index.append("z-\(i).md", parent: root) }
+        for row in suppressed { index.setSuppressed(Int(row), true) }
+        index.prepare()
+        let direct = index.directSearch("/fixture/branch/a", mode: .path, kind: .document, offset: 9, limit: 18)
+        #expect(direct.count == 18)
+        #expect(index.search("/fixture/branch/a", mode: .path, kind: .document, offset: 9, limit: 18) == direct)
+    }
+
+    @Test func splitSlashPassReconstructsParentsFromEarlierRows() {
+        var index = SearchIndex()
+        index.reserve(1_500_010, nameBytes: 9_000_100)
+        let root = index.append("/fixture", attribute: Kind.anchor)
+        let earlier = index.append("branch", parent: root, attribute: Kind.directory)
+        index.append("first.txt", parent: earlier)
+        let noise = Array("blank".utf8)
+        noise.withUnsafeBufferPointer { bytes in
+            for _ in 0..<1_500_000 {
+                index.append(bytes: bytes, parent: root, size: 0, modified: 0, attribute: Kind.file)
+            }
+        }
+        let later = index.append("subdir", parent: earlier, attribute: Kind.directory)
+        index.append("last.txt", parent: later)
+        index.prepare()
+        let rows = index.search("/fixture/branch/", mode: .path, kind: .document, limit: 600)
+        #expect(rows.map(\.name) == ["first.txt", "last.txt"])
+    }
+
     @Test func pathRenderingJoinsRawComponentsWithUTF8Repair() {
         var index = SearchIndex()
         let root = index.append("/", attribute: Kind.anchor)

@@ -10,6 +10,14 @@ struct CloudRoots {
         iCloud = home.map { $0 + "/Library/Mobile Documents/com~apple~CloudDocs" }
     }
 
+    static func display(for provider: String) -> (name: String, kind: EngineSourceStatus.CloudProviderKind) {
+        if provider.hasSuffix("/Library/Mobile Documents/com~apple~CloudDocs") ||
+            provider.hasSuffix("/Library/CloudStorage/iCloudDrive") {
+            return ("iCloud Drive", .iCloudDrive)
+        }
+        return (leafName(provider), .fileProvider)
+    }
+
     func provider(containing path: String) -> String? {
         let physical = path.hasPrefix(dataRoot + "/") ? dataRoot : ""
         let logical = path.dropFirst(physical.count)

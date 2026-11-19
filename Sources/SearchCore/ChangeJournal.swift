@@ -139,6 +139,33 @@ struct ChangeJournal {
         }
     }
 
+    /// Replay only the durable visibility mask and overlay metadata for the
+    /// volume catalogue. The base row and name pools are unnecessary.
+    func applyRetainedMetadata(attributes: inout Data, tracking: inout TrackingState?,
+                               volumes: [VolumeCheckpoint]) throws {
+        guard let root = tracking?.root ?? volumes.first?.root else { return }
+        let file: FileHandle
+        do { file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path)) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return }
+        defer { try? file.close() }
+        guard try file.seekToEnd() <= UInt64(Self.maxFile) else { return }
+        try file.seek(toOffset: 0)
+        guard try file.read(upToCount: Self.headerBytes) == header else { return }
+        let roots = Set(volumes.map(\.root))
+        while let fields = try file.read(upToCount: 36), fields.count == 36 {
+            let size = fields.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+            guard size <= Self.maxFrame, let payload = try file.read(upToCount: Int(size)),
+                  payload.count == Int(size), fields.dropFirst(4) == Self.digest(size, payload),
+                  let frame = Self.decode(payload, rows: attributes.count, root: root, volumes: roots) else { break }
+            for (id, hidden) in frame.masks {
+                if hidden { attributes[Int(id)] |= Kind.suppressed }
+                else { attributes[Int(id)] &= ~Kind.suppressed }
+            }
+            if tracking == nil { tracking = TrackingState(root: root, changes: [:], restricted: []) }
+            for row in frame.rows { tracking?.changes[row.path] = row.value }
+        }
+    }
+
     /// A new identity replaces any old journal atomically. A crash between
     /// the two renames leaves a journal the new snapshot cannot accept.
     mutating func reset() throws -> Int {

@@ -37,6 +37,7 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
                 "rawInaccessibleLocations": source.rawInaccessibleLocations.map(encodeLocation)
             ]
             if let error = source.error { value["error"] = error }
+            if let provider = source.cloudProviderKind { value["cloudProviderKind"] = provider.rawValue }
             if let scan = source.scan, let bytes = try? JSONEncoder().encode(scan) {
                 value["scan"] = try? JSONSerialization.jsonObject(with: bytes)
             }
@@ -99,7 +100,7 @@ func runEngineCLI(_ args: [String]) throws {
     }
     engine.onExternalVolumesChange = { [weak engine] in
         if let error = engine?.externalVolumeSettingsError {
-            FileHandle.standardError.write(Data((error + "\n").utf8))
+            FileHandle.standardError.write(Data((error.category.rawValue + ": " + error.underlyingMessage + "\n").utf8))
         }
     }
     engine.start()
@@ -135,10 +136,17 @@ func runEngineCLI(_ args: [String]) throws {
                 let rows: [[String: Any]] = engine.externalVolumes.map {
                     ["id": $0.id, "name": $0.name, "isOnline": $0.isOnline, "isIncluded": $0.isIncluded,
                      "isScanning": $0.isScanning, "indexedCount": $0.indexedCount,
+                     "nameIsPlaceholder": $0.nameIsPlaceholder, "progress": $0.progress.rawValue,
+                     "retainedCount": $0.retainedCount as Any? ?? NSNull(),
+                     "filesystem": $0.filesystem as Any? ?? NSNull(),
+                     "capacityBytes": $0.capacityBytes as Any? ?? NSNull(),
                      "detail": $0.detail as Any? ?? NSNull()]
                 }
+                let error = engine.externalVolumeSettingsError.map {
+                    ["category": $0.category.rawValue, "underlyingMessage": $0.underlyingMessage]
+                }
                 try write("volumes", ["volumes": rows, "includesNew": engine.includesNewExternalVolumes,
-                                      "error": engine.externalVolumeSettingsError as Any? ?? NSNull()])
+                                      "error": error as Any? ?? NSNull()])
             case "set-volume":
                 guard let id = command.volumeID, let included = command.included else {
                     try write("bad-command"); return false

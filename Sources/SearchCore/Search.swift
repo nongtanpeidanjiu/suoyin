@@ -51,6 +51,7 @@ struct PreparedSearch {
     var nameOrder: [UInt32] = []
     var fileKinds: [UInt8] = []
     var nameFilter: [UInt64] = []
+    var hasLeafRoot = false
     let columnOrders = ColumnOrders()
 
     init(keyOffsets: [UInt32]) { self.keyOffsets = keyOffsets }
@@ -79,6 +80,7 @@ struct PreparedSearch {
             }
         }
         fileKinds = previous?.fileKinds ?? []
+        hasLeafRoot = previous?.hasLeafRoot ?? false
         classifyKinds(in: index)
         nameFilter = previous?.nameFilter ?? []
         prepareNameFilter(in: index, previousNameBytes: previousNameBytes)
@@ -88,9 +90,10 @@ struct PreparedSearch {
         var kinds = fileKinds
         let first = kinds.count
         kinds.append(contentsOf: repeatElement(0, count: index.recordCount - first))
-        withView(index: index) { view in
+        let newLeafRoot = withView(index: index) { view in
             kinds.withUnsafeMutableBufferPointer { dm_classify_kinds(&view, $0.baseAddress, first) }
         }
+        hasLeafRoot = hasLeafRoot || newLeafRoot
         fileKinds = kinds
     }
 
@@ -127,7 +130,8 @@ struct PreparedSearch {
                                                 file_kinds: kinds.baseAddress,
                                                 name_filter: filter.isEmpty ? nil : filter.baseAddress,
                                                 row_count: rows.count, name_bytes: names.count,
-                                                fold_bytes: folded.count, fold_count: changed.count)
+                                                fold_bytes: folded.count, fold_count: changed.count,
+                                                has_leaf_root: hasLeafRoot)
                                             return body(&view)
                                         }
                                     }

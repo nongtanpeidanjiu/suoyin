@@ -34,6 +34,8 @@ public struct TrackingStatus: Codable {
     public var lastCompactionNanoseconds: UInt64 = 0
     public var coverageRestricted: [String] = []
     public var awaitingFullDiskAccess = false
+    var coverageDenialErrors: [String: Int32]? = nil
+    var pendingFullDiskAccessPaths: [String]? = nil
     public var overlayRows = 0
     public var baseRecords = 0
     public var applying = false
@@ -226,12 +228,8 @@ public final class ChangeTracker {
         mounts?.engineObserver = observer
     }
 
-    func engineExternalStates() -> [(name: String, root: String, status: TrackingStatus)] {
-        (mounts?.searchable() ?? []).map { ($0.mount.name, $0.mount.identity.mount, $0.tracker.snapshotStatus()) }
-    }
-
-    var engineCoverageRoots: [String] {
-        (scope.wholeDisk ? [NSHomeDirectory()] : [root]) + [scope.clouds.storage, scope.clouds.iCloud].compactMap { $0 }
+    func engineExternalStates() -> [(name: String, status: TrackingStatus)] {
+        (mounts?.searchable() ?? []).map { ($0.mount.name, $0.tracker.snapshotStatus()) }
     }
 
     func engineCloudProvider() -> String? { lock.withLock { lastCloudProvider } }
@@ -333,17 +331,20 @@ public final class ChangeTracker {
             coverage = publishedCoverage.sorted()
         }
         let read = updated.readView()
-        lock.withLock {
-            guard !externalCancelled else { return }
+        let coverageChanged = lock.withLock {
+            guard !externalCancelled else { return false }
             view = read
             if changed { status.generation += 1 }
             status.appliedEvents = positions()
             status.overlayRows = updated.state.changes.count
             status.baseRecords = updated.base.recordCount
             if let coverage { status.coverageRestricted = coverage }
+            let evidenceChanged = status.coverageDenialErrors != updated.state.denialErrors
+            status.coverageDenialErrors = updated.state.denialErrors
+            return coverage != nil || evidenceChanged
         }
         if engineRowsChanged { engineObserver?(.index) }
-        else if coverage != nil { engineObserver?(.status) }
+        else if coverageChanged { engineObserver?(.status) }
     }
 
     private func positions() -> [String: UInt64] {
@@ -904,7 +905,7 @@ public final class ChangeTracker {
             var more = index.reconcile(path: folder, observed: observed)
             if inCloud {
                 switch observed {
-                case .absent, .restricted: cloud?.discard(at: folder)
+                case .absent, .restricted, .denied: cloud?.discard(at: folder)
                 case .pending: cloud?.enqueue(folder, inherited: inherited)
                 case .deferred: break
                 case .readable:
@@ -912,10 +913,10 @@ public final class ChangeTracker {
                     if inherited & Kind.pending != 0 { index.clearCloudPending(at: folder); cloud?.discardOnly(folder) }
                 }
             }
-            if case let .readable(_, contents) = observed {
+            if case let .readable(_, contents, _) = observed {
                 enqueueCloudChildren(of: folder, contents: contents, in: &index)
             }
-            if work[folder] == true, case let .readable(_, contents) = observed {
+            if work[folder] == true, case let .readable(_, contents, _) = observed {
                 recursive += 1
                 for (name, entry) in contents where entry.directory && entry.attribute & Kind.pending == 0 {
                     let child = joinedPath(folder, name)
@@ -952,21 +953,27 @@ public final class ChangeTracker {
             cloud?.discardOnly(path)
             return false
         }
+        let completed: Bool
         switch result {
-        case let .readable(_, children):
+        case let .readable(_, children, _):
             _ = revised.reconcile(path: path, observed: result, completingCloud: true)
             enqueueCloudChildren(of: path, contents: children, in: &revised)
+            completed = true
         case .absent:
             _ = revised.reconcile(path: path, observed: .absent)
             cloud?.discard(at: path)
-        case .pending, .deferred, .restricted:
+            completed = true
+        case .restricted, .denied:
+            _ = revised.reconcile(path: path, observed: result)
+            completed = false
+        case .pending, .deferred:
             return false
         }
         revised.prepareDelta()
         publish(revised, changed: true)
         if duringCompaction != nil { compactionNeedsRetry = true }
         scheduleSave()
-        return true
+        return completed
     }
 
     private func releaseTemporaryPages() {
@@ -1458,6 +1465,7 @@ public final class ChangeTracker {
         let changed = lock.withLock {
             let changed = status.awaitingFullDiskAccess != blocked
             status.awaitingFullDiskAccess = blocked
+            status.pendingFullDiskAccessPaths = blocked ? containerAccess.roots : []
             return changed
         }
         if changed { engineObserver?(.status) }

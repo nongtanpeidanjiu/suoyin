@@ -1,4 +1,5 @@
 import CoreServices
+import Darwin
 import Foundation
 import Testing
 @testable import SearchCore
@@ -91,6 +92,12 @@ struct EngineTests {
 
         tracker.injectPermissionObservation(folder.path, .restricted)
         try #require(until { events.status?.inaccessiblePaths == [folder.path] })
+        #expect(engine.status.inaccessibleLocationCount == 1)
+        #expect(engine.status.rawInaccessibleLocations == [
+            InaccessibleLocation(path: folder.path, count: 1, reason: .unknown)
+        ])
+        tracker.injectPermissionObservation(folder.path, .denied(EACCES))
+        try #require(until { events.status?.inaccessibleLocations.first?.reason == .filePermissions })
         #expect(engine.search(EngineQuery(text: "known-file")).hits.isEmpty)
         engine.recheckAccess()
         try #require(until { engine.status.inaccessiblePaths.isEmpty })
@@ -106,22 +113,63 @@ struct EngineTests {
         #expect(zip(times, times.dropFirst()).allSatisfy { $1 - $0 >= 245_000_000 })
     }
 
-    @Test func inaccessiblePathsSummarizeUserLocations() {
-        let roots = ["/Users/fixture", "/Volumes/Fixture disk"]
-        let paths = [
-            "/Library/System item", "/System/Library", "/private/var", "/Users/fixture-other/private",
-            "/Volumes/Fixture disk copy/private", "/Users/fixture/Documents/A",
-            "/Users/fixture/Documents/A/Child", "/Users/fixture/Documents/B",
-            dataRoot + "/Users/fixture/Documents/B",
-            "/Users/fixture/Library/CloudStorage/Provider/Folder",
-            "/Volumes/Fixture disk/Folder/Child", "/Volumes/Fixture disk/Folder"
+    @Test func inaccessibleLocationsPreserveCountsAndReasonsAcrossTheDisk() {
+        let raw: [InaccessibleLocation] = [
+            .init(path: "/Library/Fixture", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Child", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Other", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Unknown", count: 1, reason: .unknown),
+            .init(path: "/System/Fixture", count: 1, reason: .unknown),
+            .init(path: "/private/var/Fixture", count: 1, reason: .filePermissions),
+            .init(path: "/Users/fixture/Documents/A", count: 1, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Users/fixture/Documents/B", count: 1, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Volumes/Fixture disk/Folder", count: 1, reason: .filePermissions)
         ]
-        #expect(SearchEngine.summarizeRestrictions(paths, within: roots) == [
-            "/Users/fixture/Documents", "/Users/fixture/Library/CloudStorage/Provider/Folder",
-            "/Volumes/Fixture disk/Folder"
+        let grouped = AccessDenials.summarize(raw)
+        #expect(grouped == [
+            .init(path: "/Library", count: 3, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Unknown", count: 1, reason: .unknown),
+            .init(path: "/System/Fixture", count: 1, reason: .unknown),
+            .init(path: "/Users/fixture/Documents", count: 2, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Volumes/Fixture disk/Folder", count: 1, reason: .filePermissions),
+            .init(path: "/private/var/Fixture", count: 1, reason: .filePermissions)
         ])
-        let branches = (0...70).map { "/Users/fixture/Branch-\($0)/Leaf" }.sorted()
-        #expect(SearchEngine.summarizeRestrictions(Array(branches.reversed()), within: roots) == Array(branches.prefix(50)))
+        #expect(grouped.reduce(0) { $0 + $1.count } == raw.count)
+        let branches = (0...220).map { InaccessibleLocation(path: "/Library/Branch-\($0)/Leaf", count: 1, reason: .unknown) }
+        #expect(AccessDenials.summarize(branches) == branches.sorted { $0.path < $1.path })
+
+        let observed = AccessDenials(home: "/Users/fixture")
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: true)
+            == .likelyNeedsFullDiskAccess)
+        #expect(observed.reason(at: dataRoot + "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: true)
+            == .likelyNeedsFullDiskAccess)
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EACCES, missingFullDiskAccess: true) == .filePermissions)
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: false) == .unknown)
+        #expect(observed.reason(at: "/System/Fixture", error: EPERM, missingFullDiskAccess: true) == .unknown)
+        #expect(observed.reason(at: "/Users/fixture/Documents2", error: EPERM, missingFullDiskAccess: true) == .unknown)
+        #expect(observed.reason(at: "/Users/fixture/Library/Mail", error: nil, missingFullDiskAccess: true) == .unknown)
+    }
+
+    @Test func aDeniedEntryDoesNotHideItsReadableSiblings() {
+        var base = SearchIndex()
+        let parent = base.append("/fixture", attribute: Kind.anchor)
+        base.append("denied", parent: parent, attribute: Kind.file)
+        base.append("readable", parent: parent, attribute: Kind.file)
+        base.prepare()
+        let folder = TrackedEntry(size: 0, modified: 0, attribute: Kind.directory)
+        let leaf = TrackedEntry(size: 0, modified: 0, attribute: Kind.file)
+        var index = LiveIndex(base: base, root: "/fixture")
+        _ = index.reconcile(path: "/fixture", observed: .readable(own: folder, children: ["readable": leaf],
+                                                                  denied: ["denied": EACCES]))
+        #expect(index.entry(at: "/fixture/denied") == nil)
+        #expect(index.entry(at: "/fixture/readable") != nil)
+        #expect(index.state.restricted == ["/fixture/denied"])
+        #expect(index.state.denialErrors == ["/fixture/denied": EACCES])
+        _ = index.reconcile(path: "/fixture", observed: .readable(own: folder,
+                                                                  children: ["readable": leaf, "denied": leaf]))
+        #expect(index.state.restricted.isEmpty)
+        #expect(index.state.denialErrors?.isEmpty == true)
+        #expect(index.entry(at: "/fixture/denied") != nil)
     }
 
     @Test func protectedContainersAreNeverProbedUntilAuthorized() throws {
@@ -149,6 +197,9 @@ struct EngineTests {
         let (engine, tracker) = try start()
         defer { engine.stop() }
         try #require(until { engine.status.awaitingFullDiskAccess && engine.status.indexBytesOnDisk > 0 })
+        #expect(engine.status.pendingFullDiskAccessPaths == access.roots)
+        #expect(engine.status.pendingFullDiskAccessCount == 2)
+        #expect(engine.status.inaccessibleLocationCount == 0)
         #expect(trace.paths(under: access.roots).isEmpty)
         trace.reset()
         let parent = parentPath(access.roots[0])
@@ -191,6 +242,8 @@ struct EngineTests {
         trace.granted = true
         restricted.recheckAccess()
         try #require(until { !restricted.status.awaitingFullDiskAccess && restricted.search(query).total == 2 })
+        #expect(restricted.status.pendingFullDiskAccessPaths.isEmpty)
+        #expect(restricted.status.pendingFullDiskAccessCount == 0)
         trace.granted = false
         trace.reset()
         restricted.recheckAccess()

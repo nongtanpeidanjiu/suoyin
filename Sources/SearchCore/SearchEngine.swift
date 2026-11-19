@@ -62,9 +62,15 @@ public enum EnginePhase: Sendable, Equatable {
 public struct EngineStatus: Sendable {
     public let phase: EnginePhase
     public let indexedCount: Int
-    public let inaccessiblePaths: [String]
-    public let awaitingFullDiskAccess: Bool
+    public let inaccessibleLocations: [InaccessibleLocation]
+    public let rawInaccessibleLocations: [InaccessibleLocation]
+    public let pendingFullDiskAccessPaths: [String]
     public let indexBytesOnDisk: Int64
+
+    public var inaccessibleLocationCount: Int { rawInaccessibleLocations.count }
+    public var pendingFullDiskAccessCount: Int { pendingFullDiskAccessPaths.count }
+    public var awaitingFullDiskAccess: Bool { !pendingFullDiskAccessPaths.isEmpty }
+    public var inaccessiblePaths: [String] { inaccessibleLocations.map(\.path) }
 }
 
 /// In-process access to the local and attached-volume indexes. One instance
@@ -85,8 +91,8 @@ public final class SearchEngine: @unchecked Sendable {
     private var pendingDisk = false
     private var nextRefresh: DispatchTime = .now()
     private var nextIndexNotification: DispatchTime = .now()
-    private var lastCoverage: [String] = []
-    private var lastCoverageRoots: [String] = []
+    private let accessDenials = AccessDenials(home: NSHomeDirectory())
+    private var lastCoverage: [String: InaccessibleLocation.Reason] = [:]
     private var reported: EngineStatus
 
     public convenience init(dataDirectory: URL) throws {
@@ -108,7 +114,8 @@ public final class SearchEngine: @unchecked Sendable {
     init(dataDirectory: URL, tracker: ChangeTracker) {
         directory = dataDirectory
         self.tracker = tracker
-        reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessiblePaths: [], awaitingFullDiskAccess: false,
+        reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessibleLocations: [],
+                                rawInaccessibleLocations: [], pendingFullDiskAccessPaths: [],
                                 indexBytesOnDisk: Self.diskBytes(directory))
         tracker.observeEngineChanges { [weak self] in self?.scheduleRefresh(for: $0) }
     }
@@ -198,13 +205,20 @@ public final class SearchEngine: @unchecked Sendable {
         let local = tracker.snapshotStatus()
         let external = tracker.engineExternalStates()
         let count = tracker.indexedEntryCount()
-        let coverage = external.isEmpty ? local.coverageRestricted :
-            local.coverageRestricted + external.flatMap { $0.status.coverageRestricted }
-        let coverageRoots = tracker.engineCoverageRoots + external.map(\.root)
-        let restrictions = coverage == lastCoverage && coverageRoots == lastCoverageRoots
-            ? previous.inaccessiblePaths : Self.summarizeRestrictions(coverage, within: coverageRoots)
+        var coverage: [String: InaccessibleLocation.Reason] = [:]
+        for state in [local] + external.map(\.status) {
+            for path in state.coverageRestricted {
+                let reason = accessDenials.reason(at: path, error: state.coverageDenialErrors?[path],
+                                                  missingFullDiskAccess: local.awaitingFullDiskAccess)
+                coverage[path] = coverage[path].map { $0 == reason ? reason : .unknown } ?? reason
+            }
+        }
+        let coverageChanged = coverage != lastCoverage
+        let raw = coverageChanged ? coverage.sorted { $0.key < $1.key }.map {
+            InaccessibleLocation(path: $0.key, count: 1, reason: $0.value)
+        } : previous.rawInaccessibleLocations
+        let restrictions = coverageChanged ? AccessDenials.summarize(raw) : previous.inaccessibleLocations
         lastCoverage = coverage
-        lastCoverageRoots = coverageRoots
         let bytes = disk ? Self.diskBytes(directory) : previous.indexBytesOnDisk
         let phase: EnginePhase
         if let error = local.error {
@@ -222,14 +236,16 @@ public final class SearchEngine: @unchecked Sendable {
         } else {
             phase = .ready
         }
-        let updated = EngineStatus(phase: phase, indexedCount: count, inaccessiblePaths: restrictions,
-                                   awaitingFullDiskAccess: local.awaitingFullDiskAccess, indexBytesOnDisk: bytes)
+        let updated = EngineStatus(phase: phase, indexedCount: count, inaccessibleLocations: restrictions,
+                                   rawInaccessibleLocations: raw,
+                                   pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
+                                   indexBytesOnDisk: bytes)
         let (statusCallback, indexCallback) = lock.withLock {
             reported = updated
             return (statusHandler, indexHandler)
         }
         if phase != previous.phase || count != previous.indexedCount ||
-            restrictions != previous.inaccessiblePaths || updated.awaitingFullDiskAccess != previous.awaitingFullDiskAccess ||
+            coverageChanged || updated.pendingFullDiskAccessPaths != previous.pendingFullDiskAccessPaths ||
             bytes != previous.indexBytesOnDisk {
             statusCallback?(updated)
         }
@@ -243,31 +259,6 @@ public final class SearchEngine: @unchecked Sendable {
             if deliver { indexCallback() }
             else { scheduleRefresh(for: .index) }
         }
-    }
-
-    static func summarizeRestrictions(_ paths: [String], within roots: [String]) -> [String] {
-        func logical(_ path: String) -> String {
-            path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
-        }
-        let allowed = roots.map(logical)
-        func isAllowed(_ path: String) -> Bool { allowed.contains { inside(path, $0) } }
-        func topLevel(_ paths: Set<String>) -> Set<String> {
-            paths.filter { path in
-                var ancestor = path
-                while ancestor != "/" {
-                    ancestor = parentPath(ancestor)
-                    if paths.contains(ancestor) { return false }
-                }
-                return true
-            }
-        }
-        let distinct = topLevel(Set(paths.lazy.map(logical).filter(isAllowed)))
-        let siblings = Dictionary(grouping: distinct, by: parentPath)
-        let grouped = siblings.reduce(into: Set<String>()) { result, group in
-            if group.value.count > 1 && isAllowed(group.key) { result.insert(group.key) }
-            else { result.formUnion(group.value) }
-        }
-        return Array(topLevel(grouped).sorted().prefix(50))
     }
 
     private static func diskBytes(_ directory: URL) -> Int64 {

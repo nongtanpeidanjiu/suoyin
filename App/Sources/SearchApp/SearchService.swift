@@ -67,5 +67,5 @@ protocol SearchService: AnyObject {
 /// case-insensitive, NFC.
 func queryTerms(_ text: String) -> [String] {
     text.precomposedStringWithCanonicalMapping.lowercased()
-        .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        .split(whereSeparator: \.isWhitespace).map(String.init)
 }

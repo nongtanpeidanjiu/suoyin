@@ -42,6 +42,7 @@ struct EngineTests {
 
         let engine = try SearchEngine(dataDirectory: data, root: root.path)
         defer { engine.stop() }
+        #expect(engine.indexDataDirectoryExclusion == data.path)
         #expect(engine.status.phase == .starting)
         #expect(engine.search(EngineQuery(text: "item")).hits.isEmpty)
         engine.start()
@@ -66,6 +67,12 @@ struct EngineTests {
         #expect(engine.search(EngineQuery(text: first.hits[0].path, mode: .path)).hits.first?.id == first.hits[0].id)
         let miss = engine.search(EngineQuery(text: "item", offset: 9))
         #expect(miss.hits.isEmpty && miss.total == 0 && !miss.totalIsExact)
+        let bounded = engine.search(EngineQuery(text: "item", limit: 1, totalCountBudget: 3))
+        #expect(bounded.hits.map(\.id) == first.hits.map(\.id) && bounded.total == 3 && bounded.totalIsExact)
+        let lowerBound = engine.search(EngineQuery(text: "item", showAll: true, limit: 1, totalCountBudget: 2))
+        #expect(lowerBound.hits.count == 1 && lowerBound.total == 3 && !lowerBound.totalIsExact)
+        let beyond = engine.search(EngineQuery(text: "item", offset: 4, limit: 1, totalCountBudget: 8))
+        #expect(beyond.hits.isEmpty && beyond.total == 3 && beyond.totalIsExact)
         let hit = try #require(second.hits.first)
         #expect(hit.path == file.path && hit.size == 3)
         let modified = try #require(file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
@@ -77,6 +84,163 @@ struct EngineTests {
         reopened.start()
         try #require(until { reopened.search(EngineQuery(text: "item-file")).total == 1 })
         #expect(reopened.search(EngineQuery(text: "engine-data", showAll: true)).hits.isEmpty)
+    }
+
+    @Test func rebuildingAfterStartupReadFailureStartsWithoutACursor() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local")
+        let data = root.appendingPathComponent("state")
+        let blockedSnapshot = data.appendingPathComponent("index.snapshot")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: blockedSnapshot, withIntermediateDirectories: true)
+        try Data([1]).write(to: local.appendingPathComponent("startup-recovery-fixture.txt"))
+        let engine = try SearchEngine(dataDirectory: data, root: local.path)
+        defer { engine.stop() }
+        engine.start()
+        try #require(until {
+            if case .failed = engine.status.phase { return true }
+            return false
+        })
+        guard case let .failed(failure) = engine.status.phase else { Issue.record("Expected startup failure"); return }
+        #expect(failure.category == .diskRead)
+        #expect(!failure.underlyingMessage.isEmpty)
+        try FileManager.default.removeItem(at: blockedSnapshot)
+        engine.rebuild()
+        try #require(until {
+            engine.status.phase == .ready && engine.search(EngineQuery(text: "startup-recovery-fixture")).hits.count == 1
+        })
+        #expect(FileManager.default.fileExists(atPath: blockedSnapshot.path))
+    }
+
+    @Test func initializationAndTrackingFailuresUseStableCategories() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invalid = root.appendingPathComponent("invalid-data-directory")
+        try Data().write(to: invalid)
+        do {
+            _ = try SearchEngine(dataDirectory: invalid, root: root.path)
+            Issue.record("Expected initialization to fail")
+        } catch let failure as EngineFailure {
+            #expect(failure.category == .dataDirectoryUnavailable)
+            #expect(!failure.underlyingMessage.isEmpty)
+        }
+        #expect(EngineFailure(SnapshotError.filesystem(ENOSPC)).category == .dataDirectoryUnavailable)
+        #expect(EngineFailure(ScanError.metadata(path: "/fixture", error: EIO)).category == .diskRead)
+        #expect(EngineFailure(SnapshotError.invalid).category == .indexCorrupt)
+        #expect(EngineFailure(ScanError.invalidWorkerCount).category == .other)
+    }
+
+    @Test func aPersistedCapacityFailureDoesNotRescanOnStartupUntilRebuilt() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local")
+        let data = root.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        try Data().write(to: local.appendingPathComponent("capacity-fixture.txt"))
+        let snapshot = data.appendingPathComponent("index.snapshot").path
+        var budget = BaseWriteBudget(snapshot: snapshot)
+        try budget.setSnapshotLimitReached(true)
+        let engine = try SearchEngine(dataDirectory: data, root: local.path)
+        defer { engine.stop() }
+        engine.start()
+        try #require(until {
+            if case .failed(let error) = engine.status.phase { return error.category == .indexLimitExceeded }
+            return false
+        })
+        let query = EngineQuery(text: "capacity-fixture")
+        #expect(engine.search(query).hits.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: snapshot))
+        engine.rebuild()
+        try #require(until { engine.status.phase == .ready && engine.search(query).hits.count == 1 })
+        #expect(!BaseWriteBudget(snapshot: snapshot).snapshotLimitReached)
+    }
+
+    @Test func mountedVolumesReportNetworkAndImagesWithoutIndexingThem() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for path in ["/", "/System/Volumes/Preboot", "/System/Volumes/Recovery", "/System/Volumes/VM",
+                     "/System/Volumes/Update", "/System/Volumes/xarts", "/System/Volumes/Hardware",
+                     "/Library/Developer/CoreSimulator/Volumes/Example"] {
+            #expect(!ExternalVolumes.isBrowsableMount(path, filesystem: "apfs", flags: UInt32(MNT_LOCAL)))
+        }
+        #expect(!ExternalVolumes.isBrowsableMount("/Volumes/HiddenFixture", filesystem: "apfs",
+                                                   flags: UInt32(MNT_LOCAL | MNT_DONTBROWSE)))
+        #expect(ExternalVolumes.isBrowsableMount("/Volumes/LocalFixture", filesystem: "apfs", flags: UInt32(MNT_LOCAL)))
+        #expect(ExternalVolumes.isBrowsableMount("/Volumes/NetworkFixture", filesystem: "smbfs", flags: 0))
+        let local = root.appendingPathComponent("local")
+        let data = root.appendingPathComponent("state")
+        for folder in [local, data] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false, allowDiskImages: false)
+        let engine = try fixtureEngine(data: data, local: local, mounts: manager)
+        defer { try? manager.stop() }
+        manager.start(deferIndexing: true)
+        func mount(_ name: String) -> ExternalMount {
+            let path = root.appendingPathComponent(name).path
+            let identity = VolumeIdentity(root: path, mount: path, device: 0, uuid: UUID().uuidString,
+                                          log: nil, readOnly: true)
+            return ExternalMount(identity: identity, name: name, fileEvents: false)
+        }
+        let internalData = mount("Internal data fixture")
+        let internalID = try #require(internalData.volumeID)
+        var image = mount("Image fixture")
+        image.isDiskImage = true
+        var network = mount("Network fixture")
+        network.isNetwork = true
+        let notified = DispatchSemaphore(value: 0)
+        engine.onExternalVolumesChange = { [weak engine] in
+            if engine?.unindexedMountedVolumes.count == 2 { notified.signal() }
+        }
+        manager.updateMounts([internalData, image, network])
+        #expect(notified.wait(timeout: .now() + 3) == .success)
+        #expect(engine.externalVolumes.map(\.id) == [internalID])
+        #expect(engine.externalVolumes.first?.isIncluded == false)
+        #expect(engine.unindexedMountedVolumes.map(\.kind) == [.diskImage, .network])
+        #expect(engine.unindexedMountedVolumes.map(\.reason) == [.diskImagesDisabled, .networkUnsupported])
+        #expect(manager.searchable().isEmpty)
+        manager.updateMounts([internalData])
+        #expect(engine.unindexedMountedVolumes.isEmpty)
+    }
+
+    @Test func failedExternalScanReportsItsFailureAndCanRetryFromScratch() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let local = root.appendingPathComponent("local")
+        let data = root.appendingPathComponent("state")
+        let external = root.appendingPathComponent("external")
+        let cache = data.appendingPathComponent("external-volumes")
+        for folder in [local, external, cache] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let id = UUID().uuidString
+        let log = cache.appendingPathComponent("\(id)-exfat.scanlog")
+        try Data().write(to: log)
+        let file = try FileHandle(forWritingTo: log)
+        try file.truncate(atOffset: 256 * 1024 * 1024 + 1)
+        try file.close()
+        try Data().write(to: external.appendingPathComponent("retry-volume-fixture.txt"))
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        let engine = try fixtureEngine(data: data, local: local, mounts: manager)
+        defer { engine.stop() }
+        engine.start()
+        let identity = VolumeIdentity(root: external.path, mount: external.path, device: try WalkScope.device(external.path),
+                                      uuid: id, log: nil, readOnly: false)
+        let mount = ExternalMount(identity: identity, name: "Fixture volume", fileEvents: false, filesystem: "exfat")
+        manager.updateMounts([mount])
+        engine.setExternalVolume(id, included: true)
+        try #require(until { engine.externalVolumes.first?.progress == .failed })
+        #expect(engine.externalVolumes.first?.failure?.category == .indexCorrupt)
+        #expect(until { engine.status.phase == .ready })
+        #expect(engine.retryExternalVolume(id))
+        try #require(until {
+            engine.externalVolumes.first?.progress == .idle &&
+                engine.search(EngineQuery(text: "retry-volume-fixture")).hits.count == 1
+        })
+        #expect(engine.externalVolumes.first?.failure == nil)
+        #expect(!engine.retryExternalVolume(id))
     }
 
     @Test func localDenialsAreVerifiedWhileAnExternalSourceIsStillScanning() throws {

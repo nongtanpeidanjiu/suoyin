@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import Testing
 @testable import SearchCore
@@ -21,6 +22,45 @@ struct CloudVolumeTests {
             .appendingPathComponent(".m2-tmp/test-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
         return path.resolvingSymlinksInPath()
+    }
+
+    @Test func cloudTrashIsSearchableAfterOpeningAnOlderSnapshotAndAfterNewEvents() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let own = root.appendingPathComponent("state")
+        let roots = CloudRoots(home: root.path)
+        let provider = URL(fileURLWithPath: try #require(roots.storage)).appendingPathComponent("FixtureProvider")
+        let trash = provider.appendingPathComponent(".Trash")
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: false)
+        try Data().write(to: trash.appendingPathComponent("trash-existing-fixture.txt"))
+        let identity = try VolumeIdentity(root: root.path)
+        let checkpoint = try #require(identity.observedBoundary())
+        var base = SearchIndex()
+        let anchor = base.append(root.path, attribute: Kind.anchor)
+        let library = base.append("Library", parent: anchor, attribute: Kind.directory)
+        let storage = base.append("CloudStorage", parent: library, attribute: Kind.directory)
+        base.append("FixtureProvider", parent: storage, attribute: Kind.directory)
+        base.volumes = [identity.checkpoint(checkpoint)]
+        base.prepare()
+        let snapshot = own.appendingPathComponent("index").path
+        try base.savePrepared(to: snapshot)
+
+        let tracker = try ChangeTracker(root: root.path, snapshot: snapshot, ownData: own.path,
+                                        wallTime: { Date().timeIntervalSince1970 }, cloudRoots: roots)
+        let engine = SearchEngine(dataDirectory: own, tracker: tracker)
+        defer { engine.stop() }
+        engine.start()
+        let existing = EngineQuery(text: "trash-existing-fixture", showAll: true)
+        try #require(until { engine.search(existing).hits.count == 1 })
+        #expect(tracker.snapshotStatus().recovery == "replay")
+        #expect(engine.search(EngineQuery(text: existing.text)).hits.isEmpty)
+        let added = trash.appendingPathComponent("trash-new-fixture.txt")
+        let flags = UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemCreated)
+        try tracker.deliverForTesting([VolumeEvent(path: added.path, id: checkpoint + 1, flags: flags)], writing: {
+            try Data().write(to: added)
+        })
+        #expect(until { engine.search(EngineQuery(text: "trash-new-fixture", showAll: true)).hits.count == 1 })
     }
 
     @Test func interruptedDirectoryScanResumesAndRepairsATornTail() throws {
@@ -147,7 +187,6 @@ struct CloudVolumeTests {
             queue.apply = { path, _ in completed.append(path); return true }
             queue.enqueue(first, inherited: Kind.pending)
             queue.enqueue(second, inherited: Kind.pending)
-            queue.enqueue(provider + "/.Trash/old", inherited: Kind.pending)
             queue.setEnabled(true)
         }
         #expect(until { writer.sync { status.timedOut == 1 && status.inFlight && status.pending == 2 } })
@@ -259,8 +298,6 @@ struct CloudVolumeTests {
         base.append("b", parent: rootID, attribute: Kind.directory | Kind.pending)
         base.append("already-indexed.pdf", parent: rootID)
         base.append("unrelated.pdf", parent: baseRoot)
-        let deleted = base.append(".Trash", parent: rootID, attribute: Kind.directory | Kind.pending)
-        base.append("stale-recycle.txt", parent: deleted)
         base.volumes = [identity.checkpoint(checkpoint)]
         base.prepare()
         let snapshot = own.appendingPathComponent("index").path
@@ -300,7 +337,6 @@ struct CloudVolumeTests {
         })
         #expect(first.snapshotStatus().cloud.pending == 1)
         #expect(first.search("first-metadata").count == 1)
-        #expect(first.search("stale-recycle", showAll: true).isEmpty)
         try first.save()
         #expect(first.snapshotStatus().journalFrames > 0)
         engine.stop()
@@ -405,7 +441,7 @@ struct CloudVolumeTests {
         #expect(!ExternalMount.supportsFileEvents(on: "exfat"))
         #expect(formerlyMounted.cacheKey != replacedHistory.cacheKey)
 
-        let mounts = ExternalVolumes(directory: root.path)
+        let mounts = ExternalVolumes(directory: root.path, discoverAutomatically: false)
         defer { try? mounts.stop() }
         mounts.setIncludesNew(true)
         mounts.updateMounts([formerlyMounted])
@@ -481,6 +517,10 @@ struct CloudVolumeTests {
                                                    log: nil, readOnly: false), name: "SameName", fileEvents: false)
         }
         mounts.updateMounts(volumes)
+        let provisional = mounts.catalogState().0
+        #expect(provisional.count == 2 && provisional.allSatisfy { $0.requiresManualInclusion && !$0.isIncluded })
+        #expect(mounts.searchable().isEmpty)
+        for volume in provisional { mounts.setIncluded(volume.id, included: true) }
         #expect(until { mounts.statuses().filter(\.caughtUp).count == 2 })
         let active = mounts.searchable()
         #expect(active.count == 2)
@@ -488,14 +528,21 @@ struct CloudVolumeTests {
         #expect(active.allSatisfy { $0.tracker.engineState().indexed == 1 && $0.tracker.engineState().accessChecked })
         mounts.updateMounts([volumes[1]])
         #expect(mounts.searchable().map { $0.mount.identity.root } == [paths[1].path])
-        #expect(mounts.statuses().filter { !$0.online }.count == 1)
+        #expect(mounts.statuses().filter { !$0.online }.isEmpty)
+        #expect(mounts.catalogState().0.count == 1)
         mounts.updateMounts(volumes)
+        let new = try #require(mounts.catalogState().0.first { !$0.isIncluded })
+        #expect(mounts.searchable().count == 1 && new.requiresManualInclusion)
+        mounts.setIncluded(new.id, included: true)
         #expect(until { mounts.statuses().filter(\.caughtUp).count == 2 })
         let former = active.first { $0.mount.identity.root == paths[0].path }
         #expect(former.map { !mounts.isCurrent($0) } == true)
         let replacement = mounts.searchable().first { $0.mount.identity.root == paths[0].path }
         #expect(replacement?.key != former?.key)
         #expect(replacement?.tracker.snapshotStatus().recovery == "missing")
+        let reopened = ExternalVolumes(directory: root.path, discoverAutomatically: false)
+        defer { try? reopened.stop() }
+        #expect(reopened.catalogState().0.isEmpty && reopened.catalogState().1)
     }
 
     private final class ProgressEvents: @unchecked Sendable {

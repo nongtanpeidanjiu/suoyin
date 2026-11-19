@@ -23,15 +23,16 @@ final class ExternalScanLog {
     private(set) var written = 0
     private(set) var retainedCount = 0
 
-    init(path: String, onRetained: @escaping (Int) -> Void = { _ in }) throws {
+    init(path: String, reset: Bool = false, onRetained: @escaping (Int) -> Void = { _ in }) throws {
         let fd = Darwin.open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw SnapshotError.filesystem(errno) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var info = stat()
         guard fstat(fd, &info) == 0 else { throw SnapshotError.filesystem(errno) }
-        guard info.st_mode & S_IFMT == S_IFREG, info.st_size <= Self.maximumBytes else {
+        guard info.st_mode & S_IFMT == S_IFREG, reset || info.st_size <= Self.maximumBytes else {
             throw SnapshotError.invalid
         }
+        if reset { try handle.truncate(atOffset: 0) }
         let bytes = try handle.readToEnd() ?? Data()
         var offsets: [String: Range<Int>] = [:]
         var counts: [String: Int] = [:]

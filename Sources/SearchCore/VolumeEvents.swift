@@ -8,6 +8,10 @@ struct VolumeEvent {
     let id: UInt64
     let flags: UInt32
 
+    var mountChanged: Bool {
+        flags & UInt32(kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount) != 0
+    }
+
     var historyDone: Bool { flags & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
     var recursive: Bool { flags & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 }
     var isDirectory: Bool { flags & UInt32(kFSEventStreamEventFlagItemIsDir) != 0 }

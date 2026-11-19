@@ -30,6 +30,8 @@ struct ExternalMount {
     var needsLiveIdentity = false
     var capacityBytes: Int64? = nil
     var isDiskImage = false
+    var isNetwork = false
+    var isSupportedLocal = true
 
     var scanWorkers: Int {
         switch medium {
@@ -106,6 +108,8 @@ final class ExternalVolumes {
         var filesystem: String?
         var capacityBytes: Int64?
         var isDiskImage: Bool?
+        var temporaryIdentity: Bool?
+        var inclusionChosen: Bool?
     }
 
     private struct Preferences: Codable, Equatable {
@@ -126,10 +130,13 @@ final class ExternalVolumes {
     private var offline: [String: ExternalVolumeStatus] = [:]
     private var retiring: Set<String> = []
     private var lastMounts: [ExternalMount] = []
+    private var simulatedMounts: [ExternalMount] = []
+    private var unindexed: [EngineUnindexedVolume] = []
     private var attachmentIDs: [String: String] = [:]
     private var preferences = Preferences()
     private var preferenceFailure: EngineVolumeSettingsError?
     private var startupFailure: EngineVolumeSettingsError?
+    private var volumeFailures: [String: EngineFailure] = [:]
     private var preferencesWritable = true
     private var started = false
     private var indexingEnabled = true
@@ -186,6 +193,7 @@ final class ExternalVolumes {
                 .appendingPathComponent("external-volumes.damaged-\(UUID().uuidString).json")
             do {
                 try FileManager.default.moveItem(at: preferencesURL, to: backup)
+                preferenceFailure = startupFailure
                 _ = save(Preferences())
             } catch {
                 preferencesWritable = false
@@ -203,16 +211,19 @@ final class ExternalVolumes {
 
     func catalog() -> [EngineVolume] { catalogState().0 }
 
-    func catalogState() -> ([EngineVolume], Bool, EngineVolumeSettingsError?) {
+    func unindexedMountedVolumes() -> [EngineUnindexedVolume] { queue.sync { unindexed } }
+
+    func catalogState() -> ([EngineVolume], Bool, EngineVolumeSettingsError?, [EngineUnindexedVolume]) {
         queue.sync {
             let online = Set(attachmentIDs.values)
             let delegates = Dictionary(uniqueKeysWithValues: lock.withLock { active.values.map { ($0.key, $0.tracker) } })
             let rows = preferences.volumes.compactMap { id, choice -> EngineVolume? in
                 guard allowDiskImages || choice.isDiskImage != true else { return nil }
                 let current = delegates[id]?.engineState()
+                let failure = current?.status.failure ?? volumeFailures[id]
                 let scanning = current.map {
-                    $0.status.phase != "caught-up" && $0.status.error == nil
-                } ?? false
+                    $0.status.phase != "caught-up"
+                } == true && failure == nil
                 let placeholder = choice.nameIsPlaceholder ?? (choice.name == "External disk" && !online.contains(id))
                 let durable = current?.status.externalRetainedEntries ?? retained[id] ??
                     (retainedLoaded && !retainedUnavailable.contains(id) ? 0 : nil)
@@ -222,12 +233,15 @@ final class ExternalVolumes {
                 return EngineVolume(id: id, name: placeholder ? String(id.prefix(8)) : choice.name,
                                     nameIsPlaceholder: placeholder, isOnline: online.contains(id),
                                     isIncluded: choice.included, isScanning: scanning, indexedCount: current?.indexed ?? 0,
-                                    retainedCount: durable, progress: scanning ? (restoring ? .restoring : .scanning) : .idle,
+                                    retainedCount: durable, progress: failure != nil ? .failed
+                                        : scanning ? (restoring ? .restoring : .scanning) : .idle,
+                                    failure: failure,
+                                    requiresManualInclusion: choice.temporaryIdentity == true,
                                     filesystem: choice.filesystem, capacityBytes: choice.capacityBytes,
                                     detail: choice.filesystem ?? choice.detail?.components(separatedBy: " · ").first)
             }
             return (rows.sorted { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name },
-                    preferences.includesNew, preferenceFailure ?? startupFailure)
+                    preferences.includesNew, preferenceFailure ?? startupFailure, unindexed)
         }
     }
 
@@ -247,6 +261,7 @@ final class ExternalVolumes {
                   choice.included != included else { return }
             var next = preferences
             choice.included = included
+            if choice.temporaryIdentity == true { choice.inclusionChosen = true }
             next.volumes[id] = choice
             _ = save(next)
             if included {
@@ -290,6 +305,19 @@ final class ExternalVolumes {
         }
     }
 
+    func retry(_ id: String) -> Bool {
+        queue.sync {
+            guard !closed, indexingEnabled, !retiring.contains(id), attachmentIDs.values.contains(id),
+                  let choice = preferences.volumes[id], choice.included, !choice.removing else { return false }
+            if let active = searchable().first(where: { $0.key == id }), active.tracker.snapshotStatus().failure != nil {
+                active.tracker.rebuildForEngine(onlyIfFailed: true)
+            } else if volumeFailures[id] != nil {
+                refresh()
+            } else { return false }
+            return true
+        }
+    }
+
     private func saveRemoval(_ id: String, choice: Choice, forget: Bool = false) -> Bool {
         var next = preferences
         var pending = choice
@@ -308,10 +336,17 @@ final class ExternalVolumes {
 
     @discardableResult
     private func save(_ next: Preferences, applyOnFailure: Bool = true) -> Bool {
+        var durable = next
+        durable.volumes = next.volumes.filter { $0.value.temporaryIdentity != true }
+        if preferenceFailure == nil, durable.includesNew == preferences.includesNew,
+           durable.volumes == preferences.volumes.filter({ $0.value.temporaryIdentity != true }) {
+            preferences = next
+            return true
+        }
         if applyOnFailure { preferences = next }
         guard preferencesWritable else { return false }
         do {
-            try JSONEncoder().encode(next).write(to: preferencesURL, options: .atomic)
+            try JSONEncoder().encode(durable).write(to: preferencesURL, options: .atomic)
             preferences = next
             preferenceFailure = nil
             return true
@@ -410,6 +445,7 @@ final class ExternalVolumes {
                 return false
             }
             if next.volumes[id] == nil {
+                volumeFailures[id] = nil
                 lock.withLock { offline[id] = nil }
             }
             if forget && online { refresh() }
@@ -489,8 +525,12 @@ final class ExternalVolumes {
             reconcile(mounts, replacing: path)
             probeUnresolvedIdentities(in: searchable().map(\.mount))
         } else {
-            reconcile(lastMounts, replacing: path)
+            reconcile(simulatedMounts, replacing: path)
         }
+    }
+
+    func mountTableChanged() {
+        queue.async { [weak self] in self?.refresh() }
     }
 
     private func probeUnresolvedIdentities(in mounts: [ExternalMount]) {
@@ -520,7 +560,10 @@ final class ExternalVolumes {
 
     /// Also serves as a seam for tests with owned directory fixtures.
     func updateMounts(_ mounts: [ExternalMount]) {
-        queue.sync { reconcile(mounts) }
+        queue.sync {
+            simulatedMounts = mounts
+            reconcile(mounts)
+        }
     }
 
     private func register(_ observations: [ExternalMount]) -> Bool {
@@ -552,20 +595,46 @@ final class ExternalVolumes {
                     old.volumeID == nil && old.sameAttachment(as: mount)
                         ? previousIDs[path].flatMap { next.volumes[$0] } : nil
                 }
-                next.volumes[id] = Choice(name: mount.name, included: oldChoice?.included ?? next.includesNew,
+                let temporary = unique == nil
+                let include = oldChoice.flatMap { $0.inclusionChosen == true ? $0.included : nil }
+                    ?? (!temporary && next.includesNew)
+                next.volumes[id] = Choice(name: mount.name, included: include,
                                           detail: mount.detail, nameIsPlaceholder: false, filesystem: mount.filesystem,
-                                          capacityBytes: mount.capacityBytes, isDiskImage: mount.isDiskImage)
+                                          capacityBytes: mount.capacityBytes, isDiskImage: mount.isDiskImage,
+                                          temporaryIdentity: temporary ? true : nil)
             }
         }
+        let attached = Set(assigned.values)
+        next.volumes = next.volumes.filter { $0.value.temporaryIdentity != true || attached.contains($0.key) }
         let changed = assigned != attachmentIDs || next != preferences
         lastMounts = observations
         attachmentIDs = assigned
+        if !volumeFailures.isEmpty {
+            volumeFailures = volumeFailures.filter { attached.contains($0.key) }
+        }
         if next != preferences { _ = save(next) }
         return changed
     }
 
     private func reconcile(_ detected: [ExternalMount], replacing path: String? = nil) {
         guard !closed else { return }
+        let unavailable = detected.compactMap { mount -> EngineUnindexedVolume? in
+            let reason: EngineUnindexedVolume.Reason
+            let kind: EngineUnindexedVolume.Kind
+            if mount.isNetwork {
+                kind = .network
+                reason = .networkUnsupported
+            } else if mount.isDiskImage && !allowDiskImages {
+                kind = .diskImage
+                reason = .diskImagesDisabled
+            } else if !mount.isSupportedLocal {
+                kind = .local
+                reason = .localVolumeUnsupported
+            } else { return nil }
+            return EngineUnindexedVolume(id: mount.identity.mount, name: mount.name, kind: kind, reason: reason)
+        }.sorted { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name }
+        let unindexedChanged = unavailable != unindexed
+        unindexed = unavailable
         if !allowDiskImages {
             var next = preferences
             for mount in detected where mount.isDiskImage {
@@ -573,8 +642,9 @@ final class ExternalVolumes {
             }
             if next != preferences { _ = save(next); engineObserver?(.status) }
         }
-        let observations = detected.filter { allowDiskImages || !$0.isDiskImage }
-        let changed = register(observations)
+        let observations = detected.filter { !$0.isNetwork && $0.isSupportedLocal && (allowDiskImages || !$0.isDiskImage) }
+        let registered = register(observations)
+        let changed = registered || unindexedChanged
         if !indexingEnabled {
             if changed { engineObserver?(.status) }
             return
@@ -589,7 +659,7 @@ final class ExternalVolumes {
                 guard mountPath != path, let active = previous[mountPath] else { return resolved }
                 return resolved.retainingKnownIdentity(from: active.mount)
             } catch {
-                preferenceFailure = Self.issue(.verifyIdentity, error)
+                volumeFailures[id] = EngineFailure(error, fallback: .diskRead)
                 engineObserver?(.status)
                 return nil
             }
@@ -601,8 +671,9 @@ final class ExternalVolumes {
                value.mount.canKeepTracker(for: candidate) { continue }
             let resolvedProvisional = candidate.map { value.mount.sameAttachment(as: $0) && value.mount.volumeID == nil }
                 ?? false
-            retire(value, recordOffline: !resolvedProvisional)
+            retire(value, recordOffline: !resolvedProvisional && preferences.volumes[value.key] != nil)
         }
+        lock.withLock { offline = offline.filter { preferences.volumes[$0.key] != nil } }
 
         for mount in mounts {
             let path = mount.identity.mount
@@ -614,8 +685,10 @@ final class ExternalVolumes {
             let base = joinedPath(directory, (cache ?? key) + ".snapshot")
             do {
                 if cache != nil || scanLog != nil {
-                    try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
-                                                            attributes: [.posixPermissions: 0o700])
+                    do {
+                        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
+                                                                attributes: [.posixPermissions: 0o700])
+                    } catch { throw EngineFailure(error, fallback: .dataDirectoryUnavailable) }
                 }
                 let tracker = try ChangeTracker(root: mount.identity.root, snapshot: base,
                                                 ownData: parentPath(directory),
@@ -623,6 +696,7 @@ final class ExternalVolumes {
                                                 external: mount, externalPersistence: cache != nil,
                                                 externalScanLog: scanLog, onAccess: onAccess)
                 let volume = Active(mount: mount, key: key, slot: nextSlot, tracker: tracker)
+                volumeFailures[key] = nil
                 nextSlot += 1
                 if let engineObserver { tracker.observeEngineChanges(engineObserver) }
                 lock.withLock {
@@ -640,6 +714,7 @@ final class ExternalVolumes {
                 engineObserver?(.status)
                 tracker.start()
             } catch {
+                volumeFailures[key] = EngineFailure(error, dataDirectory: parentPath(directory))
                 lock.withLock {
                     offline = offline.filter { !$0.value.online || $0.value.mount != path }
                     offline[key] = ExternalVolumeStatus(id: key, volumeUUID: volumeID, eventLogUUID: mount.identity.log,
@@ -647,6 +722,7 @@ final class ExternalVolumes {
                                                          caughtUp: false, slow: true, eventPosition: nil,
                                                          recovery: "unavailable")
                 }
+                engineObserver?(.status)
             }
         }
         if changed { engineObserver?(.status) }
@@ -755,39 +831,47 @@ final class ExternalVolumes {
         return CFUUIDCreateString(nil, unsafeBitCast(cf, to: CFUUID.self)) as String
     }
 
+    static func isBrowsableMount(_ path: String, filesystem: String, flags: UInt32) -> Bool {
+        guard flags & UInt32(MNT_ROOTFS | MNT_DONTBROWSE) == 0, path != "/",
+              !inside(path, "/System"), !inside(path, "/dev"),
+              filesystem != "autofs", filesystem != "devfs",
+              !path.contains("/Library/Developer/CoreSimulator/") else { return false }
+        return true
+    }
+
     private static func mounted(using session: DASession) -> [ExternalMount] {
         var mounts: UnsafeMutablePointer<statfs>?
         let count = getmntinfo(&mounts, MNT_NOWAIT)
         guard count > 0, let mounts else { return [] }
         let current = Array(UnsafeBufferPointer(start: mounts, count: Int(count)))
         return current.compactMap { info in
-            guard info.f_flags & UInt32(MNT_LOCAL) != 0 else { return nil }
             let path = withUnsafeBytes(of: info.f_mntonname) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
-            let device = withUnsafeBytes(of: info.f_mntfromname) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
-            guard path != "/", !inside(path, "/System"), !inside(path, "/dev"),
-                  device.hasPrefix("/dev/"),
-                  let disk = device.withCString({ DADiskCreateFromBSDName(nil, session, $0) }),
-                  let description = DADiskCopyDescription(disk) as? [String: Any],
-                  let mountedURL = description[kDADiskDescriptionVolumePathKey as String] as? URL,
-                  mountedURL.path == path else { return nil }
-            let model = description[kDADiskDescriptionDeviceModelKey as String] as? String
-            let transport = description[kDADiskDescriptionDeviceProtocolKey as String] as? String
-            let image = ExternalMount.isDiskImage(model: model, transport: transport)
-            let external = description[kDADiskDescriptionDeviceInternalKey as String] as? Bool == false
-            guard image || (external && transport != "Virtual Interface") else { return nil }
-            let uuid = descriptionUUID(description[kDADiskDescriptionVolumeUUIDKey as String])
-            let identity = VolumeIdentity(root: path, mount: path, device: info.f_fsid.val.0,
-                                          uuid: uuid, log: nil, readOnly: info.f_flags & UInt32(MNT_RDONLY) != 0)
             let filesystem = withUnsafeBytes(of: info.f_fstypename) {
                 String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
             }
+            guard isBrowsableMount(path, filesystem: filesystem, flags: info.f_flags) else { return nil }
+            let device = withUnsafeBytes(of: info.f_mntfromname) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+            let readOnly = info.f_flags & UInt32(MNT_RDONLY) != 0
+            let network = info.f_flags & UInt32(MNT_LOCAL) == 0
+            let disk = !network && device.hasPrefix("/dev/")
+                ? device.withCString { DADiskCreateFromBSDName(nil, session, $0) } : nil
+            let description = disk.flatMap { DADiskCopyDescription($0) as? [String: Any] } ?? [:]
+            let model = description[kDADiskDescriptionDeviceModelKey as String] as? String
+            let transport = description[kDADiskDescriptionDeviceProtocolKey as String] as? String
+            let image = ExternalMount.isDiskImage(model: model, transport: transport)
+            let mountedURL = description[kDADiskDescriptionVolumePathKey as String] as? URL
+            let supported = mountedURL?.path == path && (image || transport != "Virtual Interface")
+            let uuid = descriptionUUID(description[kDADiskDescriptionVolumeUUIDKey as String])
+            let identity = VolumeIdentity(root: path, mount: path, device: info.f_fsid.val.0,
+                                          uuid: uuid, log: nil, readOnly: readOnly)
             let (capacity, overflow) = Int64(clamping: info.f_blocks).multipliedReportingOverflow(by: Int64(info.f_bsize))
             return ExternalMount(identity: identity,
                                  name: description[kDADiskDescriptionVolumeNameKey as String] as? String ?? leafName(path),
                                  fileEvents: ExternalMount.supportsFileEvents(on: filesystem),
-                                 bsdName: DADiskGetBSDName(disk).map { String(cString: $0) },
+                                 bsdName: disk.flatMap { DADiskGetBSDName($0) }.map { String(cString: $0) },
                                  filesystem: filesystem, needsLiveIdentity: true,
-                                 capacityBytes: !overflow && capacity > 0 ? capacity : nil, isDiskImage: image)
+                                 capacityBytes: !overflow && capacity > 0 ? capacity : nil, isDiskImage: image,
+                                 isNetwork: network, isSupportedLocal: supported)
         }
     }
 }

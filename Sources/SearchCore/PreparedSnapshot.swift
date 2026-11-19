@@ -57,7 +57,7 @@ extension SearchIndex {
         let hot = header.starts(with: hotMagic)
         guard hot || header.starts(with: "M1INDEX1".utf8) else { throw SnapshotError.invalid }
         let rows = Int(field(hot ? 8 : 12, UInt32.self))
-        guard rows <= 20_000_000 else { throw SnapshotError.invalid }
+        guard rows <= maximumSnapshotRecords else { throw SnapshotError.invalid }
         let size = try file.seekToEnd()
         let attributeOffset = 64 + rows * MemoryLayout<DMRecord>.stride
         guard UInt64(attributeOffset + rows) <= size else { throw SnapshotError.invalid }
@@ -68,7 +68,7 @@ extension SearchIndex {
         if hot {
             let version = field(28, UInt32.self)
             let metadataBytes = Int(field(24, UInt32.self))
-            guard (version == 1 || version == 2), metadataBytes <= 64_000_000,
+            guard (version == 1 || version == 2), metadataBytes <= maximumPreparedMetadataBytes,
                   metadataBytes > 0, UInt64(metadataBytes) <= size - UInt64(attributeOffset + rows)
             else { throw SnapshotError.invalid }
             let metadataOffset = 64 + rows * (version == 1 ? 45 : 33) + Int(field(20, UInt32.self)) * 4 +
@@ -118,6 +118,9 @@ extension SearchIndex {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let metadata = try encoder.encode(SnapshotMetadata(volumes: volumes, tracking: tracking))
+        try Self.checkSnapshotCapacity(records: recordCount, names: names.count,
+                                       metadata: metadata.count, metadataLimit: Self.maximumPreparedMetadataBytes)
+        guard tables.keyBytes.count <= Self.maximumSnapshotNameBytes else { throw SnapshotError.limitExceeded }
         let fields = [records.count, names.count, tables.keyBytes.count, tables.changedRows.count, metadata.count]
         guard fields.allSatisfy({ $0 <= Int(UInt32.max) }) else { throw SnapshotError.invalid }
         var header = Data(Self.hotMagic)
@@ -210,8 +213,8 @@ extension SearchIndex {
         let version = fields[5]
         guard version == 1 || version == 2 else { throw SnapshotError.unsupportedVersion }
         let rowBytes = version == 1 ? 45 : 33
-        guard n <= 20_000_000, changedCount <= n, nameCount <= 512_000_000,
-              foldedCount <= 512_000_000, metaCount <= 64_000_000,
+        guard n <= maximumSnapshotRecords, changedCount <= n, nameCount <= maximumSnapshotNameBytes,
+              foldedCount <= maximumSnapshotNameBytes, metaCount <= maximumPreparedMetadataBytes,
               st.st_size == Int64(64 + n * rowBytes + changedCount * 4 + nameCount + foldedCount + metaCount)
         else { throw SnapshotError.invalid }
 

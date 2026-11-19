@@ -35,20 +35,7 @@ struct CloudRoots {
 
     func isScanBoundary(_ path: String) -> Bool { path == storage || path == iCloud }
 
-    static func matchesProviderRoot(_ path: String) -> Bool {
-        let logical = path.hasPrefix(dataRoot + "/") ? path.dropFirst(dataRoot.count) : path[...]
-        if logical.hasSuffix("/Library/Mobile Documents/com~apple~CloudDocs") { return true }
-        guard logical.contains("/Library/CloudStorage/") else { return false }
-        let components = logical.split(separator: "/")
-        guard components.count > 3, components.suffix(3).first == "Library",
-              components.dropLast().last == "CloudStorage" else { return false }
-        return !components.last!.hasPrefix(".")
-    }
 
-    func isTrash(_ path: String) -> Bool {
-        guard let provider = provider(containing: path) else { return false }
-        return inside(path, joinedPath(provider, ".Trash"))
-    }
 }
 
 public struct CloudCompletionStatus: Codable, Sendable {
@@ -136,7 +123,7 @@ final class CloudCompletion {
     }
 
     func enqueue(_ path: String, inherited: UInt8) {
-        guard !closed, let provider = roots.provider(containing: path), !roots.isTrash(path) else { return }
+        guard !closed, let provider = roots.provider(containing: path) else { return }
         if jobs[path] == nil {
             jobs[path] = Job(inherited: inherited)
             providerJobs[provider, default: 0] += 1
@@ -147,7 +134,7 @@ final class CloudCompletion {
     func replacePending(_ pending: [String: UInt8]) {
         if call != nil { call?.valid = false }
         jobs = jobs.filter { pending[$0.key] != nil }
-        for (path, attributes) in pending where jobs[path] == nil && !roots.isTrash(path) {
+        for (path, attributes) in pending where jobs[path] == nil {
             jobs[path] = Job(inherited: attributes)
         }
         recountProviders()

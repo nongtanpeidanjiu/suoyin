@@ -151,7 +151,6 @@ struct WalkScope {
     let dataDevice: dev_t
     let mirrors: Set<String>
     let clouds: CloudRoots
-    let privateScratch: Set<String>
     let homeLibrary: String
     let homeCaches: String
     let wholeDisk: Bool
@@ -174,8 +173,6 @@ struct WalkScope {
         self.clouds = clouds ?? CloudRoots(home: wholeDisk ? home : nil)
         homeLibrary = home + "/Library"
         homeCaches = homeLibrary + "/Caches"
-        let cwd = FileManager.default.currentDirectoryPath
-        privateScratch = [cwd + "/.m1-tmp"]
     }
 
     static func device(_ path: String) throws -> dev_t {
@@ -202,38 +199,7 @@ struct WalkScope {
         return false
     }
 
-    func backgroundDirectory(_ path: String) -> Bool {
-        let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
-        if inside(logical, homeLibrary) && clouds.provider(containing: logical) == nil && logical != clouds.storage { return true }
-        // An explicitly indexed fixture or external root is the reference point
-        // for visibility. Only directories inside it affect that view.
-        let visiblePrefix = wholeDisk && inside(logical, "/usr/local") ? "/usr/local" : ""
-        let relative = wholeDisk ? logical.dropFirst(visiblePrefix.count) : path.dropFirst(root.count)
-        var prefix = visiblePrefix
-        let components = relative.split(separator: "/")
-        for (index, component) in components.enumerated() {
-            prefix += "/" + component
-            let insidePackage = index < components.count - 1 && Self.packageSuffixes.contains { component.hasSuffix($0) }
-            if component.hasPrefix(".") || insidePackage ||
-                wholeDisk && defaultHiddenDirectory(prefix) { return true }
-        }
-        return false
-    }
 
-    func providerTrashParent(_ path: String) -> Bool {
-        clouds.provider(containing: path) == path || wholeDisk && CloudRoots.matchesProviderRoot(path)
-    }
-
-    func insideProviderTrash(_ path: String) -> Bool {
-        var suffix = path[...]
-        while let range = suffix.range(of: "/.Trash") {
-            let end = range.upperBound
-            if (end == path.endIndex || path[end] == "/"),
-               providerTrashParent(String(path[..<range.lowerBound])) { return true }
-            suffix = path[end...]
-        }
-        return false
-    }
 }
 
 private let directoryReadSlots = DispatchSemaphore(value: 4)
@@ -462,10 +428,9 @@ private final class ScanSession {
         counts.fallback += delta.fallback
         if delta.directory_error != 0 || batch.unidentifiedDenial { restrictions[job.path] = delta.directory_error }
         if !batch.denied.isEmpty {
-            let isProvider = scope.providerTrashParent(job.path)
             for (name, error) in batch.denied {
                 let child = joinedPath(job.path, name)
-                if !excludedPaths.contains(child), !scope.mirrors.contains(child), !(isProvider && name == ".Trash") {
+                if !excludedPaths.contains(child), !scope.mirrors.contains(child) {
                     restrictions[child] = error
                 }
             }
@@ -516,7 +481,6 @@ private final class ScanSession {
         let parentHidden = index.attributes[Int(job.parent)] & Kind.hidden
         let platformParent = job.path.hasPrefix(dataRoot + "/")
             ? String(job.path.dropFirst(dataRoot.count)) : job.path
-        let parentIsTrashRoot = scope.providerTrashParent(platformParent)
         let parentIsPackage = WalkScope.packageSuffixes.contains { job.path.hasSuffix($0) }
         let parentPrefix = job.path == "/" ? "/" : job.path + "/"
         let includeFiles = dataTargets.isEmpty || dataTargets.contains { inside(job.path, $0) }
@@ -524,7 +488,6 @@ private final class ScanSession {
             for item in batch.items {
                 let name = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: item.start), count: item.length)
                 let isDirectory = item.type == 2
-                if parentIsTrashRoot && name.elementsEqual(".Trash".utf8) { continue }
                 var attribute: UInt8 = isDirectory ? Kind.directory : item.type == 1 ? Kind.file : Kind.other
                 attribute |= parentHidden
                 if name.first == 46 || item.flags & 0x8000 != 0 || parentIsPackage { attribute |= Kind.hidden }
@@ -541,7 +504,7 @@ private final class ScanSession {
                 let component = String(decoding: name, as: UTF8.self)
                 let path = parentPrefix + component
                 if excludedPaths.contains(path) || scope.wholeDisk &&
-                    (path == dataRoot || scope.mirrors.contains(path) || scope.privateScratch.contains(path)) {
+                    (path == dataRoot || scope.mirrors.contains(path)) {
                     continue
                 }
                 if !dataTargets.isEmpty && !includeFiles &&
@@ -697,10 +660,19 @@ extension WalkScope {
         return nil
     }
 
+    /// Older snapshots omitted provider trash. Probe metadata before asking
+    /// for a listing, and never walk through an unloaded provider.
+    func hasCloudTrashMetadata(_ provider: String) -> Bool {
+        guard cloudDataless(at: provider) == false else { return false }
+        var info = stat()
+        if Self.metadata(joinedPath(provider, ".Trash"), &info) == 0 { return true }
+        return errno == EACCES || errno == EPERM
+    }
+
     /// Observe one directory. A denied read is distinct from an empty directory.
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String],
                  loadCloud: Bool = false) throws -> DirectoryObservation {
-        guard !insideProviderTrash(path), !excluded.contains(where: { inside(path, $0) }) else { return .absent }
+        guard !excluded.contains(where: { inside(path, $0) }) else { return .absent }
         onAccess?(path)
         if let provider = clouds.provider(containing: path) {
             // Avoid walking through an unloaded ancestor to inspect its child.
@@ -754,7 +726,6 @@ extension WalkScope {
         let logical = path.hasPrefix(dataRoot + "/") ? String(path.dropFirst(dataRoot.count)) : path
         let excludedChildren = Set(excluded.filter { parentPath($0) == path }.map(leafName))
         let mirroredChildren = Set(mirrors.filter { parentPath($0) == path }.map(leafName))
-        let providerTrash = providerTrashParent(logical)
         let containsDataRoot = wholeDisk && path == parentPath(dataRoot)
         let dataName = leafName(dataRoot)
         let mayHideSystemChild = logical == "/" || logical == "/Library" || logical == "/private" ||
@@ -764,8 +735,7 @@ extension WalkScope {
                 let bytes = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: item.start), count: item.length)
                 let name = String(decoding: bytes, as: UTF8.self)
                 if excludedChildren.contains(name) || mirroredChildren.contains(name) ||
-                    containsDataRoot && name == dataName ||
-                    providerTrash && name == ".Trash" { continue }
+                    containsDataRoot && name == dataName { continue }
                 var flags: UInt8 = item.type == 2 ? Kind.directory : item.type == 1 ? Kind.file : Kind.other
                 if inherited & Kind.hidden != 0 || name.hasPrefix(".") || item.flags & 0x8000 != 0 ||
                     package || mayHideSystemChild && defaultHiddenDirectory(joinedPath(logical, name)) { flags |= Kind.hidden }
@@ -783,7 +753,7 @@ extension WalkScope {
         return .readable(own: TrackedEntry(size: own.st_size, modified: time, attribute: ownFlags),
                          children: children, denied: batch.denied.filter {
             !excludedChildren.contains($0.key) && !mirroredChildren.contains($0.key) &&
-                !(containsDataRoot && $0.key == dataName) && !(providerTrash && $0.key == ".Trash")
+                !(containsDataRoot && $0.key == dataName)
         })
     }
 

@@ -12,7 +12,7 @@ struct CoreTests {
         index.append("公司路径-2026.pdf", parent: folder, size: 15, modified: 7)
         index.append("Cafe\u{301}.txt", parent: root, size: 1, modified: 6)
         index.append(".hidden.txt", parent: root, size: 40, modified: 4, attribute: Kind.file | Kind.hidden)
-        index.append(".Trash", parent: root, attribute: Kind.directory | Kind.excluded)
+        index.append(".excluded-fixture", parent: root, attribute: Kind.directory | Kind.excluded)
         return index
     }
 
@@ -24,7 +24,7 @@ struct CoreTests {
         #expect(index.search("quality").isEmpty)
         #expect(index.search("hidden").isEmpty)
         #expect(index.search("hidden", showAll: true).count == 1)
-        #expect(index.search(".Trash", showAll: true).isEmpty)
+        #expect(index.search("excluded-fixture", showAll: true).isEmpty)
     }
 
     @Test func allPathWordsMustMatchContinuously() {
@@ -293,6 +293,25 @@ struct CoreTests {
             #expect(recovered.search("质量 2026", mode: .path).count == 2)
             #expect(try SearchIndex.load(from: file.path).search("") == source.search(""))
         }
+    }
+
+    @Test func snapshotWriterRejectsLimitsBeforeReplacingAValidFile() throws {
+        let maximum = SearchIndex.maximumSnapshotRecords
+        try SearchIndex.checkSnapshotCapacity(records: maximum, names: 1, metadata: 1, metadataLimit: 1)
+        #expect(throws: SnapshotError.limitExceeded) {
+            try SearchIndex.checkSnapshotCapacity(records: maximum + 1, names: 1, metadata: 1, metadataLimit: 1)
+        }
+        let folder = try scratch()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("index.snapshot")
+        var source = fixture()
+        try source.save(to: file.path)
+        let before = try Data(contentsOf: file)
+        source.volumes = [VolumeCheckpoint(root: String(repeating: "x", count: SearchIndex.maximumLegacyMetadataBytes),
+                                           volumeUUID: nil, eventLogUUID: nil, mountedDevice: nil,
+                                           readOnly: false, appliedEvent: 1)]
+        #expect(throws: SnapshotError.limitExceeded) { try source.save(to: file.path) }
+        #expect(try Data(contentsOf: file) == before)
     }
 
     @Test func bulkAndOrdinaryReadSameMetadataAndDoNotFollowLinks() throws {

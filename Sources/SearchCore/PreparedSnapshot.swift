@@ -172,13 +172,14 @@ extension SearchIndex {
         }
         guard lseek(fd, 32, SEEK_SET) == 32 else { throw SnapshotError.filesystem(errno) }
         try Array(hash.finalize()).withUnsafeBytes { try write($0) }
-        guard fsync(fd) == 0 else { throw SnapshotError.filesystem(errno) }
+        try syncIndexFile(fd)
         let closed = Darwin.close(fd)
         open = false
         guard closed == 0 else { throw SnapshotError.filesystem(errno) }
         try beforeReplace?()
         guard rename(temporary, path) == 0 else { throw SnapshotError.filesystem(errno) }
         committed = true
+        try syncIndexDirectory(containing: path)
     }
 
     // Read into final arrays directly. Avoid a second full resident mmap on warm startup.

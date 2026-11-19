@@ -240,4 +240,8 @@ struct EventCursor {
         }
         pendingHistory = nil
     }
+
+    mutating func confirmHistory(through boundary: UInt64) {
+        if historyDelivered, let applied { lag.confirmHistory(through: min(applied, boundary)) }
+    }
 }

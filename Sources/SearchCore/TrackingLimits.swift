@@ -42,7 +42,7 @@ struct ReplayLag {
     mutating func record(_ event: UInt64, at time: UInt64) {
         let cut = time >= Self.margin ? time - Self.margin : nil
         while let cut, let first = points.first, first.time <= cut {
-            baseline = points.removeFirst().event
+            baseline = max(baseline ?? 0, points.removeFirst().event)
         }
         if let last = points.last, last.time / Self.second == time / Self.second {
             points.removeLast()
@@ -50,11 +50,14 @@ struct ReplayLag {
         points.append((time, event))
     }
 
+    mutating func confirmHistory(through event: UInt64) { baseline = max(baseline ?? 0, event) }
+
     func position(at time: UInt64, observed: UInt64?, pending: UInt64?) -> UInt64? {
         guard let observed else { return nil }
         let aged = time >= Self.margin
             ? points.last(where: { $0.time <= time - Self.margin })?.event : nil
-        guard let safe = aged ?? baseline else { return nil }
+        guard aged != nil || baseline != nil else { return nil }
+        let safe = max(aged ?? 0, baseline ?? 0)
         let limit = min(observed, safe, pending.map { $0 > 0 ? $0 - 1 : 0 } ?? .max)
         return limit == 0 ? nil : limit
     }

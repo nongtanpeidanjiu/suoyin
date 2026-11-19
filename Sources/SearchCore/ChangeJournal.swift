@@ -93,6 +93,8 @@ struct JournalImage {
 /// 32-byte base digest. Frame: little-endian UInt32 length, 32-byte SHA-256
 /// over the length and payload, then the payload. Integers have fixed widths.
 struct ChangeJournal {
+    enum CapacityError: Error { case requiresNewBase }
+
     private static let magic = Data("M2DELTA1".utf8)
     private static let version: UInt32 = 1
     private static let maxFrame = 32 * 1024 * 1024
@@ -128,16 +130,13 @@ struct ChangeJournal {
         // Bound allocations even when an externally damaged journal advertises a huge size.
         guard info.st_size <= Self.maxFile else { repair = "invalid-size"; return }
         let file = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        let bytes = try file.readToEnd() ?? Data()
-        guard bytes.starts(with: header) else { repair = "identity-or-version"; return }
+        guard try file.read(upToCount: Self.headerBytes) == header else { repair = "identity-or-version"; return }
         length = Self.headerBytes
         repair = "valid"
         let volumeRoots = Set(index.volumes.map(\.root))
-        while length < bytes.count {
-            var reader = JournalReader(bytes: bytes, cursor: length)
-            guard let size = reader.read(UInt32.self), size <= Self.maxFrame,
-                  let digest = reader.take(32), let payload = reader.take(Int(size)),
-                  digest == Self.digest(size, payload),
+        while length < info.st_size {
+            guard let fields = try file.read(upToCount: 36), fields.count == 36,
+                  let payload = try Self.readPayload(fields, from: file),
                   let frame = Self.decode(payload, rows: index.recordCount, root: root, volumes: volumeRoots)
             else {
                 repair = "discarded-suffix"
@@ -150,7 +149,7 @@ struct ChangeJournal {
             }
             frame.apply(to: &index, root: root)
             restoredFrames += 1
-            length = reader.cursor
+            length += 36 + payload.count
         }
     }
 
@@ -168,9 +167,7 @@ struct ChangeJournal {
         guard try file.read(upToCount: Self.headerBytes) == header else { return }
         let roots = Set(volumes.map(\.root))
         while let fields = try file.read(upToCount: 36), fields.count == 36 {
-            let size = fields.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
-            guard size <= Self.maxFrame, let payload = try file.read(upToCount: Int(size)),
-                  payload.count == Int(size), fields.dropFirst(4) == Self.digest(size, payload),
+            guard let payload = try Self.readPayload(fields, from: file),
                   let frame = Self.decode(payload, rows: attributes.count, root: root, volumes: roots) else { break }
             for (id, hidden) in frame.masks {
                 if hidden { attributes[Int(id)] |= Kind.suppressed }
@@ -179,6 +176,13 @@ struct ChangeJournal {
             if tracking == nil { tracking = TrackingState(root: root, changes: [:], restricted: []) }
             for row in frame.rows { tracking?.changes[row.path] = row.value }
         }
+    }
+
+    private static func readPayload(_ fields: Data, from file: FileHandle) throws -> Data? {
+        let size = fields.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+        guard size <= maxFrame, let payload = try file.read(upToCount: Int(size)), payload.count == Int(size),
+              fields.dropFirst(4) == digest(size, payload) else { return nil }
+        return payload
     }
 
     /// A new identity replaces any old journal atomically. A crash between
@@ -192,14 +196,18 @@ struct ChangeJournal {
             _ = Darwin.unlink(temporary)
         }
         try Self.write(header, to: fd)
+        try syncIndexFile(fd)
         guard rename(temporary, path) == 0 else { throw SnapshotError.filesystem(errno) }
+        try syncIndexDirectory(containing: path)
         length = Self.headerBytes
         return length
     }
 
-    mutating func append(_ frame: JournalFrame, sync: Bool = true) throws -> Int {
+    mutating func append(_ frame: JournalFrame, sync: Bool = true, limit: Int? = nil) throws -> Int {
         let payload = Self.encode(frame)
-        guard payload.count <= Self.maxFrame else { throw SnapshotError.invalid }
+        guard payload.count <= Self.maxFrame,
+              max(length, Self.headerBytes) + 36 + payload.count <= min(limit ?? Self.maxFile, Self.maxFile)
+        else { throw CapacityError.requiresNewBase }
         let size = UInt32(payload.count)
         var bytes = Data()
         bytes.put(size)
@@ -210,11 +218,7 @@ struct ChangeJournal {
         guard fd >= 0 else { throw SnapshotError.filesystem(errno) }
         defer { _ = Darwin.close(fd) }
         try Self.write(bytes, to: fd)
-        if sync {
-            while fsync(fd) != 0 {
-                guard errno == EINTR else { throw SnapshotError.filesystem(errno) }
-            }
-        }
+        if sync { try syncIndexFile(fd) }
         length += bytes.count
         return initialization + bytes.count
     }

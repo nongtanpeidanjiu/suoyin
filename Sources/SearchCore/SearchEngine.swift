@@ -110,11 +110,23 @@ public struct EngineStatus: Sendable {
     public let inaccessibleLocationsVerified: Bool
     public let pendingFullDiskAccessPaths: [String]
     public let indexBytesOnDisk: Int64
+    public let startup: EngineStartupMetrics?
 
     public var inaccessibleLocationCount: Int { rawInaccessibleLocations.count }
     public var pendingFullDiskAccessCount: Int { pendingFullDiskAccessPaths.count }
     public var awaitingFullDiskAccess: Bool { !pendingFullDiskAccessPaths.isEmpty }
     public var inaccessiblePaths: [String] { inaccessibleLocations.map(\.path) }
+}
+
+public struct EngineStartupMetrics: Sendable, Equatable {
+    public let historyEvents: UInt64
+    public let catchUpNanoseconds: UInt64?
+    public let recoveryReason: String?
+}
+
+public enum EngineStopResult: Sendable, Equatable {
+    case finished, deadlineExceeded
+    case failed(EngineFailure)
 }
 
 public struct EngineVolume: Sendable, Equatable {
@@ -231,7 +243,7 @@ public final class SearchEngine: @unchecked Sendable {
                                 sources: [], inaccessibleLocations: [],
                                 rawInaccessibleLocations: [], inaccessibleLocationsVerified: false,
                                 pendingFullDiskAccessPaths: [],
-                                indexBytesOnDisk: Self.diskBytes(directory))
+                                indexBytesOnDisk: Self.diskBytes(directory), startup: nil)
         tracker.observeEngineChanges { [weak self] in self?.scheduleRefresh(for: $0) }
     }
 
@@ -300,18 +312,27 @@ public final class SearchEngine: @unchecked Sendable {
         }
     }
 
-    public func stop() {
-        let outcome: Result<Void, Error>? = lifecycle.withLock {
-            guard started, !stopped else { return nil }
+    /// Stops listening and saves the published changes that fit within the
+    /// shutdown deadline. A caller which sees a timeout may exit immediately.
+    @discardableResult
+    public func stop() -> EngineStopResult {
+        let running = lifecycle.withLock {
+            guard started else { return false }
             stopped = true
-            return Result { try tracker.stop() }
+            return true
         }
-        guard let outcome else { return }
-        if case let .failure(error) = outcome {
-            tracker.recordEngineFailure(error)
+        guard running else { return .finished }
+        do {
+            try tracker.stop()
+        } catch TrackerShutdownError.deadlineExceeded { return .deadlineExceeded }
+        catch {
+            let failure = EngineFailure(error, fallback: .dataDirectoryUnavailable, dataDirectory: directory.path)
+            tracker.recordEngineFailure(failure)
+            scheduleRefresh(for: .disk)
+            return .failed(failure)
         }
-        // Also cover a failed write that left an older durable snapshot in place.
         scheduleRefresh(for: .disk)
+        return .finished
     }
 
     public func search(_ query: EngineQuery) -> EngineResult {
@@ -440,7 +461,10 @@ public final class SearchEngine: @unchecked Sendable {
                                    sources: sources, inaccessibleLocations: restrictions,
                                    rawInaccessibleLocations: raw, inaccessibleLocationsVerified: verified,
                                    pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
-                                   indexBytesOnDisk: bytes)
+                                   indexBytesOnDisk: bytes, startup: local.startupHistoryEvents.map {
+            EngineStartupMetrics(historyEvents: $0, catchUpNanoseconds: local.startupCatchUpNanoseconds,
+                                 recoveryReason: local.startupRecoveryReason)
+        })
         let (indexCallback, volumeCallback) = lock.withLock {
             reported = updated
             let changed = volumeRemoved || volumes != reportedVolumes || unindexedVolumes != reportedUnindexedVolumes ||
@@ -455,7 +479,7 @@ public final class SearchEngine: @unchecked Sendable {
         if phase != previous.phase || count != previous.indexedCount || sources != previous.sources ||
             verified != previous.inaccessibleLocationsVerified ||
             coverageChanged || updated.pendingFullDiskAccessPaths != previous.pendingFullDiskAccessPaths ||
-            bytes != previous.indexBytesOnDisk {
+            bytes != previous.indexBytesOnDisk || updated.startup != previous.startup {
             scheduleStatusDelivery()
         }
         if index, let indexCallback {

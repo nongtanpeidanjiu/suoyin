@@ -24,7 +24,7 @@ enum DirectoryObservation {
     case readable(own: TrackedEntry, children: [String: TrackedEntry])
     case absent
     case restricted
-    case pending
+    case pending(dataless: Bool)
     case deferred
 }
 
@@ -97,6 +97,9 @@ struct LiveIndex {
     private var overlays = [SearchIndex](repeating: SearchIndex(), count: partitionCount)
     private var changedChildren: [String: Set<String>] = [:]
     private var dirtyPartitions: Set<Int> = []
+    private var baseEntryCount = 0
+    private var overlayEntryCounts = [Int](repeating: 0, count: partitionCount)
+    private(set) var rowRevision: UInt64 = 0
     var state: TrackingState
     private var directories: [String: UInt32] = [:]
     private let links: DirectoryLinks?
@@ -105,10 +108,13 @@ struct LiveIndex {
         self.base = base
         state = base.tracking ?? TrackingState(root: root, changes: [:], restricted: [])
         self.base.tracking = nil
-        if base.tracking != nil {
-            for i in base.attributes.indices where base.attributes[i] & Kind.suppressed != 0 {
+        for i in base.attributes.indices {
+            let flags = base.attributes[i]
+            if base.tracking != nil && flags & Kind.suppressed != 0 {
                 self.base.attributes[i] &= ~Kind.suppressed
                 self.base.setSuppressed(i, true)
+            } else if base.visible(flags, true) && !base.isSuppressed(i) {
+                baseEntryCount += 1
             }
         }
         links = linkChildren ? DirectoryLinks(base) : nil
@@ -127,6 +133,7 @@ struct LiveIndex {
 
     private mutating func change(_ value: TrackedEntry?, at path: String) {
         guard state.changes[path] != value else { return }
+        rowRevision &+= 1
         let parent = parentPath(path)
         state.changes[path] = value
         if value == nil {
@@ -156,6 +163,7 @@ struct LiveIndex {
                 }
             }
             index.prepare()
+            overlayEntryCounts[shard] = index.visibleEntryCount
             overlays[shard] = index
         }
         dirtyPartitions.removeAll()
@@ -254,7 +262,7 @@ struct LiveIndex {
             case .readable:
                 if state.restricted.contains(path) { reopened.append(path) }
             case .absent: _ = reconcile(path: path, observed: .absent)
-            case .pending: _ = reconcile(path: path, observed: .pending)
+            case .pending(let dataless): _ = reconcile(path: path, observed: .pending(dataless: dataless))
             case .deferred, .restricted, nil: _ = reconcile(path: path, observed: .restricted)
             }
         }
@@ -349,8 +357,18 @@ struct LiveIndex {
         return baseEntry(id)
     }
 
+    func isRestricted(_ path: String, includingSelf: Bool = true) -> Bool {
+        guard !state.restricted.isEmpty, includingSelf || path != "/" else { return false }
+        var ancestor = includingSelf ? path : parentPath(path)
+        while true {
+            if state.restricted.contains(ancestor) { return true }
+            if ancestor == "/" { return false }
+            ancestor = parentPath(ancestor)
+        }
+    }
+
     mutating func refreshFile(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
-        guard !state.restricted.contains(where: { inside(path, $0) }) else { return false }
+        guard !isRestricted(path) else { return false }
         let parent = parentPath(path)
         let folder = entry(at: parent)
         guard folder?.directory == true || parent == state.root else { return false }
@@ -367,7 +385,7 @@ struct LiveIndex {
     }
 
     mutating func refreshDirectory(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
-        guard !state.restricted.contains(where: { inside(path, $0) }) else { return false }
+        guard !isRestricted(path) else { return false }
         if path == state.root {
             guard case .entry(let found) = observation(Kind.directory) else { return false }
             return found.directory
@@ -376,7 +394,8 @@ struct LiveIndex {
               case .entry(let found) = observation(former.attribute), found.directory,
               (former.attribute ^ found.attribute) & Kind.pending == 0
         else { return false }
-        let latest = TrackedEntry(size: found.size, modified: found.modified, attribute: former.attribute)
+        let flags = (former.attribute & ~Kind.dataless) | (found.attribute & Kind.dataless)
+        let latest = TrackedEntry(size: found.size, modified: found.modified, attribute: flags)
         if latest != former { set(latest, path: path, original: baseID(at: path)) }
         return true
     }
@@ -387,22 +406,31 @@ struct LiveIndex {
             return
         }
         if value == baseEntry(original) {
-            base.setSuppressed(Int(original), false)
+            suppressBase(Int(original), false)
             change(nil, at: path)
         } else {
-            base.setSuppressed(Int(original), true)
+            suppressBase(Int(original), true)
             change(value, at: path)
+        }
+    }
+
+    private mutating func suppressBase(_ id: Int, _ suppress: Bool) {
+        guard base.isSuppressed(id) != suppress else { return }
+        base.setSuppressed(id, suppress)
+        if base.visible(base.attributes[id], true) {
+            baseEntryCount += suppress ? -1 : 1
+            rowRevision &+= 1
         }
     }
 
     mutating func removeSubtree(_ path: String, includingRoot: Bool) {
         if let root = directoryID(path) {
-            if includingRoot { base.setSuppressed(Int(root), true) }
+            if includingRoot { suppressBase(Int(root), true) }
             if let links {
                 var parents = [root]
                 while let parent = parents.popLast() {
                     links.forEachChild(parent) { id in
-                        base.setSuppressed(Int(id), true)
+                        suppressBase(Int(id), true)
                         if links.head(id) != .max { parents.append(id) }
                     }
                 }
@@ -433,6 +461,17 @@ struct LiveIndex {
         return pending
     }
 
+    // Older archives used the same bit for both kinds of pending directory.
+    // Only those candidates need a fresh metadata observation before publication.
+    mutating func refreshLegacyCloudFlags(_ pending: [String: UInt8], probe: (String) -> Bool?) {
+        for (path, flags) in pending where flags & Kind.dataless == 0 {
+            if probe(path) == true {
+                _ = reconcile(path: path, observed: .pending(dataless: true))
+            }
+        }
+        prepareDelta()
+    }
+
     mutating func purgeProviderTrash(in roots: CloudRoots) {
         var providers = roots.iCloud.map { [$0] } ?? []
         if let storage = roots.storage {
@@ -451,14 +490,17 @@ struct LiveIndex {
 
     /// Return children requiring recursive enumeration because their subtree is new.
     mutating func reconcile(path: String, observed: DirectoryObservation, completingCloud: Bool = false) -> [String] {
-        if state.restricted.contains(where: { $0 != path && inside(path, $0) }) { return [] }
+        if isRestricted(path, includingSelf: false) { return [] }
         switch observed {
         case .deferred:
             return []
-        case .pending:
-            if let former = entry(at: path), former.directory, former.attribute & Kind.pending == 0 {
-                set(TrackedEntry(size: former.size, modified: former.modified, attribute: former.attribute | Kind.pending),
-                    path: path, original: baseID(at: path))
+        case .pending(let dataless):
+            if let former = entry(at: path), former.directory {
+                let bits = former.attribute | Kind.pending | (dataless ? Kind.dataless : 0)
+                if bits != former.attribute {
+                    set(TrackedEntry(size: former.size, modified: former.modified, attribute: bits),
+                        path: path, original: baseID(at: path))
+                }
             }
             return []
         case .restricted:
@@ -475,8 +517,9 @@ struct LiveIndex {
         case let .readable(own, children):
             let needsRestore = state.restricted.remove(path) != nil
             if path != state.root, let existing = entry(at: path) {
-                let owned = TrackedEntry(size: own.size, modified: own.modified,
-                                         attribute: completingCloud ? existing.attribute & ~Kind.pending : existing.attribute)
+                var flags = (existing.attribute & ~Kind.dataless) | (own.attribute & Kind.dataless)
+                if completingCloud { flags &= ~Kind.pending }
+                let owned = TrackedEntry(size: own.size, modified: own.modified, attribute: flags)
                 let id = baseID(at: path)
                 if owned != existing { set(owned, path: path, original: id) }
             }
@@ -518,7 +561,8 @@ struct LiveIndex {
     }
 
     func readView() -> LiveSearchView {
-        LiveSearchView(base: base, overlays: state.changes.isEmpty ? [] : overlays)
+        LiveSearchView(base: base, overlays: state.changes.isEmpty ? [] : overlays,
+                       entryCount: baseEntryCount + overlayEntryCounts.reduce(0, +))
     }
 
     func memoryBreakdown() -> [String: Int] {
@@ -544,8 +588,7 @@ struct LiveIndex {
 struct LiveSearchView {
     let base: SearchIndex
     let overlays: [SearchIndex]
-
-    var entryCount: Int { base.visibleEntryCount + overlays.reduce(0) { $0 + $1.visibleEntryCount } }
+    let entryCount: Int
 
     func search(_ query: String, mode: QueryMode, column: SearchColumn, direction: SearchDirection,
                 showAll: Bool, offset: Int, limit: Int) -> [SearchRow] {
@@ -562,7 +605,7 @@ struct LiveSearchView {
             let changed = overlay.search(query, mode: mode, column: column, direction: direction,
                                          showAll: showAll, limit: capacity).map { item in
                 SearchRow(id: item.id | mask, name: item.name, path: item.path,
-                          size: item.size, modified: item.modified)
+                          size: item.size, modified: item.modified, attribute: item.attribute)
             }
             if changed.isEmpty { continue }
             var i = 0, j = 0

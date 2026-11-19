@@ -12,14 +12,25 @@ public struct SearchRow: Codable, Equatable, Sendable {
     public let size: Int64
     public let modified: Int64
     public let volumeID: String?
+    var attribute: UInt8 = 0
+    var volumeSlot: UInt32 = 0
 
-    init(id: UInt32, name: String, path: String, size: Int64, modified: Int64, volumeID: String? = nil) {
+    private enum CodingKeys: String, CodingKey { case id, name, path, size, modified, volumeID }
+
+    init(id: UInt32, name: String, path: String, size: Int64, modified: Int64, volumeID: String? = nil,
+         attribute: UInt8 = 0) {
         self.id = id
         self.name = name
         self.path = path
         self.size = size
         self.modified = modified
         self.volumeID = volumeID
+        self.attribute = attribute
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.name == rhs.name && lhs.path == rhs.path &&
+            lhs.size == rhs.size && lhs.modified == rhs.modified && lhs.volumeID == rhs.volumeID
     }
 }
 
@@ -33,6 +44,13 @@ enum Kind {
     static let pending: UInt8 = 8
     static let excluded: UInt8 = 16
     static let suppressed: UInt8 = 32
+    // Directory listing state and SF_DATALESS can change independently.
+    static let dataless: UInt8 = 64
+    static let datalessFlag: UInt32 = 0x40000000
+
+    static func placeholderBits(for attribute: UInt8) -> UInt8 {
+        attribute & mask == directory ? pending | dataless : pending
+    }
 }
 
 public struct VolumeCheckpoint: Codable, Sendable, Equatable {
@@ -110,7 +128,8 @@ public struct SearchIndex {
 
     func row(_ id: UInt32) -> SearchRow {
         let record = records[Int(id)]
-        return SearchRow(id: id, name: name(id), path: fullPath(id), size: record.size, modified: record.modified)
+        return SearchRow(id: id, name: name(id), path: fullPath(id), size: record.size, modified: record.modified,
+                         attribute: attributes[Int(id)])
     }
 
     func visible(_ attribute: UInt8, _ showAll: Bool) -> Bool {

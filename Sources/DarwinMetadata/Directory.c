@@ -21,6 +21,11 @@ static int expected_error(int error, DMCounts *counts) {
     }
 }
 
+static int directory_error(int error, DMCounts *counts) {
+    if (error == EACCES || error == EPERM) counts->directory_denied++;
+    return expected_error(error, counts);
+}
+
 static int64_t timestamp(struct timespec time) {
     int64_t nanos, result;
     if (__builtin_mul_overflow((int64_t)time.tv_sec, (int64_t)1000000000, &nanos) ||
@@ -52,14 +57,14 @@ static int ordinary_list(int fd, DMEntryCallback callback, void *context, DMCoun
     if (!directory) {
         int error = errno;
         close(fd);
-        return expected_error(error, counts);
+        return directory_error(error, counts);
     }
     int error = 0;
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (!entry && errno == EINTR) continue;
-        if (!entry) { error = expected_error(errno, counts); break; }
+        if (!entry) { error = directory_error(errno, counts); break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         error = stat_entry(dirfd(directory), entry->d_name, callback, context, counts);
         if (error) break;
@@ -117,16 +122,16 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
     struct stat st;
     int result;
     do { result = lstat(path, &st); } while (result < 0 && errno == EINTR);
-    if (result < 0) return expected_error(errno, counts);
+    if (result < 0) return directory_error(errno, counts);
     if (!S_ISDIR(st.st_mode)) return expected_error(ENOTDIR, counts);
     if (st.st_dev != device_a && st.st_dev != device_b) { counts->other_mount++; return 0; }
     if (!load_directory && (st.st_flags & SF_DATALESS)) { counts->pending++; return 0; }
 
     int fd;
     do { fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
-    if (fd < 0) return expected_error(errno, counts);
+    if (fd < 0) return directory_error(errno, counts);
     do { result = fstat(fd, &st); } while (result < 0 && errno == EINTR);
-    if (result < 0) { int error = errno; close(fd); return expected_error(error, counts); }
+    if (result < 0) { int error = errno; close(fd); return directory_error(error, counts); }
     if (st.st_dev != device_a && st.st_dev != device_b) { close(fd); counts->other_mount++; return 0; }
     if (!load_directory && (st.st_flags & SF_DATALESS)) { close(fd); counts->pending++; return 0; }
     if (ordinary) return ordinary_list(fd, callback, context, counts);
@@ -150,7 +155,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
                 counts->fallback++;
                 return ordinary_list(fd, callback, context, counts);
             }
-            error = expected_error(code, counts);
+            error = directory_error(code, counts);
             break;
         }
         if (number == 0) break;

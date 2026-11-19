@@ -61,6 +61,7 @@ final class ExternalVolumes {
     struct Active {
         let mount: ExternalMount
         let key: String
+        let slot: UInt32
         let tracker: ChangeTracker
     }
 
@@ -79,6 +80,8 @@ final class ExternalVolumes {
     private var probe = 0
     private static let probeDelays = [250, 500, 1_000, 2_000, 4_000, 8_000]
     private var closed = false
+    private var nextSlot: UInt32 = 1
+    var engineObserver: ((EngineChange) -> Void)?
 
     init(directory: String) {
         self.directory = joinedPath(directory, "external-volumes")
@@ -206,7 +209,9 @@ final class ExternalVolumes {
                                                 ownData: parentPath(directory),
                                                 wallTime: { Date().timeIntervalSince1970 },
                                                 external: mount, externalPersistence: cache != nil)
-                let volume = Active(mount: mount, key: key, tracker: tracker)
+                let volume = Active(mount: mount, key: key, slot: nextSlot, tracker: tracker)
+                nextSlot += 1
+                if let engineObserver { tracker.observeEngineChanges(engineObserver) }
                 lock.withLock {
                     offline = offline.filter { !$0.value.online || $0.value.mount != path }
                     offline.removeValue(forKey: key)
@@ -219,6 +224,7 @@ final class ExternalVolumes {
                         self.refresh(replacing: path)
                     }
                 }
+                engineObserver?(.status)
                 tracker.start()
             } catch {
                 lock.withLock {
@@ -233,9 +239,11 @@ final class ExternalVolumes {
     }
 
     private func retire(_ value: Active, recordOffline: Bool = true) {
+        let hadRows = value.tracker.indexedEntryCount() != 0
         _ = lock.withLock { active.removeValue(forKey: value.mount.identity.mount) }
         let last = recordOffline ? volumeStatus(value, online: false) : nil
         value.tracker.cancelExternalWork()
+        engineObserver?(hadRows ? .index : .status)
         lock.withLock { offline[value.key] = last }
         retiring.insert(value.key)
         retirement.async {

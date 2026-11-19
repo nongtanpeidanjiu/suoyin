@@ -222,6 +222,7 @@ private final class ScanSession {
     var error: Error?
     var counts = DMCounts()
     var pending = 0
+    var restricted = Set<String>()
     var entries = 0
     var local = true
     var nextPublication = 2_048
@@ -290,8 +291,10 @@ private final class ScanSession {
             counts.other_mount += delta.other_mount
             counts.pending += delta.pending
             counts.fallback += delta.fallback
+            if delta.directory_denied != 0 { restricted.insert(job.path) }
             if (code != 0 || delta.pending != 0), scope.clouds.provider(containing: job.path) != nil {
                 index.attributes[Int(job.parent)] |= Kind.pending
+                if delta.pending != 0 { index.attributes[Int(job.parent)] |= Kind.dataless }
                 if delta.pending == 0 { pending += 1 }
             } else if code != 0 {
                 if error == nil { error = ScanError.metadata(path: job.path, error: code) }
@@ -300,7 +303,7 @@ private final class ScanSession {
                 if local && entries >= nextPublication {
                     let phase = nextPublication == 2_048 ? "partial" : "batch"
                     nextPublication = entries + 20_000
-                    do { try publish(mark(phase), index) } catch { self.error = error }
+                    do { try publish(mark(phase), withCoverage()) } catch { self.error = error }
                 }
             }
             workersActive -= 1
@@ -325,8 +328,8 @@ private final class ScanSession {
                 var attribute: UInt8 = isDirectory ? Kind.directory : item.type == 1 ? Kind.file : Kind.other
                 attribute |= parentHidden
                 if name.first == 46 || item.flags & 0x8000 != 0 || parentIsPackage { attribute |= Kind.hidden }
-                let dataless = item.flags & 0x40000000 != 0
-                if dataless { attribute |= Kind.pending }
+                let dataless = item.flags & Kind.datalessFlag != 0
+                if dataless { attribute |= Kind.placeholderBits(for: attribute) }
                 if !isDirectory {
                     if !includeFiles { continue }
                     index.append(bytes: name, parent: job.parent, size: item.size,
@@ -369,6 +372,14 @@ private final class ScanSession {
         walk()
         group.wait()
         if let error { throw error }
+    }
+
+    func withCoverage() -> SearchIndex {
+        var result = index
+        if !restricted.isEmpty {
+            result.tracking = TrackingState(root: scope.root, changes: [:], restricted: restricted)
+        }
+        return result
     }
 }
 
@@ -415,13 +426,14 @@ extension SearchIndex {
         if scope.wholeDisk { session.addRoot(dataRoot) }
         try onProgress(session.mark("scan_start"), session.index)
         try session.run(workers)
-        try onProgress(session.mark("local_complete"), session.index)
+        try onProgress(session.mark("local_complete"), session.withCoverage())
         session.local = false
         session.jobs = session.cloudJobs
         session.cloudJobs = []
         if !session.jobs.isEmpty { try session.run(workers) }
-        try onProgress(session.mark("cloud_complete"), session.index)
-        return session.index
+        let result = session.withCoverage()
+        try onProgress(session.mark("cloud_complete"), result)
+        return result
     }
 }
 
@@ -442,6 +454,20 @@ extension WalkScope {
         ].map { home + $0 }
     }
 
+    func cloudDataless(at path: String) -> Bool? {
+        guard let provider = clouds.provider(containing: path) else { return nil }
+        var ancestors = [path]
+        while ancestors.last! != provider { ancestors.append(parentPath(ancestors.last!)) }
+        for ancestor in ancestors.reversed() {
+            var info = stat()
+            guard Self.metadata(ancestor, &info) == 0 else { return nil }
+            let dataless = info.st_flags & Kind.datalessFlag != 0
+            if ancestor == path { return dataless }
+            if dataless { return nil }
+        }
+        return nil
+    }
+
     /// Observe one directory. A denied read is distinct from an empty directory.
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String],
                  loadCloud: Bool = false) throws -> DirectoryObservation {
@@ -459,8 +485,8 @@ extension WalkScope {
                     if errno == ENOTDIR || errno == ENOENT { return .absent }
                     throw ScanError.metadata(path: ancestor, error: errno)
                 }
-                if checked.st_flags & 0x40000000 != 0 {
-                    if !loadCloud { return ancestor == path ? .pending : .deferred }
+                if checked.st_flags & Kind.datalessFlag != 0 {
+                    if !loadCloud { return ancestor == path ? .pending(dataless: true) : .deferred }
                     if ancestor != path { return .deferred }
                 }
             }
@@ -482,7 +508,7 @@ extension WalkScope {
                 : dm_list(path, primaryDevice, dataDevice, false, collectEntry, context, &counts)
         }
         if error != 0 { throw ScanError.metadata(path: path, error: error) }
-        if counts.pending != 0, clouds.provider(containing: path) != nil { return .pending }
+        if counts.pending != 0, clouds.provider(containing: path) != nil { return .pending(dataless: true) }
         if counts.denied != 0 || counts.pending != 0 || counts.other_mount != 0 { return .restricted }
         if loadCloud && counts.disappeared != 0 { return .deferred }
         if counts.disappeared != 0 && Self.metadata(path, &own) != 0 {
@@ -513,14 +539,16 @@ extension WalkScope {
                     package || mayHideSystemChild && defaultHiddenDirectory(joinedPath(logical, name)) { flags |= Kind.hidden }
                 if flags & Kind.mask == Kind.directory && clouds.isVisibleRoot(joinedPath(logical, name)) ||
                     path == "/usr" && name == "local" { flags &= ~Kind.hidden }
-                if item.flags & 0x40000000 != 0 { flags |= Kind.pending }
+                if item.flags & Kind.datalessFlag != 0 { flags |= Kind.placeholderBits(for: flags) }
                 children[name] = TrackedEntry(size: item.size, modified: item.modified, attribute: flags)
             }
         }
+        if loadCloud, Self.metadata(path, &own) != 0 { return .deferred }
+        let ownFlags = Kind.directory | (own.st_flags & Kind.datalessFlag != 0 ? Kind.dataless : 0)
         let (seconds, overflow) = Int64(own.st_mtimespec.tv_sec).multipliedReportingOverflow(by: 1_000_000_000)
         let (total, addOverflow) = seconds.addingReportingOverflow(Int64(own.st_mtimespec.tv_nsec))
         let time = overflow || addOverflow ? (own.st_mtimespec.tv_sec < 0 ? Int64.min : Int64.max) : total
-        return .readable(own: TrackedEntry(size: own.st_size, modified: time, attribute: Kind.directory),
+        return .readable(own: TrackedEntry(size: own.st_size, modified: time, attribute: ownFlags),
                          children: children)
     }
 
@@ -537,7 +565,7 @@ extension WalkScope {
         if verifyAccess, type == S_IFDIR {
             // An explicit directory event can report an ACL or mode change
             // even though lstat still succeeds. Check coverage without listing it.
-            guard info.st_flags & 0x40000000 == 0, access(path, R_OK | X_OK) == 0 else { return .unverified }
+            guard info.st_flags & Kind.datalessFlag == 0, access(path, R_OK | X_OK) == 0 else { return .unverified }
             let fd = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else { return .unverified }
             _ = Darwin.close(fd)
@@ -550,7 +578,7 @@ extension WalkScope {
             attribute |= Kind.hidden
         }
         if path == "/usr/local" { attribute &= ~Kind.hidden }
-        if info.st_flags & 0x40000000 != 0 { attribute |= Kind.pending }
+        if info.st_flags & Kind.datalessFlag != 0 { attribute |= Kind.placeholderBits(for: attribute) }
         guard let entry = Self.fileEntry(info, attribute: attribute) else { return .unverified }
         return .entry(entry)
     }

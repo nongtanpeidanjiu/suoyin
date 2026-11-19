@@ -12,7 +12,7 @@ typedef struct {
 } DMRecord;
 
 typedef struct {
-    uint32_t denied, disappeared, pending, other_mount, fallback;
+    uint32_t denied, disappeared, pending, other_mount, fallback, directory_denied;
 } DMCounts;
 
 typedef void (*DMEntryCallback)(void *, const uint8_t *, size_t, int64_t, int64_t, uint32_t, uint32_t);

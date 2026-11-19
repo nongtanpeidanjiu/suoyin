@@ -60,6 +60,8 @@ private func run(_ args: [String]) throws {
     switch command {
     case "track":
         try runTrackingCLI(args)
+    case "engine":
+        try runEngineCLI(args)
     case "prepare-cache":
         guard args.count == 3 else { throw CommandError.usage }
         var index = try SearchIndex.load(from: args[1])

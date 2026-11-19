@@ -171,7 +171,7 @@ extension SearchIndex {
                 var attr = type == 0 ? Kind.anchor : type == 2 ? Kind.directory : type == 1 ? Kind.file : Kind.other
                 if parent != .max { attr |= index.attributes[Int(parent)] & (Kind.hidden | Kind.excluded) }
                 if name.first == 46 || flags & 0x8000 != 0 { attr |= Kind.hidden }
-                if flags & 0x40000000 != 0 { attr |= Kind.pending }
+                if flags & Kind.datalessFlag != 0 { attr |= Kind.placeholderBits(for: attr) }
                 if name.elementsEqual(".Trash".utf8), parent != .max,
                    CloudRoots.matchesProviderRoot(index.fullPath(parent)) { attr |= Kind.excluded }
                 let (time, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)

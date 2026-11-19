@@ -70,6 +70,10 @@ private struct EventBatch {
     let events: [VolumeEvent]
 }
 
+enum EngineChange {
+    case status, index, disk
+}
+
 /// Work and persistence are serialized on one queue. Queries capture a value
 /// of the last published view, then run without holding the publication lock.
 public final class ChangeTracker {
@@ -124,6 +128,9 @@ public final class ChangeTracker {
     private var saveTicket: UInt64 = 0
     private var closed = false
     private var observer: ((String) -> Void)?
+    private var engineObserver: ((EngineChange) -> Void)?
+    private var lastCloudProvider: String?
+    private var manualRebuild = false
     private var needsReplay: Set<Int> = []
     private var scanBarriers: [Int: ScanBoundary] = [:]
     private let recoveryTiming: RecoveryTiming
@@ -177,7 +184,15 @@ public final class ChangeTracker {
             })
             queue.changed = { [weak self] value in
                 guard let self else { return }
-                self.lock.withLock { self.status.cloud = value }
+                let changed = self.lock.withLock {
+                    let previous = self.status.cloud
+                    let previousProvider = self.lastCloudProvider
+                    self.status.cloud = value
+                    self.lastCloudProvider = value.pending == 0 ? nil : value.activeProvider ?? self.lastCloudProvider
+                    return (previous.pending == 0) != (value.pending == 0) ||
+                        previousProvider != self.lastCloudProvider
+                }
+                if changed { self.engineObserver?(.status) }
             }
             queue.beforeApply = { [weak self] in self?.drain() }
             queue.apply = { [weak self] path, result in self?.applyCloud(path, result) ?? false }
@@ -195,6 +210,25 @@ public final class ChangeTracker {
         update.async {
             self.observer = onPhase
             do { try self.bootstrap() } catch { self.fail(error) }
+        }
+    }
+
+    // Installed before starting the writer or its mount manager.
+    func observeEngineChanges(_ observer: @escaping (EngineChange) -> Void) {
+        engineObserver = observer
+        mounts?.engineObserver = observer
+    }
+
+    func engineExternalStates() -> [(name: String, status: TrackingStatus)] {
+        (mounts?.searchable() ?? []).map { ($0.mount.name, $0.tracker.snapshotStatus()) }
+    }
+
+    func engineCloudProvider() -> String? { lock.withLock { lastCloudProvider } }
+
+    func recordEngineFailure(_ message: String) {
+        lock.withLock {
+            status.error = message
+            status.phase = "error"
         }
     }
 
@@ -237,6 +271,7 @@ public final class ChangeTracker {
 
     private func note(_ phase: String) {
         lock.withLock { status.phase = phase }
+        engineObserver?(.status)
         observer?(phase)
     }
 
@@ -262,19 +297,23 @@ public final class ChangeTracker {
         for volume in volumes {
             groups.append(volume.tracker.search(query, mode: mode, column: column, direction: direction,
                                                  showAll: showAll, limit: capacity).map {
-                SearchRow(id: $0.id, name: $0.name, path: $0.path,
-                          size: $0.size, modified: $0.modified, volumeID: volume.key)
+                var row = SearchRow(id: $0.id, name: $0.name, path: $0.path,
+                                    size: $0.size, modified: $0.modified, volumeID: volume.key,
+                                    attribute: $0.attribute)
+                row.volumeSlot = volume.slot
+                return row
             })
         }
         let rows = groups.enumerated().flatMap { group, rows in rows.map { (group, $0) } }.sorted { lhs, rhs in
             let order = compareAcross(lhs.1, rhs.1, column: column)
             return order == 0 ? lhs.0 < rhs.0 : (direction == .ascending ? order < 0 : order > 0)
         }
-        return rows.lazy.filter { $0.0 == 0 || self.mounts?.isCurrent(volumes[$0.0 - 1]) == true }
+        let present = [true] + volumes.map { mounts?.isCurrent($0) == true }
+        return rows.lazy.filter { present[$0.0] }
             .dropFirst(offset).prefix(limit).map { $0.1 }
     }
 
-    private func publish(_ updated: LiveIndex, changed: Bool) {
+    private func publish(_ updated: LiveIndex, changed: Bool, engineRowsChanged: Bool = true) {
         current = updated
         let coverage: [String]?
         if publishedCoverage == updated.state.restricted { coverage = nil }
@@ -292,6 +331,8 @@ public final class ChangeTracker {
             status.baseRecords = updated.base.recordCount
             if let coverage { status.coverageRestricted = coverage }
         }
+        if engineRowsChanged { engineObserver?(.index) }
+        else if coverage != nil { engineObserver?(.status) }
     }
 
     private func positions() -> [String: UInt64] {
@@ -381,7 +422,11 @@ public final class ChangeTracker {
             }
             if let cloud {
                 validated.purgeProviderTrash(in: scope.clouds)
-                cloud.replacePending(validated.pendingCloudDirectories(in: scope.clouds))
+                let pending = validated.pendingCloudDirectories(in: scope.clouds)
+                if engineObserver != nil {
+                    validated.refreshLegacyCloudFlags(pending) { scope.cloudDataless(at: $0) }
+                }
+                cloud.replacePending(pending)
             }
             publish(validated, changed: true)
             scheduleSave()
@@ -717,6 +762,7 @@ public final class ChangeTracker {
         let directoriesToVerify = metadata
         if (!work.isEmpty || !files.isEmpty || !metadata.isEmpty), var updated = current {
             current = nil
+            let before = updated.rowRevision
             let start = DispatchTime.now().uptimeNanoseconds
             lock.withLock { status.applying = true; status.lastApplyStart = start }
             do {
@@ -748,7 +794,7 @@ public final class ChangeTracker {
                 try reconcile(work, in: &updated)
                 updated.prepareDelta()
                 acknowledgeReadyEvents()
-                publish(updated, changed: true)
+                publish(updated, changed: true, engineRowsChanged: updated.rowRevision != before)
                 recordDuringCompaction(work)
                 if duringCompaction != nil {
                     for path in files.keys {
@@ -832,7 +878,7 @@ public final class ChangeTracker {
             let inCloud = scope.clouds.provider(containing: folder) != nil
             let observed: DirectoryObservation
             do { observed = try scope.observe(folder, inherited: inherited, excluding: excluded) }
-            catch where inCloud { observed = .pending }
+            catch where inCloud { observed = .pending(dataless: false) }
             var more = index.reconcile(path: folder, observed: observed)
             if inCloud {
                 switch observed {
@@ -880,7 +926,7 @@ public final class ChangeTracker {
     private func applyCloud(_ path: String, _ result: DirectoryObservation) -> Bool {
         guard !closed, !recoveryUnresolved, var revised = current else { return false }
         guard revised.entry(at: path).map({ $0.directory && $0.attribute & Kind.pending != 0 }) == true,
-              !revised.state.restricted.contains(where: { $0 != path && inside(path, $0) }) else {
+              !revised.isRestricted(path, includingSelf: false) else {
             cloud?.discardOnly(path)
             return false
         }
@@ -942,7 +988,8 @@ public final class ChangeTracker {
 
     private func scheduleRecovery() {
         guard !closed, !detached, snapshotStatus().error == nil, !recoveryInProgress, !paused,
-              let deadline = recoveryDeadlines().values.min() else {
+              let deadline = manualRebuild && !pendingRecovery.isEmpty
+                ? DispatchTime.now().uptimeNanoseconds : recoveryDeadlines().values.min() else {
             recoveryTimer?.schedule(deadline: .distantFuture)
             return
         }
@@ -971,9 +1018,11 @@ public final class ChangeTracker {
         drain()
         guard snapshotStatus().error == nil else { return }
         let now = DispatchTime.now().uptimeNanoseconds
-        let due = Set(recoveryDeadlines().filter { $0.value <= now }.keys)
+        let manual = manualRebuild
+        let due = manual ? Set(pendingRecovery.keys) : Set(recoveryDeadlines().filter { $0.value <= now }.keys)
         if !due.isEmpty {
-            do { try recover(due, reason: "history-invalid") }
+            manualRebuild = false
+            do { try recover(due, reason: manual ? "manual-rebuild" : "history-invalid") }
             catch { fail(error) }
         }
         scheduleRecovery()
@@ -1099,6 +1148,7 @@ public final class ChangeTracker {
             cloud?.setEnabled(true)
             mounts?.start()
             releaseTemporaryPages()
+            engineObserver?(.status)
             observer?("caught-up")
         }
     }
@@ -1224,6 +1274,7 @@ public final class ChangeTracker {
             }
             status.journalWrittenBytes += UInt64(initialized)
         }
+        engineObserver?(.disk)
     }
 
     /// Keep the last durable rows, but make a restart recheck a volume whose
@@ -1251,6 +1302,7 @@ public final class ChangeTracker {
             status.journalFrames += 1
             status.journalWrittenBytes += UInt64(written)
         }
+        if written != 0 { engineObserver?(.disk) }
         return true
     }
 
@@ -1355,19 +1407,42 @@ public final class ChangeTracker {
         }
     }
 
+    func recheckEngineAccess() {
+        update.async {
+            do {
+                try self.applyCoverage(at: self.snapshotStatus().coverageRestricted, recursive: true)
+                self.cloud?.retry()
+            } catch { self.fail(error) }
+        }
+        for volume in mounts?.searchable() ?? [] { volume.tracker.recheckEngineAccess() }
+    }
+
+    func rebuildForEngine() {
+        update.async {
+            guard !self.closed, !self.detached, !self.cursors.isEmpty else { return }
+            self.lock.withLock { self.status.error = nil }
+            self.manualRebuild = true
+            let now = DispatchTime.now().uptimeNanoseconds
+            let volumes = Dictionary(uniqueKeysWithValues: self.cursors.indices.map { ($0, now) })
+            if self.requestRecovery(volumes) { self.scheduleRecovery() }
+        }
+        for volume in mounts?.searchable() ?? [] { volume.tracker.rebuildForEngine() }
+    }
+
     private func applyCoverage(at paths: [String], recursive: Bool = false) throws {
-        guard !closed, !detached, var updated = current else { return }
+        guard !paths.isEmpty, !closed, !detached, var updated = current else { return }
+        let before = updated.rowRevision
         let work = paths.reduce(into: [String: Bool]()) { $0[$1] = recursive }
         try reconcile(work, in: &updated)
         updated.prepareDelta()
-        publish(updated, changed: true)
+        publish(updated, changed: true, engineRowsChanged: updated.rowRevision != before)
         recordDuringCompaction(work)
         scheduleSave()
         scheduleCompaction()
     }
 
     public func stop() throws {
-        try mounts?.stop()
+        let mounted = Result { try mounts?.stop() }
         try update.sync {
             cloud?.stop()
             for stream in sources.values {
@@ -1388,6 +1463,7 @@ public final class ChangeTracker {
                 else { try flushJournal() }
             }
         }
+        try mounted.get()
     }
 
     public func beginApplyTrace() {

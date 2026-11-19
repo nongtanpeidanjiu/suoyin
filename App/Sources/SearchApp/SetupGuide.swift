@@ -210,7 +210,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
                                color: .tertiaryLabelColor)
         points.alignment = .center
         return page(icon: NSApp.applicationIconImage, symbol: nil, title: "欢迎使用\(AppName.short)",
-                    body: "按文件名搜索整台电脑，输入几个字就能找到文件。\n建立索引时只读取文件名、大小和修改时间；\n只有你预览某个文件时，才会读取它的内容。\n不上传任何信息，不联网。",
+                    body: "按文件名搜索整台电脑，输入几个字就能找到文件。\n建立索引时只读取文件名、大小和修改时间；\n只有你预览某个文件时，才会读取它的内容。\n" + Updater.networkPromise,
                     below: [points])
     }
 

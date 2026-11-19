@@ -347,6 +347,86 @@ private final class GeneralPane: SettingsPane {
         let guide = NSButton(title: "重新打开设置向导…", target: self, action: #selector(showSetupGuide))
         addRow("设置向导：", guide, gap: 14)
         addRow(nil, note("按首次使用时的步骤，重新检查各项设置。"))
+
+        if let updater = Updater.shared { addUpdateRows(updater) }
+    }
+
+    // MARK: Updates
+
+    private let autoCheck = NSButton(checkboxWithTitle: "自动检查更新", target: nil, action: nil)
+    private let updateMode = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let checkNow = NSButton(title: "立即检查更新", target: nil, action: nil)
+    private let checking = NSProgressIndicator()
+    private var versionNote: NSTextField?
+
+    /// “更新”一组，只在更新功能启用时出现（见 Updater）。
+    private func addUpdateRows(_ updater: Updater) {
+        autoCheck.target = self
+        autoCheck.action = #selector(toggleAutoCheck)
+        addRow("更新：", autoCheck, gap: 14)
+        updateMode.addItems(withTitles: Updater.Mode.allCases.map(\.title))
+        updateMode.target = self
+        updateMode.action = #selector(changeUpdateMode)
+        updateMode.setAccessibilityLabel("更新方式")
+        addRow(nil, updateMode)
+        checkNow.target = updater
+        checkNow.action = #selector(Updater.checkForUpdates)
+        checking.style = .spinning
+        checking.controlSize = .small
+        checking.isDisplayedWhenStopped = false
+        let controls = NSStackView(views: [checkNow, checking])
+        controls.spacing = 8
+        controls.alignment = .centerY
+        addRow(nil, controls, gap: 4)
+        let version = note("")
+        versionNote = version
+        addRow(nil, version)
+        addRow(nil, note(Updater.networkPromise))
+        NotificationCenter.default.addObserver(forName: Updater.stateChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.reloadUpdates()
+        }
+    }
+
+    private func reloadUpdates() {
+        guard let updater = Updater.shared else { return }
+        autoCheck.state = updater.automaticallyChecks ? .on : .off
+        updateMode.selectItem(at: updater.mode.rawValue)
+        updateMode.isEnabled = updater.automaticallyChecks
+        if let pending = updater.pendingVersion {
+            checkNow.title = "安装 \(pending) 并重新打开"
+            checkNow.isEnabled = true
+        } else {
+            checkNow.title = "立即检查更新"
+            checkNow.isEnabled = updater.canCheck
+        }
+        if updater.isChecking { checking.startAnimation(nil) } else { checking.stopAnimation(nil) }
+        var lines = ["当前版本：\(Updater.currentVersion)"]
+        if updater.isOffline {
+            lines.append("演示模式不检查更新。")
+        } else if let date = updater.lastCheck {
+            lines.append("上次检查：" + Self.checkDate.string(from: date))
+        } else {
+            lines.append("上次检查：还没有检查过")
+        }
+        versionNote?.stringValue = lines.joined(separator: "\n")
+    }
+
+    private static let checkDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    @objc private func toggleAutoCheck() {
+        Updater.shared?.automaticallyChecks = autoCheck.state == .on
+        reloadUpdates()
+    }
+
+    @objc private func changeUpdateMode() {
+        guard let mode = Updater.Mode(rawValue: updateMode.indexOfSelectedItem) else { return }
+        Updater.shared?.mode = mode
+        reloadUpdates()
     }
 
     @objc private func showSetupGuide() { onShowSetupGuide() }
@@ -383,6 +463,7 @@ private final class GeneralPane: SettingsPane {
             }
         }
         dock.state = NSApp.activationPolicy() == .regular ? .on : .off
+        reloadUpdates()
     }
 
     func cancelRecording() {

@@ -49,6 +49,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service = ServiceHost(holding: firstLaunch, open: Self.openService)
 
         installMainMenu()
+        NotificationCenter.default.addObserver(self, selector: #selector(updaterStateChanged),
+                                               name: Updater.stateChanged, object: nil)
         // Stand-ins a previous run left behind, e.g. after a crash.
         PreviewContent.removeAll()
         panel = SearchPanelController(service: service)
@@ -240,6 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
         menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        if let item = Self.updateMenuItem() { menu.addItem(item) }
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return menu
     }
@@ -285,6 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于\(AppName.short)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
+        if let item = Self.updateMenuItem() {
+            appMenu.addItem(item)
+            appMenuUpdateItem = item
+        }
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
         appMenu.addItem(.separator())
@@ -318,6 +325,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showAccessGuide() { setupGuide.show(at: .access) }
+
+    /// 应用菜单里的“检查更新…”，有待安装的更新时改成安装它。
+    private var appMenuUpdateItem: NSMenuItem?
+
+    /// “检查更新…”，更新功能未启用时没有这一项；演示模式下或正在检查时
+    /// 不可用（见 `Updater.validateMenuItem`）。
+    private static func updateMenuItem() -> NSMenuItem? {
+        guard let updater = Updater.shared else { return nil }
+        let item = NSMenuItem(title: updater.menuTitle, action: #selector(Updater.checkForUpdates), keyEquivalent: "")
+        item.target = updater
+        return item
+    }
+
+    @objc private func updaterStateChanged() {
+        guard let updater = Updater.shared, let item = appMenuUpdateItem else { return }
+        item.title = updater.menuTitle
+    }
 
     @objc private func openSearch() {
         panel.show(anchor: statusItem.button?.window?.frame)

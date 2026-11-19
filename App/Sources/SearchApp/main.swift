@@ -94,6 +94,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                             object: nil, queue: .main) { [weak self] _ in
             self?.panel.hide()
         }
+        // Quits the normal way, as the menu's “退出” does, so that tests can
+        // check what a restart brings back.
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.quit"),
+                                                            object: nil, queue: .main) { _ in
+            NSApp.terminate(nil)
+        }
         // Opens the confirmation for deleting a volume's data (object: its
         // id), as its “…” menu does; a pop-up menu cannot be driven by tests.
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.deleteVolume"),

@@ -451,7 +451,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         attachedHeading.isHidden = attached.isEmpty
         attachedList.isHidden = attached.isEmpty
         attachedList.show(attached)
-        let error = service.externalVolumeSettingsError.map(externalVolumeErrorText)
+        let error = service.externalVolumeSettingsError?.text
         volumesError.stringValue = error ?? ""
         volumesError.isHidden = error == nil
     }

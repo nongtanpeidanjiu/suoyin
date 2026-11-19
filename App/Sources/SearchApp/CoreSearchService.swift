@@ -24,7 +24,7 @@ final class CoreSearchService: SearchService {
     private let volumeLock = NSLock()
     private var volumes: [ExternalVolume] = []
     private var includesNew = false
-    private var settingsError: String?
+    private var settingsError: ExternalVolumeSettingsError?
     /// Choices sent to the core and not yet reflected in what it reports.
     private var pendingChoices: [String: Bool] = [:]
     private var pendingIncludesNew: Bool?
@@ -63,7 +63,7 @@ final class CoreSearchService: SearchService {
     func start() {
         engine.onStatusChange = { [weak self] status in
             guard let self else { return }
-            self.onStatusChange?(Self.convert(status))
+            self.onStatusChange?(self.indexStatus(from: status))
             // Counts of the volumes move with the status.
             self.refreshVolumes()
         }
@@ -99,7 +99,7 @@ final class CoreSearchService: SearchService {
         return SearchResponse(hits: hits, total: result.total, totalIsExact: result.totalIsExact)
     }
 
-    var status: IndexStatus { Self.convert(engine.status) }
+    var status: IndexStatus { indexStatus(from: engine.status) }
     func recheckAccess() { engine.recheckAccess() }
     func rebuild() { engine.rebuild() }
 
@@ -125,13 +125,13 @@ final class CoreSearchService: SearchService {
                 guard let included = pendingChoices[volume.id], included != volume.isIncluded else { return volume }
                 var shown = volume
                 shown.isIncluded = included
-                if !included { shown.isScanning = false }
+                if !included { shown.progress = .idle }
                 return shown
             }
         }
     }
 
-    var externalVolumeSettingsError: String? { volumeLock.withLock { settingsError } }
+    var externalVolumeSettingsError: ExternalVolumeSettingsError? { volumeLock.withLock { settingsError } }
 
     /// Leaving a volume out takes its files out of the results as soon as
     /// the core returns; its data stays until deleted.
@@ -169,7 +169,7 @@ final class CoreSearchService: SearchService {
     private func readVolumes(notify: Bool = false) {
         let list = engine.externalVolumes.map(Self.convert)
         let addsNew = engine.includesNewExternalVolumes
-        let error = engine.externalVolumeSettingsError
+        let error = engine.externalVolumeSettingsError.map(Self.convert)
         let changed = volumeLock.withLock { () -> Bool in
             defer { (volumes, includesNew, settingsError) = (list, addsNew, error) }
             return list != volumes || addsNew != includesNew || error != settingsError
@@ -178,74 +178,78 @@ final class CoreSearchService: SearchService {
     }
 
     private static func convert(_ volume: EngineVolume) -> ExternalVolume {
-        ExternalVolume(id: volume.id,
-                       // A volume known only from an earlier version's files
-                       // has a stand-in name until it is attached again.
-                       name: volume.name == "External disk" ? "外接磁盘" : volume.name,
-                       isOnline: volume.isOnline, isIncluded: volume.isIncluded, isScanning: volume.isScanning,
-                       indexedCount: volume.indexedCount, detail: volume.detail.map(readableDetail))
-    }
-
-    /// “exfat · 999.96 GB” as “exFAT · 1 TB”: the file system as Disk
-    /// Utility names it, the size as printed on the box.
-    private static func readableDetail(_ detail: String) -> String {
-        let names = ["apfs": "APFS", "hfs": "Mac OS 扩展", "exfat": "exFAT", "msdos": "FAT", "ntfs": "NTFS"]
-        var parts = detail.components(separatedBy: " · ")
-        if let first = parts.first, let name = names[first.lowercased()] { parts[0] = name }
-        if parts.count > 1, let size = boxSize(parts[1]) { parts[1] = size }
-        return parts.joined(separator: " · ")
-    }
-
-    /// “999.96 GB” → “1 TB”, “63.9 GB” → “64 GB”; nil when not understood.
-    private static func boxSize(_ text: String) -> String? {
-        let pieces = text.split(separator: " ")
-        let units: [String: Double] = ["KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15]
-        guard pieces.count == 2, let factor = units[String(pieces[1])],
-              let value = Double(pieces[0].replacingOccurrences(of: ",", with: "")) else { return nil }
-        let bytes = value * factor
-        func trimmed(_ value: Double) -> String {
-            let rounded = (value * 10).rounded() / 10
-            return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
+        let progress: ExternalVolume.Progress
+        switch volume.progress {
+        case .idle: progress = .idle
+        case .restoring: progress = .restoring
+        case .scanning: progress = .scanning
         }
-        if bytes >= 995e9 { return trimmed(bytes / 1e12) + " TB" }
-        if bytes >= 995e6 { return String(Int((bytes / 1e9).rounded())) + " GB" }
-        return String(Int((bytes / 1e6).rounded())) + " MB"
+        return ExternalVolume(id: volume.id, name: volume.name, nameIsPlaceholder: volume.nameIsPlaceholder,
+                              isOnline: volume.isOnline, isIncluded: volume.isIncluded, progress: progress,
+                              indexedCount: volume.indexedCount, retainedCount: volume.retainedCount,
+                              // `detail` carries only the file system now.
+                              filesystem: volume.filesystem ?? volume.detail, capacityBytes: volume.capacityBytes)
+    }
+
+    private static func convert(_ error: EngineVolumeSettingsError) -> ExternalVolumeSettingsError {
+        let category: ExternalVolumeSettingsError.Category
+        switch error.category {
+        case .readSettings: category = .readSettings
+        case .invalidSettings: category = .invalidSettings
+        case .backupSettings: category = .backupSettings
+        case .writeSettings: category = .writeSettings
+        case .inspectIndex: category = .inspectIndex
+        case .verifyIdentity: category = .verifyIdentity
+        case .removeIndex: category = .removeIndex
+        }
+        return ExternalVolumeSettingsError(category: category, underlyingMessage: error.underlyingMessage)
     }
 
     // MARK: Conversions
 
-    private static func convert(_ status: EngineStatus) -> IndexStatus {
+    private func indexStatus(from status: EngineStatus) -> IndexStatus {
         let phase: IndexPhase
         switch status.phase {
         case .starting: phase = .starting
         case .scanning(let indexed): phase = .scanning(indexed: indexed)
         case .ready: phase = .ready
         case .recovering: phase = .recovering
-        case .supplementing(let name, let indexed): phase = .supplementing(name: cloudName(name), indexed: indexed)
+        case .supplementing(let name, let indexed):
+            let source = status.sources.first { $0.name == name }
+            phase = .supplementing(name: source.map(Self.displayName) ?? name, indexed: indexed,
+                                   restoring: isRestoring(name, source))
         case .failed(let reason): phase = .degraded(reason: reason)
         }
         return IndexStatus(phase: phase, indexedCount: status.indexedCount,
-                           rawInaccessiblePlaces: status.rawInaccessibleLocations.map(convert),
-                           inaccessiblePlaces: status.inaccessibleLocations.map(convert),
+                           rawInaccessiblePlaces: status.rawInaccessibleLocations.map(Self.convert),
+                           inaccessiblePlaces: status.inaccessibleLocations.map(Self.convert),
                            pendingFullDiskAccessPaths: status.pendingFullDiskAccessPaths,
                            inaccessibleVerified: status.inaccessibleLocationsVerified,
                            indexBytesOnDisk: status.indexBytesOnDisk,
                            localIndexedCount: status.localIndexedCount,
-                           sources: status.sources.map(convert))
+                           sources: status.sources.map(Self.convert))
+    }
+
+    /// Whether the volume being supplemented is bringing back an earlier
+    /// run's entries, as its scan or the volume list says.
+    private func isRestoring(_ name: String, _ source: EngineSourceStatus?) -> Bool {
+        guard let source, source.kind == .externalVolume else { return false }
+        if source.scan?.restoring == true { return true }
+        let listed = volumeLock.withLock { volumes.first { $0.id == source.id || ($0.name == name && $0.isOnline) } }
+        return listed?.progress == .restoring
     }
 
     private static func convert(_ source: EngineSourceStatus) -> IndexSource {
-        IndexSource(id: source.id, name: source.kind == .cloudProvider ? cloudName(source.name) : source.name,
+        IndexSource(id: source.id, name: displayName(source),
                     kind: source.kind == .externalVolume ? .externalVolume : .cloudProvider,
                     indexed: source.indexed, isComplete: source.inaccessibleLocationsVerified,
                     failure: source.error)
     }
 
-    /// The core names a cloud provider after its folder; iCloud Drive's
-    /// folder name means nothing to a user.
-    private static func cloudName(_ folder: String) -> String {
-        if folder == "com~apple~CloudDocs" || folder == "Mobile Documents" { return "iCloud 云盘" }
-        return folder
+    /// iCloud Drive under the name the Finder gives it in Chinese; other
+    /// providers keep the name of their folder.
+    private static func displayName(_ source: EngineSourceStatus) -> String {
+        source.cloudProviderKind == .iCloudDrive ? "iCloud 云盘" : source.name
     }
 
     private static func convert(_ kind: SearchKind) -> EngineKind {

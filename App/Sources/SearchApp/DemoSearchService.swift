@@ -30,26 +30,48 @@ final class DemoSearchService: SearchService {
 
     // MARK: Attached volumes
 
-    /// Made-up volumes: one being scanned, one attached but left out, one
-    /// remembered while detached. The choices act on these at once, the way
-    /// the core is to act on real ones, but nothing touches a real disk.
+    /// Made-up volumes, one for each state the list can show: being read,
+    /// being restored from an earlier run, attached but left out with kept
+    /// entries, detached with kept entries, and one known only from an
+    /// earlier version's files. The choices act on these at once, the way
+    /// the core acts on real ones, but nothing touches a real disk.
     private var volumes: [ExternalVolume] = [
-        ExternalVolume(id: "demo-backup", name: "演示备份盘", isOnline: true, isIncluded: true, isScanning: true,
-                       indexedCount: 41_206, detail: "exFAT · 1 TB"),
-        ExternalVolume(id: "demo-stick", name: "演示 U 盘", isOnline: true, isIncluded: false, isScanning: false,
-                       indexedCount: 0, detail: "FAT32 · 64 GB"),
-        ExternalVolume(id: "demo-archive", name: "演示归档盘", isOnline: false, isIncluded: true, isScanning: false,
-                       indexedCount: 230_118, detail: "APFS · 2 TB"),
+        ExternalVolume(id: "demo-backup", name: "演示备份盘", isOnline: true, isIncluded: true, progress: .scanning,
+                       indexedCount: 41_206, retainedCount: 41_206, filesystem: "exfat",
+                       capacityBytes: 999_962_312_704),
+        ExternalVolume(id: "demo-portable", name: "演示移动硬盘", isOnline: true, isIncluded: true, progress: .restoring,
+                       indexedCount: 154_032, retainedCount: 154_032, filesystem: "hfs",
+                       capacityBytes: 512_110_190_592),
+        ExternalVolume(id: "demo-stick", name: "演示 U 盘", isOnline: true, isIncluded: false,
+                       indexedCount: 0, retainedCount: 12_877, filesystem: "msdos", capacityBytes: 63_864_569_856),
+        ExternalVolume(id: "demo-archive", name: "演示归档盘", isOnline: false, isIncluded: true,
+                       indexedCount: 0, retainedCount: 230_118, filesystem: "apfs", capacityBytes: 2_000_398_934_016),
+        ExternalVolume(id: "3F2A9C41-demo", name: "3F2A9C41", nameIsPlaceholder: true, isOnline: false, isIncluded: true,
+                       indexedCount: 0, retainedCount: nil),
     ]
-    /// How many entries each scanning volume ends up with.
-    private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-stick": 12_877]
+    /// How many entries each volume being read ends up with.
+    private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-portable": 171_500, "demo-stick": 19_340]
+    /// Half-second steps a restore takes before reading new folders.
+    private var restoreSteps: [String: Int] = [:]
     private var scanTimer: Timer?
 
     var onExternalVolumesChange: (() -> Void)?
     var externalVolumes: [ExternalVolume] { volumes }
-    /// `--demo-volume-error` shows how a settings error of the core looks.
-    let externalVolumeSettingsError: String? =
-        CommandLine.arguments.contains("--demo-volume-error") ? "Unable to save external volume settings" : nil
+    /// `--demo-volume-error [category]` shows how a settings error of the
+    /// core looks; the category defaults to a failed save.
+    let externalVolumeSettingsError: ExternalVolumeSettingsError? = {
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--demo-volume-error") else { return nil }
+        let categories: [String: ExternalVolumeSettingsError.Category] = [
+            "readSettings": .readSettings, "invalidSettings": .invalidSettings, "backupSettings": .backupSettings,
+            "writeSettings": .writeSettings, "inspectIndex": .inspectIndex, "verifyIdentity": .verifyIdentity,
+            "removeIndex": .removeIndex,
+        ]
+        let named = arguments.indices.contains(flag + 1) ? categories[arguments[flag + 1]] : nil
+        return ExternalVolumeSettingsError(
+            category: named ?? .writeSettings,
+            underlyingMessage: "Error Domain=NSCocoaErrorDomain Code=513 \"You don’t have permission to save the file.\"")
+    }()
 
     /// Kept in memory only, so the demo never touches the real choice.
     var includesNewExternalVolumes = false {
@@ -58,18 +80,36 @@ final class DemoSearchService: SearchService {
 
     func setExternalVolume(_ id: String, included: Bool) {
         guard let index = volumes.firstIndex(where: { $0.id == id }), volumes[index].isIncluded != included else { return }
-        volumes[index].isIncluded = included
-        // Added back: scan what is attached, from where it was left.
-        volumes[index].isScanning = included && volumes[index].isOnline
+        var volume = volumes[index]
+        volume.isIncluded = included
+        if included && volume.isOnline {
+            // Added back: what was kept comes back first, then the rest is read.
+            let kept = volume.retainedCount ?? 0
+            volume.progress = kept > 0 ? .restoring : .scanning
+            volume.indexedCount = kept
+        } else {
+            // As the core reports it: nothing of it is searched any more, but
+            // what was indexed is kept.
+            volume.retainedCount = max(volume.retainedCount ?? 0, volume.indexedCount)
+            volume.progress = .idle
+            volume.indexedCount = 0
+        }
+        volumes[index] = volume
         changedVolumes()
     }
 
     func removeExternalVolumeData(_ id: String) {
         guard let index = volumes.firstIndex(where: { $0.id == id }) else { return }
-        // As the core does: the volume stays listed, left out.
-        volumes[index].isIncluded = false
-        volumes[index].isScanning = false
-        volumes[index].indexedCount = 0
+        // As the core does: a detached volume is forgotten, an attached one
+        // stays listed, left out, with nothing kept.
+        if !volumes[index].isOnline {
+            volumes.remove(at: index)
+        } else {
+            volumes[index].isIncluded = false
+            volumes[index].progress = .idle
+            volumes[index].indexedCount = 0
+            volumes[index].retainedCount = 0
+        }
         changedVolumes()
     }
 
@@ -78,16 +118,29 @@ final class DemoSearchService: SearchService {
         runScans()
     }
 
-    /// Counts rise every half second, as the core reports them.
+    /// Counts rise every half second, as the core reports them. A restore
+    /// shows its whole count at once and turns into reading after a while.
     private func runScans() {
         guard scanTimer == nil, volumes.contains(where: \.isScanning) else { return }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
-            for index in self.volumes.indices where self.volumes[index].isScanning {
-                let target = self.scanTargets[self.volumes[index].id] ?? 50_000
-                let next = self.volumes[index].indexedCount + max(target / 90, 137)
-                self.volumes[index].indexedCount = min(next, target)
-                if next >= target { self.volumes[index].isScanning = false }
+            for index in self.volumes.indices {
+                let id = self.volumes[index].id
+                switch self.volumes[index].progress {
+                case .idle: continue
+                case .restoring:
+                    self.restoreSteps[id, default: 0] += 1
+                    if self.restoreSteps[id, default: 0] >= 20 {
+                        self.restoreSteps[id] = nil
+                        self.volumes[index].progress = .scanning
+                    }
+                case .scanning:
+                    let target = self.scanTargets[id] ?? 50_000
+                    let next = min(self.volumes[index].indexedCount + max(target / 90, 137), target)
+                    self.volumes[index].indexedCount = next
+                    self.volumes[index].retainedCount = max(self.volumes[index].retainedCount ?? 0, next)
+                    if next >= target { self.volumes[index].progress = .idle }
+                }
             }
             if !self.volumes.contains(where: \.isScanning) {
                 timer.invalidate()
@@ -131,18 +184,27 @@ final class DemoSearchService: SearchService {
             }
         }
         loaded.sort { $0.foldedName == $1.foldedName ? $0.hit.path < $1.hit.path : $0.foldedName < $1.foldedName }
-        publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: 0))
-        // A made-up attached volume being added, so the progress line and the
-        // "checking" state of the access list can be looked at: the count
-        // grows every half second, as the core reports it, then settles.
+        // Made-up attached volumes being added, so the progress lines and the
+        // "checking" state of the access list can be looked at: first one
+        // brings back what an earlier run indexed (its count is there at
+        // once), then another is read, its count growing every half second
+        // as the core reports it, then all settles.
+        publish(loaded, phase: .supplementing(name: Self.restoredVolume, indexed: 0, restoring: true))
+        for _ in 1...8 {
+            Thread.sleep(forTimeInterval: 0.5)
+            publish(loaded, phase: .supplementing(name: Self.restoredVolume, indexed: 154_032, restoring: true),
+                    contentChanged: false)
+        }
         for step in 1...24 {
             Thread.sleep(forTimeInterval: 0.5)
-            publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: step * 48_271), contentChanged: false)
+            publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: step * 48_271, restoring: false),
+                    contentChanged: false)
         }
         publish(loaded, phase: .ready)
     }
 
     private static let sampleVolume = "演示备份盘"
+    private static let restoredVolume = "演示移动硬盘"
 
     private func publish(_ loaded: [Entry], phase: IndexPhase, contentChanged: Bool = true) {
         var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)

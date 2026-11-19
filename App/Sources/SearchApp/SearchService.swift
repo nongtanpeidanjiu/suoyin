@@ -76,8 +76,10 @@ enum IndexPhase {
     /// after missed file events. Searching keeps working meanwhile.
     case recovering
     /// Adding an attached volume or a cloud provider; `indexed` counts what
-    /// that source has published so far.
-    case supplementing(name: String, indexed: Int)
+    /// that source has published so far. `restoring` is true while an
+    /// attached volume brings back what an earlier run had indexed (already
+    /// searchable) rather than reading new folders.
+    case supplementing(name: String, indexed: Int, restoring: Bool)
     case degraded(reason: String)
 }
 
@@ -138,19 +140,33 @@ struct IndexSource: Equatable {
 /// An attached volume the index knows about, attached now or remembered
 /// from an earlier time.
 struct ExternalVolume: Equatable {
+    enum Progress { case idle, restoring, scanning }
+
     /// Stable across attachments (the volume UUID where there is one).
     var id: String
-    /// The name shown to the user.
+    /// The volume's name; with `nameIsPlaceholder` the first characters of
+    /// its identifier instead. Show `title`.
     var name: String
+    /// True for a volume known only from an earlier version's files and not
+    /// attached since, whose real name is not known yet.
+    var nameIsPlaceholder = false
     var isOnline: Bool
     /// Whether its files are searched.
     var isIncluded: Bool
-    /// Being scanned for the first time, or brought up to date.
-    var isScanning: Bool
-    /// Entries of this volume in the index.
+    /// Bringing back what an earlier run indexed (already searchable while
+    /// it is checked), or reading folders not indexed yet.
+    var progress: Progress = .idle
+    /// Entries of this volume that can be searched now; 0 while it is left
+    /// out or detached.
     var indexedCount: Int
-    /// A short extra line such as “exFAT · 1 TB”, or nil for none.
-    var detail: String?
+    /// Entries kept on this Mac for the volume, searched or not; nil while
+    /// not counted yet, 0 when there are none.
+    var retainedCount: Int?
+    /// The file system as the core names it, such as “exfat”.
+    var filesystem: String?
+    var capacityBytes: Int64?
+
+    var isScanning: Bool { progress != .idle }
 }
 
 protocol SearchService: AnyObject {
@@ -176,42 +192,108 @@ protocol SearchService: AnyObject {
     /// Deletes what was indexed for the volume and stops searching it. A
     /// volume that is not attached is then forgotten.
     func removeExternalVolumeData(_ id: String)
-    /// What went wrong when keeping these choices or deleting data, in the
-    /// core's own words; nil when nothing did.
-    var externalVolumeSettingsError: String? { get }
+    /// What went wrong when keeping these choices or deleting data; nil when
+    /// nothing did.
+    var externalVolumeSettingsError: ExternalVolumeSettingsError? { get }
     /// Called, on any thread, when the list or a volume's state changed.
     var onExternalVolumesChange: (() -> Void)? { get set }
 }
 
-extension ExternalVolume {
-    /// The state line under the volume's name.
-    var stateLine: String {
-        let count = formattedCount(indexedCount)
-        if !isOnline {
-            if !isIncluded { return indexedCount > 0 ? "未连接，未加入，保留 \(count) 个已收录条目" : "未连接，未加入" }
-            return indexedCount > 0 ? "未连接，已收录 \(count) 个" : "未连接"
+/// Something the core could not do with the choices about attached volumes.
+struct ExternalVolumeSettingsError: Equatable {
+    enum Category {
+        case readSettings, invalidSettings, backupSettings, writeSettings, inspectIndex, verifyIdentity, removeIndex
+    }
+
+    var category: Category
+    /// The core's own words, for diagnosis.
+    var underlyingMessage: String
+
+    /// What happened in words a user understands, the core's own text
+    /// following in brackets.
+    var text: String {
+        let meaning: String
+        switch category {
+        case .readSettings:
+            meaning = "读不到外接磁盘的设置，暂时按默认设置处理；这次运行期间的更改在重新打开软件后会失效。"
+        case .invalidSettings:
+            meaning = "外接磁盘的设置文件已损坏，已改用默认设置（原文件另存了一份）；请重新选择要加入搜索的磁盘。"
+        case .backupSettings:
+            meaning = "外接磁盘的设置文件已损坏，且没能另存原文件；暂时按默认设置处理，这次运行期间的更改在重新打开软件后会失效。"
+        case .writeSettings:
+            meaning = "外接磁盘的设置没能保存，刚才的更改在重新打开软件后可能失效。"
+        case .inspectIndex:
+            meaning = "读不到部分外接磁盘已收录的数据，这些磁盘暂时无法显示保留的条目数。"
+        case .verifyIdentity:
+            meaning = "无法确认一块外接磁盘的身份，暂时没有搜索它；重新插入后会再试。"
+        case .removeIndex:
+            meaning = "删除外接磁盘已收录的数据时出错，数据仍然保留，下次打开软件时会再试一次。"
         }
-        if !isIncluded { return indexedCount > 0 ? "未加入，保留 \(count) 个已收录条目" : "未加入" }
-        if isScanning { return indexedCount > 0 ? "正在扫描，已收录 \(count) 个" : "正在扫描" }
-        return indexedCount > 0 ? "已加入，共 \(count) 个文件" : "已加入"
+        return "\(meaning)（原始信息：\(underlyingMessage)）"
     }
 }
 
-/// Explains a settings error of the core in words a user understands; the
-/// core's own text follows in brackets.
-func externalVolumeErrorText(_ raw: String) -> String {
-    let lowered = raw.lowercased()
-    let meaning: String
-    if lowered.contains("remove") {
-        meaning = "删除外接磁盘已收录的数据时出错，下次启动时会再试一次。"
-    } else if lowered.contains("save") {
-        meaning = "外接磁盘的设置没能保存，刚才的更改在重新打开软件后可能失效。"
-    } else if lowered.contains("read") || lowered.contains("inspect") {
-        meaning = "读不到外接磁盘的设置，暂时无法更改；可以退出后重新打开软件再试。"
-    } else {
-        meaning = "外接磁盘的设置出了问题。"
+extension ExternalVolume {
+    /// The name shown to the user.
+    var title: String { nameIsPlaceholder ? "外接磁盘 \(name)" : name }
+
+    /// “exFAT · 1 TB”, or nil when neither is known.
+    var detail: String? {
+        let parts = [filesystem.map(Self.filesystemName), capacityBytes.flatMap(Self.boxSize)].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
-    return "\(meaning)（原始信息：\(raw)）"
+
+    /// The file system as Disk Utility names it.
+    static func filesystemName(_ raw: String) -> String {
+        let names = ["apfs": "APFS", "hfs": "Mac OS 扩展", "exfat": "exFAT", "msdos": "FAT", "ntfs": "NTFS"]
+        return names[raw.lowercased()] ?? raw
+    }
+
+    /// The size as printed on the box: decimal units, rounded to a whole
+    /// number (one decimal below 10 TB), e.g. 999,962,312,704 B → “1 TB”,
+    /// 63,864,569,856 B → “64 GB”.
+    static func boxSize(_ bytes: Int64) -> String? {
+        guard bytes > 0 else { return nil }
+        let value = Double(bytes)
+        func trimmed(_ value: Double) -> String {
+            let rounded = (value * 10).rounded() / 10
+            return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
+        }
+        if value >= 999.5e9 { return value >= 9.95e12 ? "\(Int((value / 1e12).rounded())) TB" : trimmed(value / 1e12) + " TB" }
+        if value >= 999.5e6 { return "\(Int((value / 1e9).rounded())) GB" }
+        if value >= 999.5e3 { return "\(Int((value / 1e6).rounded())) MB" }
+        return "\(Int((value / 1e3).rounded())) KB"
+    }
+
+    /// Kept entries worth naming: nil while not counted, and for none.
+    private var keptCount: Int? { retainedCount.flatMap { $0 > 0 ? $0 : nil } }
+
+    /// The state line under the volume's name.
+    var stateLine: String {
+        if !isOnline {
+            return keptCount.map { "未连接，保留 \(formattedCount($0)) 个已收录条目" } ?? "未连接"
+        }
+        if !isIncluded {
+            return keptCount.map { "未加入，保留 \(formattedCount($0)) 个已收录条目" } ?? "未加入"
+        }
+        switch progress {
+        case .restoring:
+            // What an earlier run indexed comes back at once and can be
+            // searched while it is checked; nothing starts over.
+            if indexedCount > 0 { return "正在恢复上次收录的内容，\(formattedCount(indexedCount)) 个已可搜索" }
+            return keptCount.map { "正在恢复上次收录的 \(formattedCount($0)) 个条目" } ?? "正在恢复上次收录的内容"
+        case .scanning:
+            return indexedCount > 0 ? "正在扫描，已收录 \(formattedCount(indexedCount)) 个" : "正在扫描"
+        case .idle:
+            if indexedCount > 0 { return "已加入，共 \(formattedCount(indexedCount)) 个文件" }
+            // Just attached or just switched on: kept entries are about to be
+            // loaded.
+            return keptCount.map { "已加入，正在载入已收录的 \(formattedCount($0)) 个条目" } ?? "已加入"
+        }
+    }
+
+    /// Whether deleting its data would delete anything known.
+    var hasRetainedData: Bool { keptCount != nil }
 }
 
 /// The query text as sent to the core: every kind of space becomes a plain

@@ -127,9 +127,12 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         let item = NSMenuItem(title: "删除已收录的数据…", action: #selector(deleteChosen(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = volume.id
-        // Always offered: the core counts the entries of a volume that is
-        // left out or detached as zero, though they may still be kept.
-        item.isEnabled = true
+        // Greyed out rather than hidden, so the menu looks the same on every
+        // row: there is nothing to delete, or it has not been counted yet.
+        item.isEnabled = volume.hasRetainedData
+        if !item.isEnabled {
+            item.toolTip = volume.retainedCount == nil ? "正在统计已收录的条目，稍后再试" : "这块磁盘没有已收录的数据"
+        }
         menu.addItem(item)
     }
 
@@ -232,18 +235,18 @@ private final class VolumeCell: NSTableCellView {
         self.owner = owner
         icon.image = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: nil)
         icon.alphaValue = volume.isOnline ? 1 : 0.45
-        nameLabel.stringValue = volume.name
+        nameLabel.stringValue = volume.title
         nameLabel.textColor = volume.isOnline ? .labelColor : .secondaryLabelColor
         detailLabel.stringValue = volume.detail ?? ""
         detailLabel.isHidden = volume.detail == nil
         if stateLabel.stringValue != volume.stateLine { stateLabel.stringValue = volume.stateLine }
         let state: NSControl.StateValue = volume.isIncluded ? .on : .off
         if toggle.state != state { toggle.state = state }
-        toggle.setAccessibilityLabel("将“\(volume.name)”加入搜索")
+        toggle.setAccessibilityLabel("将“\(volume.title)”加入搜索")
         more.isHidden = !owner.showsMenu
-        more.setAccessibilityLabel("“\(volume.name)”的更多操作")
-        setAccessibilityLabel("\(volume.name)，\(volume.stateLine)")
-        toolTip = volume.name
+        more.setAccessibilityLabel("“\(volume.title)”的更多操作")
+        setAccessibilityLabel("\(volume.title)，\(volume.stateLine)")
+        toolTip = volume.title
     }
 
     @objc private func switched() {
@@ -262,11 +265,15 @@ enum ExternalVolumeConfirmation {
     /// only after the user agreed.
     static func askToDelete(_ volume: ExternalVolume, in window: NSWindow?, confirmed: @escaping () -> Void) {
         let alert = NSAlert()
-        alert.messageText = "要删除“\(volume.name)”已收录的数据吗？"
-        var text = "只删除本软件为这块磁盘建立的索引"
-        if volume.indexedCount > 0 { text += "（\(formattedCount(volume.indexedCount)) 个条目）" }
+        alert.messageText = "要删除“\(volume.title)”已收录的数据吗？"
+        var text = "将删除本软件为这块磁盘保存的"
+        text += volume.retainedCount.map { " \(formattedCount($0)) 个已收录条目" } ?? "已收录条目"
         text += "，磁盘上的文件不受任何影响。"
-        text += "删除后不再搜索这块磁盘，它仍留在列表中，显示为“未加入”；以后可以重新加入，届时需要重新扫描。"
+        if volume.isOnline {
+            text += "删除后不再搜索这块磁盘，它仍留在列表中，显示为“未加入”；以后可以重新加入，届时需要从头扫描。"
+        } else {
+            text += "这块磁盘目前未连接，删除后会从列表中移除；以后再插入时会作为新磁盘出现，加入搜索需要从头扫描。"
+        }
         alert.informativeText = text
         let delete = alert.addButton(withTitle: "删除")
         delete.hasDestructiveAction = true

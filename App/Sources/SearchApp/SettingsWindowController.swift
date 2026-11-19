@@ -542,7 +542,7 @@ private final class ScopePane: SettingsPane {
     func updateVolumes() {
         newVolumes.state = service.includesNewExternalVolumes ? .on : .off
         volumeList.show(service.externalVolumes)
-        let error = service.externalVolumeSettingsError.map(externalVolumeErrorText)
+        let error = service.externalVolumeSettingsError?.text
         if volumeError.stringValue != error ?? "" { volumeError.stringValue = error ?? "" }
         if volumeErrorRow.isHidden != (error == nil) {
             volumeErrorRow.isHidden = error == nil

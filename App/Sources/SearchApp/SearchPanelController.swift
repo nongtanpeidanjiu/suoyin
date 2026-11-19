@@ -734,11 +734,17 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         case .recovering:
             lead += " · 正在更新索引"
             key = "recovering"
-        case .supplementing(let source, let indexed):
-            lead += " · 正在补充 "
+        case .supplementing(let source, let indexed, let restoring):
+            // Short, the row is narrow: restoring brings back entries that
+            // are searchable already, reading adds new ones.
+            lead += restoring ? " · 正在恢复 " : " · 正在补充 "
             name = source
-            tail = indexed > 0 ? "，已收录 \(formattedCount(indexed)) 个" : ""
-            key = "supplementing\u{0}" + source
+            if restoring {
+                tail = indexed > 0 ? "，\(formattedCount(indexed)) 个可搜" : ""
+            } else {
+                tail = indexed > 0 ? "，已收录 \(formattedCount(indexed)) 个" : ""
+            }
+            key = (restoring ? "restoring\u{0}" : "supplementing\u{0}") + source
         case .degraded(let reason):
             lead += " · "
             name = reason

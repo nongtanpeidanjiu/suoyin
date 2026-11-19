@@ -21,11 +21,85 @@ final class DemoSearchService: SearchService {
 
     func start() {
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.load() }
+        DispatchQueue.main.async { [weak self] in self?.runScans() }
     }
 
     func stop() {}
     func recheckAccess() {}
     func rebuild() { start() }
+
+    // MARK: Attached volumes
+
+    /// Made-up volumes: one being scanned, one attached but left out, one
+    /// remembered while detached. The choices act on these at once, the way
+    /// the core is to act on real ones, but nothing touches a real disk.
+    private var volumes: [ExternalVolume] = [
+        ExternalVolume(id: "demo-backup", name: "演示备份盘", isOnline: true, isIncluded: true, isScanning: true,
+                       indexedCount: 41_206, detail: "exFAT · 1 TB"),
+        ExternalVolume(id: "demo-stick", name: "演示 U 盘", isOnline: true, isIncluded: false, isScanning: false,
+                       indexedCount: 0, detail: "FAT32 · 64 GB"),
+        ExternalVolume(id: "demo-archive", name: "演示归档盘", isOnline: false, isIncluded: true, isScanning: false,
+                       indexedCount: 230_118, detail: "APFS · 2 TB"),
+    ]
+    /// How many entries each scanning volume ends up with.
+    private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-stick": 12_877]
+    private var scanTimer: Timer?
+
+    var onExternalVolumesChange: (() -> Void)?
+    var supportsExternalVolumeControl: Bool { true }
+    var externalVolumes: [ExternalVolume] { volumes }
+
+    var includesNewExternalVolumes: Bool {
+        get { ExternalVolumePreferences.includeNew }
+        set { ExternalVolumePreferences.includeNew = newValue }
+    }
+
+    func setExternalVolume(_ id: String, included: Bool) {
+        guard let index = volumes.firstIndex(where: { $0.id == id }), volumes[index].isIncluded != included else { return }
+        volumes[index].isIncluded = included
+        // Added back: scan what is attached, from where it was left.
+        volumes[index].isScanning = included && volumes[index].isOnline
+        changedVolumes()
+    }
+
+    func removeExternalVolumeData(_ id: String) {
+        guard let index = volumes.firstIndex(where: { $0.id == id }) else { return }
+        if volumes[index].isOnline {
+            volumes[index].isIncluded = false
+            volumes[index].isScanning = false
+            volumes[index].indexedCount = 0
+        } else {
+            volumes.remove(at: index)
+        }
+        changedVolumes()
+    }
+
+    private func changedVolumes() {
+        onExternalVolumesChange?()
+        runScans()
+    }
+
+    /// Counts rise every half second, as the core reports them.
+    private func runScans() {
+        guard scanTimer == nil, volumes.contains(where: \.isScanning) else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            for index in self.volumes.indices where self.volumes[index].isScanning {
+                let target = self.scanTargets[self.volumes[index].id] ?? 50_000
+                let next = self.volumes[index].indexedCount + max(target / 90, 137)
+                self.volumes[index].indexedCount = min(next, target)
+                if next >= target { self.volumes[index].isScanning = false }
+            }
+            if !self.volumes.contains(where: \.isScanning) {
+                timer.invalidate()
+                self.scanTimer = nil
+            }
+            self.onExternalVolumesChange?()
+        }
+        // Common modes: the counts keep moving while a list is being scrolled.
+        RunLoop.main.add(timer, forMode: .common)
+        scanTimer = timer
+    }
 
     private func load() {
         let roots: [(String, Int)] = [
@@ -69,7 +143,7 @@ final class DemoSearchService: SearchService {
         publish(loaded, phase: .ready)
     }
 
-    private static let sampleVolume = "演示外接盘"
+    private static let sampleVolume = "演示备份盘"
 
     private func publish(_ loaded: [Entry], phase: IndexPhase, contentChanged: Bool = true) {
         var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)

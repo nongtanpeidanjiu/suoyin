@@ -116,6 +116,24 @@ struct IndexStatus {
     var inaccessibleCount: Int { rawInaccessiblePlaces.count }
 }
 
+/// An attached volume the index knows about, attached now or remembered
+/// from an earlier time.
+struct ExternalVolume: Equatable {
+    /// Stable across attachments (the volume UUID where there is one).
+    var id: String
+    /// The name shown to the user.
+    var name: String
+    var isOnline: Bool
+    /// Whether its files are searched.
+    var isIncluded: Bool
+    /// Being scanned for the first time, or brought up to date.
+    var isScanning: Bool
+    /// Entries of this volume in the index.
+    var indexedCount: Int
+    /// A short extra line such as “exFAT · 1 TB”, or nil for none.
+    var detail: String?
+}
+
 protocol SearchService: AnyObject {
     func start()
     func stop()
@@ -125,6 +143,54 @@ protocol SearchService: AnyObject {
     var onIndexChange: (() -> Void)? { get set }
     func recheckAccess()
     func rebuild()
+
+    // Attached volumes.
+
+    /// Whether a volume attached for the first time is added to the search
+    /// by itself. Volumes already known keep their own choice.
+    var includesNewExternalVolumes: Bool { get set }
+    /// Every known attached volume, including ones not attached right now.
+    var externalVolumes: [ExternalVolume] { get }
+    /// Turning a volume off stops its scan and takes its files out of the
+    /// results; what was indexed stays until `removeExternalVolumeData`.
+    func setExternalVolume(_ id: String, included: Bool)
+    /// Deletes what was indexed for the volume and stops searching it. A
+    /// volume that is not attached is then forgotten.
+    func removeExternalVolumeData(_ id: String)
+    /// False while the choices above are only remembered and the core does
+    /// not act on them yet; the interface says so next to the controls.
+    var supportsExternalVolumeControl: Bool { get }
+    /// Called, on any thread, when the list or a volume's state changed.
+    var onExternalVolumesChange: (() -> Void)? { get set }
+}
+
+extension ExternalVolume {
+    /// The state line under the volume's name.
+    var stateLine: String {
+        let count = formattedCount(indexedCount)
+        if !isOnline {
+            if !isIncluded { return indexedCount > 0 ? "未连接，未加入，保留 \(count) 个已收录条目" : "未连接，未加入" }
+            return indexedCount > 0 ? "未连接，已收录 \(count) 个" : "未连接"
+        }
+        if !isIncluded { return indexedCount > 0 ? "未加入，保留 \(count) 个已收录条目" : "未加入" }
+        if isScanning { return indexedCount > 0 ? "正在扫描，已收录 \(count) 个" : "正在扫描" }
+        return indexedCount > 0 ? "已加入，共 \(count) 个文件" : "已加入"
+    }
+}
+
+/// Where the choices about attached volumes are kept while the core cannot
+/// keep them itself, and the default the demo data starts from.
+enum ExternalVolumePreferences {
+    static let includeNewKey = "includeNewExternalVolumes"
+    static let choicesKey = "externalVolumeChoices"
+    static let knownKey = "knownExternalVolumes"
+
+    /// New volumes are not added by default: a large spinning disk can take
+    /// half an hour or more to scan, and not everyone wants to search it.
+    static var includeNew: Bool {
+        get { UserDefaults.standard.bool(forKey: includeNewKey) }
+        set { UserDefaults.standard.set(newValue, forKey: includeNewKey) }
+    }
 }
 
 /// The query text as sent to the core: every kind of space becomes a plain

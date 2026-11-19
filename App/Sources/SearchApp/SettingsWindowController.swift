@@ -14,8 +14,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
     private var current: SettingsPane?
     private var poll: Timer?
 
-    init(service: SearchService, shortcuts: ShortcutCenter, onShowAccessGuide: @escaping () -> Void) {
-        general = GeneralPane(shortcuts: shortcuts)
+    init(service: SearchService, shortcuts: ShortcutCenter, onShowAccessGuide: @escaping () -> Void,
+         onShowSetupGuide: @escaping () -> Void) {
+        general = GeneralPane(shortcuts: shortcuts, onShowSetupGuide: onShowSetupGuide)
         scope = ScopePane(service: service, onShowAccessGuide: onShowAccessGuide)
         index = IndexPane(service: service)
         super.init()
@@ -39,6 +40,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         guard isVisible else { return }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func volumesChanged() {
+        guard isVisible else { return }
+        scope.updateVolumes()
     }
 
     func update(_ status: IndexStatus) {
@@ -114,6 +120,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         let size = NSSize(width: Self.width, height: pane.fittingHeight(width: Self.width))
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        // A tall pane that would run off the bottom of the screen moves the
+        // window up rather than hiding its last rows.
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame, frame.minY < visible.minY {
+            frame.origin.y = min(visible.minY, visible.maxY - frame.height)
+        }
         guard abs(frame.height - window.frame.height) > 0.5 else { return }
         window.setFrame(frame, display: true, animate: animated && window.isVisible && !Motion.reduced)
     }
@@ -254,8 +265,11 @@ private final class GeneralPane: SettingsPane {
     /// The last failure stays on screen until the next attempt.
     private var loginFailure: String?
 
-    init(shortcuts: ShortcutCenter) {
+    private let onShowSetupGuide: () -> Void
+
+    init(shortcuts: ShortcutCenter, onShowSetupGuide: @escaping () -> Void) {
         self.shortcuts = shortcuts
+        self.onShowSetupGuide = onShowSetupGuide
         super.init(identifier: "general", title: "通用", symbol: "gearshape")
 
         login.target = self
@@ -309,7 +323,13 @@ private final class GeneralPane: SettingsPane {
         dock.action = #selector(toggleDock)
         addRow("程序坞：", dock, gap: 14)
         addRow(nil, note("关闭时只在菜单栏显示图标。"))
+
+        let guide = NSButton(title: "重新打开设置向导…", target: self, action: #selector(showSetupGuide))
+        addRow("设置向导：", guide, gap: 14)
+        addRow(nil, note("按首次使用时的步骤，重新检查各项设置。"))
     }
+
+    @objc private func showSetupGuide() { onShowSetupGuide() }
 
     private static let recordingHint = "按下后没有反应，说明这组键已被系统占用。"
 
@@ -419,6 +439,10 @@ private final class ScopePane: SettingsPane {
     private let service: SearchService
     private let onShowAccessGuide: () -> Void
     private let systemFiles = NSButton(checkboxWithTitle: "显示系统文件和隐藏文件", target: nil, action: nil)
+    private let newVolumes = NSButton(checkboxWithTitle: "自动把新插入的外接磁盘加入搜索", target: nil, action: nil)
+    private let volumeList = ExternalVolumeList(width: InaccessibleOutline.width, maxRows: 3,
+                                                emptyText: "还没有接入过外接磁盘")
+    private var pendingVersionRow: NSGridRow!
     private let accessIcon = NSImageView()
     private let accessLabel = NSTextField(labelWithString: "")
     private let accessButton = NSButton(title: "前往授权…", target: nil, action: nil)
@@ -440,6 +464,29 @@ private final class ScopePane: SettingsPane {
         systemFiles.action = #selector(toggleSystemFiles)
         addRow("显示：", systemFiles)
         addRow(nil, note("包括系统目录、个人“资源库”、应用程序包内部，以及名称以“.”开头的文件。"))
+
+        newVolumes.target = self
+        newVolumes.action = #selector(toggleNewVolumes)
+        addRow("外接磁盘：", newVolumes, gap: 14)
+        addRow(nil, note("""
+            关闭时新磁盘不会被扫描，已加入的不受影响。大容量机械硬盘首次扫描可能需要几十分钟，期间仍可正常搜索。
+            """))
+        volumeList.onToggle = { [weak self] id, included in
+            self?.service.setExternalVolume(id, included: included)
+            self?.updateVolumes()
+        }
+        volumeList.onDelete = { [weak self] volume in
+            guard let self else { return }
+            ExternalVolumeConfirmation.askToDelete(volume, in: self.view.window) { [weak self] in
+                self?.service.removeExternalVolumeData(volume.id)
+                self?.updateVolumes()
+            }
+        }
+        volumeList.onHeightChange = { [weak self] in self?.onSizeChange?() }
+        addRow(nil, volumeList, gap: 4)
+        let nextVersion = note("此选项将在下一个版本生效。")
+        nextVersion.textColor = .tertiaryLabelColor
+        pendingVersionRow = addRow(nil, nextVersion)
 
         accessIcon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         accessButton.target = self
@@ -482,6 +529,23 @@ private final class ScopePane: SettingsPane {
         systemFiles.state = Preferences.includeSystemFiles ? .on : .off
         reloadAccess()
         update(service.status)
+        updateVolumes()
+    }
+
+    /// The attached volumes, refreshed in place as their state changes.
+    func updateVolumes() {
+        newVolumes.state = service.includesNewExternalVolumes ? .on : .off
+        let supported = service.supportsExternalVolumeControl
+        volumeList.canDelete = supported
+        volumeList.show(service.externalVolumes)
+        if pendingVersionRow.isHidden != supported {
+            pendingVersionRow.isHidden = supported
+            onSizeChange?()
+        }
+    }
+
+    @objc private func toggleNewVolumes() {
+        service.includesNewExternalVolumes = newVolumes.state == .on
     }
 
     func reloadAccess() {
@@ -759,7 +823,7 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         addSubview(placeholderLabel)
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: Self.width),
-            heightAnchor.constraint(equalToConstant: 260),
+            heightAnchor.constraint(equalToConstant: 200),
         ])
     }
 

@@ -10,10 +10,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var hotKey: HotKey!
     private var shortcuts: ShortcutCenter!
-    private lazy var accessGuide = AccessGuideController { [weak self] in self?.service.recheckAccess() }
+    private lazy var setupGuide = SetupGuideController(
+        service: service, shortcuts: shortcuts,
+        onGranted: { [weak self] in self?.service.recheckAccess() },
+        onFinish: { [weak self] in self?.panel.show(anchor: nil) })
     private lazy var settings = SettingsWindowController(
         service: service, shortcuts: shortcuts,
-        onShowAccessGuide: { [weak self] in self?.accessGuide.show() })
+        onShowAccessGuide: { [weak self] in self?.setupGuide.show(at: .access) },
+        onShowSetupGuide: { [weak self] in self?.setupGuide.show(at: .welcome) })
     private var spinner: Timer?
     /// The status line of the menu while it is open, kept current as the
     /// supplementing count rises.
@@ -52,14 +56,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service.onIndexChange = { [weak self] in
             DispatchQueue.main.async { self?.panel.refresh() }
         }
+        service.onExternalVolumesChange = { [weak self] in
+            DispatchQueue.main.async {
+                self?.settings.volumesChanged()
+                self?.setupGuide.volumesChanged()
+            }
+        }
         service.start()
         panel.clearPreviewLeftovers()
 
-        // Offer the authorization guide once, on the first launch without access.
-        if !DiskAccess.isGranted, !UserDefaults.standard.bool(forKey: "accessGuideShown"),
-           !CommandLine.arguments.contains("--show") {
-            UserDefaults.standard.set(true, forKey: "accessGuideShown")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.accessGuide.show() }
+        // The setup guide opens by itself once, on the first launch. The key
+        // is the one the earlier single-page access guide set, so whoever saw
+        // that one is not asked again. `--show-setup` opens it regardless,
+        // for testing.
+        let forced = CommandLine.arguments.contains("--show-setup")
+        if forced || (!UserDefaults.standard.bool(forKey: "accessGuideShown") && !CommandLine.arguments.contains("--show")) {
+            if !forced { UserDefaults.standard.set(true, forKey: "accessGuideShown") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.setupGuide.show(at: .welcome) }
         }
 
         // Lets test scripts open the panel the way the shortcut does.
@@ -225,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.windowsMenu = window
     }
 
-    @objc private func showAccessGuide() { accessGuide.show() }
+    @objc private func showAccessGuide() { setupGuide.show(at: .access) }
 
     @objc private func openSearch() {
         panel.show(anchor: statusItem.button?.window?.frame)

@@ -151,23 +151,46 @@ final class PreviewContent {
         let base = name.utf8.count > 240 ? "file" : name
         let folder = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try makePrivateFolder(root)
+            try makePrivateFolder(folder)
             if isMarkdown(type, name: name), let page = markdownPage(url, encoding: encoding,
                                                                     size: values.fileSize ?? 0, title: name) {
                 let target = folder.appendingPathComponent(base + ".html")
-                try page.write(to: target, atomically: false, encoding: .utf8)
+                try writePrivately(Data(page.utf8), to: target)
                 return .standIn(target)
             }
             let target = folder.appendingPathComponent(base + ".txt")
             let small = (values.fileSize ?? 0) <= convertLimit
             if encoding == .gb18030 || !small || clonefile(path, target.path, 0) != 0 {
-                try converted(url, encoding).write(to: target, atomically: false, encoding: .utf8)
+                try writePrivately(Data(converted(url, encoding).utf8), to: target)
+            } else {
+                // A clone takes the original's permissions; it is a file of its
+                // own, so narrowing them leaves the original untouched.
+                guard chmod(target.path, 0o600) == 0 else { throw CocoaError(.fileWriteNoPermission) }
             }
             return .standIn(target)
         } catch {
             try? FileManager.default.removeItem(at: folder)
             return .original
         }
+    }
+
+    /// Stand-ins hold the contents of the user's files, so only the user may
+    /// read them: folders 0700, files 0600, whatever the umask.
+    private static func makePrivateFolder(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        // An existing folder, e.g. from an earlier version, is narrowed too.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    /// Creates the file with mode 0600 from the start, never wider.
+    private static func writePrivately(_ data: Data, to url: URL) throws {
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        try handle.write(contentsOf: data)
+        try handle.close()
     }
 
     private static func isMarkdown(_ type: UTType, name: String) -> Bool {

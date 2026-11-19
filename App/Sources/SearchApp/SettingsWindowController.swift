@@ -646,6 +646,9 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
 
     private let outline = NSOutlineView()
     private var groups: [Node] = []
+    /// The width a group heading's cell actually got, reported back by the
+    /// cell once laid out. Until then it is estimated from the list width.
+    private var groupCellWidth: CGFloat?
 
     init() {
         super.init(frame: .zero)
@@ -804,8 +807,10 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         guard let node = item as? Node, case .group(let reason, _) = node.kind else { return Self.rowHeight }
         let probe = GroupCell.measuring
         probe.show(reason: reason, title: "", explanation: Self.explanation(reason))
-        let width = (outline.tableColumns.first?.width ?? Self.width) - 24
-        return probe.height(forWidth: max(width, 120))
+        // The column can still be at its initial width when rows are first
+        // measured; a heading is indented by the disclosure triangle.
+        let estimate = max(outline.tableColumns.first?.width ?? 0, Self.width - 4) - 26
+        return probe.height(forWidth: max(groupCellWidth ?? estimate, 120))
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
@@ -820,6 +825,7 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
             }()
             cell.show(reason: reason, title: "\(Self.title(reason)) · \(formatted(count)) 个位置",
                       explanation: Self.explanation(reason))
+            cell.onWidthChange = { [weak self] width in self?.noteGroupCellWidth(width) }
             return cell
         case .place(let place):
             let cell = PlaceCell.make(in: outlineView, kind: .place)
@@ -841,6 +847,18 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         }
     }
 
+    /// Re-measures the headings when their cells turn out wider or narrower
+    /// than the width their height was worked out for.
+    private func noteGroupCellWidth(_ width: CGFloat) {
+        guard width > 0, abs((groupCellWidth ?? -1) - width) > 0.5 else { return }
+        groupCellWidth = width
+        let rows = groups.map { outline.row(forItem: $0) }.filter { $0 >= 0 }
+        guard !rows.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.outline.noteHeightOfRows(withIndexesChanged: IndexSet(rows))
+        }
+    }
+
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
         if let node = item as? Node, case .group = node.kind { return false }
         return true
@@ -855,7 +873,8 @@ private final class GroupCell: NSTableCellView {
     private let icon = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let explanationLabel = NSTextField(wrappingLabelWithString: "")
-    private var widthConstraint: NSLayoutConstraint?
+    /// Told the cell's laid-out width, so the list can size the row to it.
+    var onWidthChange: ((CGFloat) -> Void)?
 
     init() {
         super.init(frame: .zero)
@@ -902,13 +921,17 @@ private final class GroupCell: NSTableCellView {
     override func layout() {
         explanationLabel.preferredMaxLayoutWidth = max(bounds.width - 6, 0)
         super.layout()
+        onWidthChange?(bounds.width)
     }
 
-    /// The row height that shows the whole explanation at this width.
+    /// The row height that shows the whole explanation at this cell width:
+    /// top inset, heading, spacing, explanation, and a bottom inset that
+    /// leaves the same gap before the first location as between locations.
     func height(forWidth width: CGFloat) -> CGFloat {
         explanationLabel.preferredMaxLayoutWidth = width - 6
         let text = explanationLabel.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width - 6, height: 1000))
         let lineHeight = ceil(NSFont.systemFont(ofSize: NSFont.smallSystemFontSize).boundingRectForFont.height)
-        return 6 + max(lineHeight, 15) + 2 + ceil(text?.height ?? lineHeight) + 8
+        let heading = max(ceil(titleLabel.intrinsicContentSize.height), lineHeight)
+        return 6 + heading + 2 + ceil(text?.height ?? lineHeight) + 3
     }
 }

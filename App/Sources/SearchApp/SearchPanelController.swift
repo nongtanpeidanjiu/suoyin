@@ -1,9 +1,18 @@
 import AppKit
+import Quartz
 import QuartzCore
 
 private final class SearchPanel: NSPanel {
+    /// Quick Look looks for its controller along the key window's responder
+    /// chain; the window is on that chain while focus is in the search field.
+    weak var previewController: SearchPanelController?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { previewController != nil }
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) { previewController?.beginPreview(panel) }
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) { previewController?.endPreview(panel) }
 }
 
 /// Top-left-origin container that also paints the glass tint and rim, so
@@ -73,7 +82,8 @@ extension NSAppearance {
 /// lets the same piece of glass grow downward to hold a filter row and the
 /// results. The design follows the current system search.
 final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
-                                   NSTableViewDataSource, NSTableViewDelegate {
+                                   NSTableViewDataSource, NSTableViewDelegate,
+                                   QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     private enum Layout {
         static let width: CGFloat = 640
         static let searchRow: CGFloat = 54
@@ -110,6 +120,15 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var topEdge: CGFloat = 0
     private var lastDismissal = Date.distantPast
     private(set) var isVisible = false
+    /// The Quick Look panel while this controller drives it.
+    private var previewPanel: QLPreviewPanel?
+    /// Set from the moment a preview is asked for until it has closed, so the
+    /// panel does not dismiss itself when Quick Look takes key status.
+    private var previewRequested = false
+    /// The file Quick Look was last given, so background refreshes of the
+    /// list do not reload an unchanged preview.
+    private var previewedPath: String?
+    private var reloadingResults = false
     /// Asked to open the settings window (Command-comma in the panel).
     var onOpenSettings: (() -> Void)?
 
@@ -119,6 +138,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
                             backing: .buffered, defer: true)
         super.init()
+        panel.previewController = self
         ResultCellView.compact = false
         ResultCellView.invertsWhenChosen = false
         buildWindow()
@@ -280,6 +300,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         let menu = NSMenu()
         menu.addItem(withTitle: "打开", action: #selector(openSelection), keyEquivalent: "").target = self
         menu.addItem(withTitle: "在访达中显示", action: #selector(revealSelection), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "快速查看", action: #selector(showPreview), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "复制完整路径", action: #selector(copyPath), keyEquivalent: "").target = self
         menu.addItem(withTitle: "复制名称", action: #selector(copyName), keyEquivalent: "").target = self
@@ -365,6 +386,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         guard isVisible else { return }
         isVisible = false
         lastDismissal = Date()
+        closePreview()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = Motion.reduced ? 0.1 : Motion.dismiss
             panel.animator().alphaValue = 0
@@ -376,7 +398,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     func windowDidResignKey(_ notification: Notification) {
         // `--pin` keeps the panel open while it is being inspected by testing tools.
-        if !CommandLine.arguments.contains("--pin") { hide() }
+        // Quick Look taking key status is not a reason to go away.
+        guard !CommandLine.arguments.contains("--pin"), !previewRequested, !isPreviewShown else { return }
+        hide()
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -517,6 +541,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 self.hits = response.hits
                 self.total = response.total
                 self.totalIsExact = response.totalIsExact
+                // Reloading passes the selection through the first row on the
+                // way back to the user's row; the preview follows only the end.
+                self.reloadingResults = true
                 self.table.reloadData()
                 if keepingSelection, let previousPath,
                    let row = response.hits.firstIndex(where: { $0.path == previousPath }) {
@@ -529,6 +556,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 self.placeSelection(animated: false)
                 self.updateFooter()
                 self.resizeToFit()
+                self.reloadingResults = false
+                self.followSelectionInPreview()
             }
         }
     }
@@ -580,6 +609,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         placeSelection(animated: true)
+        followSelectionInPreview()
     }
 
     /// Slides the soft highlight to the selected row. The slide is short
@@ -644,8 +674,21 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// the field; Command-comma opens the settings.
     private func installCopyShortcut() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.isVisible, event.window === self.panel,
-                  event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command else { return event }
+            guard let self, self.isVisible else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Option-Space and Command-Y open and close Quick Look, also while
+            // its panel has key status. Catching Option-Space here keeps the
+            // field from receiving the no-break space it would otherwise type.
+            let optionSpace = event.keyCode == 49 && flags == .option
+            let commandY = flags == .command && event.charactersIgnoringModifiers?.lowercased() == "y"
+            if optionSpace || commandY, event.window === self.panel || event.window is QLPreviewPanel {
+                if self.isPreviewShown || self.selectedHit != nil {
+                    self.togglePreview()
+                    return nil
+                }
+                return optionSpace ? nil : event
+            }
+            guard event.window === self.panel, flags == .command else { return event }
             if event.charactersIgnoringModifiers == "," {
                 self.hide()
                 self.onOpenSettings?()
@@ -682,6 +725,118 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         table.scrollRowToVisible(row)
     }
 
+    // MARK: Quick Look
+
+    private var isPreviewShown: Bool {
+        QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+    }
+
+    /// Option-Space and Command-Y: opens Quick Look on the selected file, or
+    /// closes it when it is already open.
+    @objc func togglePreview() {
+        if isPreviewShown { closePreview() } else { showPreview() }
+    }
+
+    /// Opens Quick Look on the selected file without taking focus from the
+    /// search field, so typing and the arrow keys keep working on the list.
+    @objc private func showPreview() {
+        guard isVisible, selectedHit != nil, let quickLook = QLPreviewPanel.shared() else { return }
+        previewRequested = true
+        // Quick Look finds its controller through the key window, so the
+        // search panel must hold key status when the preview is asked for.
+        if !panel.isKeyWindow { refocusField() }
+        if previewPanel == nil { quickLook.updateController() }
+        debugLog("preview key=\(panel.isKeyWindow) controller=\(previewPanel != nil)")
+        // Above the search panel, which floats over ordinary windows.
+        quickLook.level = NSWindow.Level(rawValue: panel.level.rawValue + 1)
+        quickLook.reloadData()
+        if !quickLook.isVisible { quickLook.orderFront(nil) }
+        // Without a controller there is nothing to show; do not leave the
+        // panel unable to dismiss itself.
+        guard previewPanel != nil else { closePreview(); previewRequested = false; return }
+        // Ordering Quick Look in can leave it holding key status; give it back.
+        if !panel.isKeyWindow { refocusField() }
+    }
+
+    /// Shows the newly selected file in the open preview.
+    private func followSelectionInPreview() {
+        guard !reloadingResults, let previewPanel, selectedHit?.path != previewedPath else { return }
+        previewPanel.reloadData()
+    }
+
+    private func closePreview() {
+        guard isPreviewShown else { previewRequested = false; return }
+        QLPreviewPanel.shared().orderOut(nil)
+    }
+
+    /// Returns the keyboard to the search field without selecting its text.
+    private func refocusField() {
+        guard isVisible else { return }
+        panel.makeKey()
+        if field.currentEditor() == nil {
+            panel.makeFirstResponder(field)
+            let end = (field.stringValue as NSString).length
+            field.currentEditor()?.selectedRange = NSRange(location: end, length: 0)
+        }
+    }
+
+    fileprivate func beginPreview(_ quickLook: QLPreviewPanel) {
+        debugLog("beginPreview")
+        previewPanel = quickLook
+        quickLook.dataSource = self
+        quickLook.delegate = self
+    }
+
+    fileprivate func endPreview(_ quickLook: QLPreviewPanel) {
+        debugLog("endPreview visible=\(quickLook.isVisible)")
+        previewPanel = nil
+        quickLook.dataSource = nil
+        quickLook.delegate = nil
+        previewedPath = nil
+        let wasRequested = previewRequested
+        previewRequested = false
+        // Closing the preview (Esc or Space in its own panel, or its close
+        // button) hands the keyboard back to the search field. Quick Look
+        // still counts as visible at this point, so look once it has gone.
+        guard wasRequested else { return }
+        DispatchQueue.main.async { [weak self] in
+            if !quickLook.isVisible { self?.refocusField() }
+        }
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { selectedHit == nil ? 0 : 1 }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        // A file that is gone or unreadable gets Quick Look's own notice.
+        previewedPath = selectedHit?.path
+        return selectedHit.map { NSURL(fileURLWithPath: $0.path) }
+    }
+
+    /// While Quick Look holds key status, the keys that steer the list still do.
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        switch event.keyCode {
+        case 125: moveSelection(by: 1)
+        case 126: moveSelection(by: -1)
+        case 36, 76: flags.contains(.command) ? revealSelection() : openSelection()
+        default: return false
+        }
+        return true
+    }
+
+    /// Lets Quick Look zoom out of, and back into, the selected row.
+    func previewPanel(_ quickLook: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!) -> NSRect {
+        let row = table.selectedRow
+        guard isVisible, hits.indices.contains(row) else { return .zero }
+        let rect = table.rect(ofRow: row)
+        guard table.visibleRect.intersects(rect) else { return .zero }
+        return self.panel.convertToScreen(table.convert(rect, to: nil))
+    }
+
+    /// Test hook: moves the selection the way the arrow keys do.
+    func moveSelectionForTesting(by delta: Int) { moveSelection(by: delta) }
+
     // MARK: Keyboard
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -695,7 +850,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
             setScope(path: !searchesPath)
         case #selector(NSResponder.cancelOperation(_:)):
-            if field.stringValue.isEmpty { hide() } else {
+            if isPreviewShown { closePreview() } else if field.stringValue.isEmpty { hide() } else {
                 field.stringValue = ""
                 runQuery()
             }

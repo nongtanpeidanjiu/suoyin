@@ -61,6 +61,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                             object: nil, queue: .main) { [weak self] _ in
             self?.panel.show(anchor: nil)
         }
+        // Test hooks for Quick Look: the same path as Option-Space, and the
+        // arrow keys (object "1" or "-1").
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.preview"),
+                                                            object: nil, queue: .main) { [weak self] _ in
+            self?.panel.togglePreview()
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.select"),
+                                                            object: nil, queue: .main) { [weak self] note in
+            self?.panel.moveSelectionForTesting(by: Int(note.object as? String ?? "") ?? 1)
+        }
 
         if CommandLine.arguments.contains("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {

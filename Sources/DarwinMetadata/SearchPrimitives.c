@@ -19,6 +19,79 @@ enum { KIND_MASK = 3, ANCHOR = 0, DIRECTORY = 2, HIDDEN = 4, EXCLUDED = 16 | 32 
 static const char *original(const DMQueryView *v, uint32_t id) {
     return (const char *)v->names + v->rows[id].offset;
 }
+
+uint8_t dm_file_kind(const char *name, uint8_t attribute) {
+    // Keep the sorted suffix list and the acceptance document in sync.
+    static const struct { const char *suffix; uint8_t kind; } formats[] = {
+        {"3fr", DM_KIND_IMAGE}, {"3gp", DM_KIND_VIDEO}, {"7z", DM_KIND_ARCHIVE},
+        {"aac", DM_KIND_AUDIO}, {"aif", DM_KIND_AUDIO}, {"aiff", DM_KIND_AUDIO},
+        {"alac", DM_KIND_AUDIO}, {"arw", DM_KIND_IMAGE}, {"avi", DM_KIND_VIDEO},
+        {"avif", DM_KIND_IMAGE}, {"bmp", DM_KIND_IMAGE}, {"bz2", DM_KIND_ARCHIVE},
+        {"cr2", DM_KIND_IMAGE}, {"cr3", DM_KIND_IMAGE}, {"csv", DM_KIND_DOCUMENT},
+        {"dmg", DM_KIND_ARCHIVE}, {"dng", DM_KIND_IMAGE}, {"doc", DM_KIND_DOCUMENT},
+        {"docm", DM_KIND_DOCUMENT}, {"docx", DM_KIND_DOCUMENT}, {"dps", DM_KIND_DOCUMENT},
+        {"epub", DM_KIND_DOCUMENT}, {"et", DM_KIND_DOCUMENT}, {"flac", DM_KIND_AUDIO},
+        {"flv", DM_KIND_VIDEO}, {"gif", DM_KIND_IMAGE}, {"gz", DM_KIND_ARCHIVE},
+        {"heic", DM_KIND_IMAGE}, {"heif", DM_KIND_IMAGE}, {"icns", DM_KIND_IMAGE},
+        {"ico", DM_KIND_IMAGE}, {"iso", DM_KIND_ARCHIVE}, {"j2k", DM_KIND_IMAGE},
+        {"jp2", DM_KIND_IMAGE}, {"jpeg", DM_KIND_IMAGE}, {"jpg", DM_KIND_IMAGE},
+        {"key", DM_KIND_DOCUMENT}, {"m2ts", DM_KIND_VIDEO}, {"m4a", DM_KIND_AUDIO},
+        {"m4v", DM_KIND_VIDEO}, {"md", DM_KIND_DOCUMENT}, {"mid", DM_KIND_AUDIO},
+        {"midi", DM_KIND_AUDIO}, {"mkv", DM_KIND_VIDEO}, {"mov", DM_KIND_VIDEO},
+        {"mp3", DM_KIND_AUDIO}, {"mp4", DM_KIND_VIDEO}, {"mpeg", DM_KIND_VIDEO},
+        {"mpg", DM_KIND_VIDEO}, {"mts", DM_KIND_VIDEO}, {"nef", DM_KIND_IMAGE},
+        {"nrw", DM_KIND_IMAGE}, {"numbers", DM_KIND_DOCUMENT}, {"odp", DM_KIND_DOCUMENT},
+        {"ods", DM_KIND_DOCUMENT}, {"odt", DM_KIND_DOCUMENT}, {"ogg", DM_KIND_AUDIO},
+        {"opus", DM_KIND_AUDIO}, {"orf", DM_KIND_IMAGE}, {"pages", DM_KIND_DOCUMENT},
+        {"pdf", DM_KIND_DOCUMENT}, {"pef", DM_KIND_IMAGE}, {"png", DM_KIND_IMAGE},
+        {"ppt", DM_KIND_DOCUMENT}, {"pptm", DM_KIND_DOCUMENT}, {"pptx", DM_KIND_DOCUMENT},
+        {"psd", DM_KIND_IMAGE}, {"raf", DM_KIND_IMAGE}, {"rar", DM_KIND_ARCHIVE},
+        {"raw", DM_KIND_IMAGE}, {"rtf", DM_KIND_DOCUMENT}, {"rw2", DM_KIND_IMAGE},
+        {"srf", DM_KIND_IMAGE}, {"svg", DM_KIND_IMAGE}, {"tar", DM_KIND_ARCHIVE},
+        {"tbz", DM_KIND_ARCHIVE}, {"tbz2", DM_KIND_ARCHIVE}, {"tgz", DM_KIND_ARCHIVE},
+        {"tif", DM_KIND_IMAGE}, {"tiff", DM_KIND_IMAGE}, {"tsv", DM_KIND_DOCUMENT},
+        {"txt", DM_KIND_DOCUMENT}, {"txz", DM_KIND_ARCHIVE}, {"wav", DM_KIND_AUDIO},
+        {"webm", DM_KIND_VIDEO}, {"webp", DM_KIND_IMAGE}, {"wma", DM_KIND_AUDIO},
+        {"wmv", DM_KIND_VIDEO}, {"wps", DM_KIND_DOCUMENT}, {"xar", DM_KIND_ARCHIVE},
+        {"xls", DM_KIND_DOCUMENT}, {"xlsm", DM_KIND_DOCUMENT}, {"xlsx", DM_KIND_DOCUMENT},
+        {"xz", DM_KIND_ARCHIVE}, {"zip", DM_KIND_ARCHIVE}, {"zst", DM_KIND_ARCHIVE}
+    };
+    bool directory = (attribute & KIND_MASK) == DIRECTORY;
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) return DM_KIND_ANY;
+    char suffix[8];
+    size_t length = 0;
+    for (const char *p = dot + 1; *p; p++) {
+        if (length == sizeof(suffix) - 1) return DM_KIND_ANY;
+        unsigned char c = (unsigned char)*p;
+        suffix[length++] = (char)(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+    }
+    suffix[length] = '\0';
+    if (directory && strcmp(suffix, "app") == 0) return DM_KIND_APPLICATION;
+    size_t lo = 0, hi = sizeof(formats) / sizeof(*formats);
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int order = strcmp(suffix, formats[mid].suffix);
+        if (order == 0) return formats[mid].kind;
+        if (order < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return DM_KIND_ANY;
+}
+
+void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds) {
+    for (uint32_t id = 0; id < v->row_count; id++) {
+        kinds[id] = (v->attributes[id] & KIND_MASK) == ANCHOR
+            ? DM_KIND_ANY : dm_file_kind(original(v, id), v->attributes[id]);
+    }
+}
+
+static bool matches_kind(const DMQueryView *v, uint32_t id, uint8_t kind) {
+    if (kind == DM_KIND_ANY) return true;
+    if (kind == DM_KIND_FOLDER) return (v->attributes[id] & KIND_MASK) == DIRECTORY;
+    return v->file_kinds[id] == kind;
+}
+
 static const char *key(const DMQueryView *v, uint32_t id) {
     uint32_t offset = v->fold_offsets[id];
     return offset == UINT32_MAX ? original(v, id) : (const char *)v->folded_names + offset;
@@ -303,7 +376,7 @@ static uint32_t advance(const char *pattern, uint32_t length, const uint32_t *fa
 // A slash-bearing word can end in a basename only when its stem ends at
 // the parent slash and its remaining tail is a prefix of the basename.
 static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits,
-                       bool all, size_t *visible_matches, uint32_t *sole_match) {
+                       bool all, uint8_t file_kind, size_t *visible_matches, uint32_t *sole_match) {
     const char *tail = strrchr(word, '/') + 1;
     uint32_t stem = (uint32_t)(tail - word);
     size_t tail_length = strlen(tail);
@@ -325,7 +398,7 @@ static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits,
         hits[i] = (uint8_t)(prior_match || (root ? folded_contains(name, word) :
                    inherited == stem && folded_prefix(name, tail, tail_length)));
         if (hits[i]) {
-            if (visible(v->attributes[i], all) &&
+            if (visible(v->attributes[i], all) && matches_kind(v, i, file_kind) &&
                 (!v->suppressed_rows || !(v->suppressed_rows[i >> 3] & (1U << (i & 7))))) {
                 if ((*visible_matches)++ == 0) *sole_match = i;
             }
@@ -352,14 +425,15 @@ static bool all_words(const char *name, const uint8_t *patterns, const uint32_t 
 
 static size_t select_order(const DMQueryView *v, const uint32_t *ids, const uint8_t *matches,
                            const uint8_t *patterns, const uint32_t *offsets, size_t words,
-                           bool descending, bool all, size_t offset, size_t limit,
+                           bool descending, bool all, uint8_t kind, size_t offset, size_t limit,
                            size_t budget, uint32_t *out) {
     size_t emitted = 0, skipped = 0;
     for (size_t i = 0; i < budget && emitted < limit; i++) {
         uint32_t id = ids[descending ? v->row_count - i - 1 : i];
-        if (!visible(v->attributes[id], all) ||
+        if (matches && !matches[id]) continue;
+        if (!visible(v->attributes[id], all) || !matches_kind(v, id, kind) ||
             (v->suppressed_rows && (v->suppressed_rows[id >> 3] & (1U << (id & 7))))) continue;
-        if (matches ? !matches[id] : words && !all_words(key(v, id), patterns, offsets, words)) continue;
+        if (!matches && words && !all_words(key(v, id), patterns, offsets, words)) continue;
         if (skipped < offset) { skipped++; continue; }
         out[emitted++] = id;
     }
@@ -373,6 +447,7 @@ typedef struct {
     bool ok;
     bool any;
     bool all;
+    uint8_t kind;
     size_t visible_matches;
     uint32_t sole_match;
 } PathWord;
@@ -384,7 +459,8 @@ static void *path_word(void *argument) {
     memset(hits, 0, view->row_count);
     task->ok = true;
     if (strchr(task->word, '/')) {
-        task->ok = slash_hits(view, task->word, hits, task->all, &task->visible_matches, &task->sole_match);
+        task->ok = slash_hits(view, task->word, hits, task->all, task->kind,
+                              &task->visible_matches, &task->sole_match);
         task->any = task->ok && task->visible_matches != 0;
         return NULL;
     }
@@ -401,13 +477,13 @@ static void *path_word(void *argument) {
 
 size_t dm_query(const DMQueryView *v, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *offsets, size_t words,
-                bool path, bool descending, bool all, size_t offset,
+                bool path, bool descending, bool all, uint8_t kind, size_t offset,
                 size_t limit, uint32_t *results) {
     size_t n = v->row_count;
     if (!path || !words) {
         size_t budget = !words || n < 2048 ? n : 2048;
         size_t emitted = select_order(v, order, NULL, patterns, offsets, words,
-                                      descending, all, offset, limit, budget, results);
+                                      descending, all, kind, offset, limit, budget, results);
         if (emitted == limit || budget == n) return emitted;
     }
 
@@ -432,10 +508,10 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
                 if (matches[i] && !all_words(key(v, i), patterns, offsets, words)) matches[i] = 0;
         }
     } else {
-        PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all};
+        PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all, .kind = kind};
         size_t next = 1;
         if (words > 1 && n >= 50000) {
-            PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all};
+            PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all, .kind = kind};
             pthread_t thread;
             bool started = pthread_create(&thread, NULL, path_word, &second) == 0;
             path_word(&first);
@@ -455,7 +531,7 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
             if (first.visible_matches == 1 && limit == 1) only_path_hit = first.sole_match;
         }
         for (size_t j = next; j < words && ok && any; j++) {
-            PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all};
+            PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all, .kind = kind};
             path_word(&task);
             ok = task.ok;
             any = task.any;
@@ -469,7 +545,7 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         result = 1;
     } else {
         result = !ok ? SIZE_MAX : !any ? 0 :
-            select_order(v, order, matches, NULL, NULL, 0, descending, all, offset, limit, n, results);
+            select_order(v, order, matches, NULL, NULL, 0, descending, all, kind, offset, limit, n, results);
     }
     if (single != matches) scratch_release(single, n);
     scratch_release(matches, n);

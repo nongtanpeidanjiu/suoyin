@@ -71,6 +71,7 @@ final class ExternalVolumes {
     private let directory: String
     private var session: DASession?
     private var active: [String: Active] = [:]
+    private var initialDiscoveryComplete = false
     private var offline: [String: ExternalVolumeStatus] = [:]
     private var retiring: Set<String> = []
     private var lastMounts: [ExternalMount] = []
@@ -109,6 +110,8 @@ final class ExternalVolumes {
             }, context)
             DASessionSetDispatchQueue(session, self.queue)
             self.refresh()
+            self.lock.withLock { self.initialDiscoveryComplete = true }
+            self.engineObserver?(.status)
         }
     }
 
@@ -257,6 +260,10 @@ final class ExternalVolumes {
 
     func searchable() -> [Active] {
         lock.withLock { active.values.sorted { $0.key < $1.key } }
+    }
+
+    func engineMounts() -> (discovered: Bool, volumes: [Active]) {
+        lock.withLock { (initialDiscoveryComplete, active.values.sorted { $0.key < $1.key }) }
     }
 
     func isCurrent(_ volume: Active) -> Bool {

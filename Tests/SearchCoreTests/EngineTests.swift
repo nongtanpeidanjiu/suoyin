@@ -72,6 +72,80 @@ struct EngineTests {
         #expect(reopened.search(EngineQuery(text: "engine-data", showAll: true)).hits.isEmpty)
     }
 
+    @Test func kindsComposeWithPagingOrderingAndPublishedEdits() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let documents = ["sample.PDF", ".sample.TXT", "sample.pages"]
+        let folders = ["sample-directory", "sample.APP", "sample.pages"]
+        let files = documents.dropLast() + ["sample.HEIC", "sample.CR3", "sample.FLAC", "sample.MOV",
+                                            "sample.tar.GZ", "sample.dmg", "sample-not-a-package.app"]
+        for name in folders {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(name),
+                                                    withIntermediateDirectories: false)
+        }
+        for (size, name) in files.enumerated() {
+            try Data(repeating: 0, count: size).write(to: root.appendingPathComponent(name))
+        }
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        let tracker = try ChangeTracker(root: root.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path)
+        let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+        defer { engine.stop() }
+        engine.start()
+        try #require(until { engine.status.inaccessibleLocationsVerified })
+
+        let expected: [EngineKind: [String]] = [
+            .folder: folders, .document: documents, .image: ["sample.HEIC", "sample.CR3"],
+            .audio: ["sample.FLAC"], .video: ["sample.MOV"],
+            .archive: ["sample.tar.GZ", "sample.dmg"], .application: ["sample.APP"]
+        ]
+        for mode in [QueryMode.name, .path] {
+            for column in [SearchColumn.name, .path, .size, .modified] {
+                for direction in [SearchDirection.ascending, .descending] {
+                    for showAll in [false, true] {
+                        let text = mode == .name ? "sample" : root.path + "/ sample"
+                        var query = EngineQuery(text: text, mode: mode, column: column,
+                                                direction: direction, showAll: showAll)
+                        let all = engine.search(query).hits.map(\.name)
+                        for (kind, names) in expected {
+                            query.kind = kind
+                            let result = engine.search(query)
+                            let matched = all.filter { names.contains($0) }
+                            #expect(result.hits.map(\.name) == matched)
+                            #expect(result.totalIsExact && result.total == matched.count)
+                        }
+                    }
+                }
+            }
+        }
+        let wrongKind = EngineQuery(text: root.path + "/sample.HEIC", mode: .path, kind: .video)
+        #expect(engine.search(wrongKind).hits.isEmpty)
+        var page = EngineQuery(text: "sample", kind: .image, limit: 1)
+        let first = engine.search(page)
+        #expect(first.hits.count == 1 && first.total == 2 && !first.totalIsExact)
+        page.offset = 1
+        let second = engine.search(page)
+        #expect(second.hits.count == 1 && second.total == 2 && second.totalIsExact)
+        page.text = " \t"
+        #expect(engine.search(page).hits.isEmpty && engine.search(page).totalIsExact)
+
+        try FileManager.default.moveItem(at: root.appendingPathComponent("sample.HEIC"),
+                                         to: root.appendingPathComponent("sample.MP4"))
+        tracker.recheckCoverage(at: [root.path])
+        tracker.synchronize()
+        #expect(engine.search(EngineQuery(text: "sample", kind: .image)).hits.map(\.name) == ["sample.CR3"])
+        #expect(engine.search(EngineQuery(text: "sample", kind: .video)).hits.count == 2)
+        engine.stop()
+
+        let reopened = try SearchEngine(dataDirectory: data, root: root.path)
+        defer { reopened.stop() }
+        reopened.start()
+        try #require(until { reopened.status.inaccessibleLocationsVerified })
+        #expect(reopened.search(EngineQuery(text: "sample", kind: .application)).hits.map(\.name) == ["sample.APP"])
+        #expect(reopened.search(EngineQuery(text: "sample", kind: .video)).hits.count == 2)
+    }
+
     @Test func permissionsNotificationAndManualRebuild() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -100,7 +174,7 @@ struct EngineTests {
         try #require(until { events.status?.inaccessibleLocations.first?.reason == .filePermissions })
         #expect(engine.search(EngineQuery(text: "known-file")).hits.isEmpty)
         engine.recheckAccess()
-        try #require(until { engine.status.inaccessiblePaths.isEmpty })
+        try #require(until { engine.status.inaccessibleLocationsVerified && engine.status.inaccessiblePaths.isEmpty })
         #expect(engine.search(EngineQuery(text: "known-file")).total == 1)
         for _ in 0..<10 { tracker.injectPermissionObservation(folder.path, .restricted) }
         try #require(until { engine.status.inaccessiblePaths == [folder.path] })
@@ -111,6 +185,67 @@ struct EngineTests {
         let times = events.indexTimes
         #expect(times.count >= 2)
         #expect(zip(times, times.dropFirst()).allSatisfy { $1 - $0 >= 245_000_000 })
+    }
+
+    @Test func denialReportWaitsForRevocationAndRevalidatesPersistedDenialsOnGrant() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let documents = root.appendingPathComponent("Documents")
+        let child = documents.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try Data().write(to: child.appendingPathComponent("protected-record.txt"))
+        let trace = AccessTrace()
+        trace.granted = true
+        let access = ContainerAccess(home: root.path, probe: { trace.granted })
+        let entered = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        func makeEngine() throws -> (SearchEngine, ChangeTracker) {
+            let tracker = try ChangeTracker(root: root.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                            ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                            containerAccess: access, accessObservation: { path in
+                guard path == documents.path else { return nil }
+                entered.signal()
+                _ = resume.wait(timeout: .now() + .seconds(5))
+                return trace.granted ? nil : .denied(EPERM)
+            })
+            return (SearchEngine(dataDirectory: data, tracker: tracker), tracker)
+        }
+        let (engine, tracker) = try makeEngine()
+        defer { engine.stop() }
+        engine.start()
+        try #require(until { engine.status.inaccessibleLocationsVerified })
+        let query = EngineQuery(text: "protected-record")
+        #expect(engine.search(query).total == 1)
+        tracker.injectPermissionObservation(child.path, .denied(EACCES))
+        try #require(until { engine.status.rawInaccessibleLocations.map(\.path) == [child.path] })
+
+        trace.granted = false
+        engine.recheckAccess()
+        try #require(entered.wait(timeout: .now() + .seconds(3)) == .success)
+        #expect(until { !engine.status.inaccessibleLocationsVerified && engine.status.inaccessibleLocationCount == 0 })
+        resume.signal()
+        try #require(until {
+            engine.status.inaccessibleLocationsVerified && engine.status.rawInaccessibleLocations.map(\.path) == [documents.path]
+        })
+        #expect(engine.search(query).hits.isEmpty)
+        try tracker.save()
+        engine.stop()
+
+        trace.granted = true
+        let (reopened, reopenedTracker) = try makeEngine()
+        defer { reopened.stop() }
+        reopened.start()
+        try #require(entered.wait(timeout: .now() + .seconds(3)) == .success)
+        #expect(!reopened.status.inaccessibleLocationsVerified && reopened.status.inaccessibleLocationCount == 0)
+        resume.signal()
+        // The restored scope is observed again during reconciliation.
+        resume.signal()
+        try #require(until { reopened.status.inaccessibleLocationsVerified })
+        #expect(reopened.status.inaccessibleLocationCount == 0)
+        #expect(reopened.search(query).total == 1)
+        #expect(reopenedTracker.snapshotStatus().coverageRestricted.isEmpty)
     }
 
     @Test func inaccessibleLocationsPreserveCountsAndReasonsAcrossTheDisk() {

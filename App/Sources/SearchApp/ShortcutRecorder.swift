@@ -1,10 +1,10 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// A field showing the global shortcut. Click it, then press a new key
-/// combination; Esc cancels.
+/// A field showing a shortcut. Click it, then press a new key combination;
+/// Esc cancels. Used for every shortcut row in the settings window.
 final class ShortcutRecorder: NSControl {
-    var shortcut: Shortcut = .standard { didSet { refresh() } }
+    var shortcut: Shortcut { didSet { refresh() } }
     /// Called with the combination the user pressed; the owner decides whether it is accepted.
     var onRecord: ((Shortcut) -> Void)?
     var onRecordingChange: ((Bool) -> Void)?
@@ -12,8 +12,9 @@ final class ShortcutRecorder: NSControl {
     private let face = NSTextField(string: "")
     private var liveModifiers: NSEvent.ModifierFlags = []
 
-    override init(frame: NSRect) {
-        super.init(frame: frame)
+    init(name: String, shortcut: Shortcut) {
+        self.shortcut = shortcut
+        super.init(frame: .zero)
         face.isEditable = false
         face.isSelectable = false
         face.isBezeled = true
@@ -32,7 +33,7 @@ final class ShortcutRecorder: NSControl {
         ])
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
-        setAccessibilityLabel("全局快捷键")
+        setAccessibilityLabel(name)
         setAccessibilityHelp("按下后输入新的组合键，按 Esc 取消")
         refresh()
     }

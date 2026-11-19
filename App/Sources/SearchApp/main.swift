@@ -9,10 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: SearchPanelController!
     private var statusItem: NSStatusItem!
     private var hotKey: HotKey!
+    private var shortcuts: ShortcutCenter!
     private lazy var accessGuide = AccessGuideController { [weak self] in self?.service.recheckAccess() }
     private lazy var settings = SettingsWindowController(
-        service: service, hotKey: hotKey,
-        onShortcutChange: { [weak self] in self?.updateToolTip() },
+        service: service, shortcuts: shortcuts,
         onShowAccessGuide: { [weak self] in self?.accessGuide.show() })
     private var spinner: Timer?
     private var angle: CGFloat = 0
@@ -32,9 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         hotKey = HotKey { [weak self] in self?.panel.toggle(anchor: nil) }
-        // A saved shortcut that can no longer be registered falls back to the default.
-        if case .failure = hotKey.register(Shortcut.saved) { _ = hotKey.register(.standard) }
-        updateToolTip()
+        shortcuts = ShortcutCenter(hotKey: hotKey)
+        shortcuts.onChange = { [weak self] in self?.shortcutsChanged() }
+        // Puts right saved shortcuts that clash, then registers the global one.
+        shortcuts.start()
 
         service.onStatusChange = { [weak self] status in
             DispatchQueue.main.async {
@@ -156,8 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func settingsDidChangeDockIcon() { settings.reassert() }
 
-    private func updateToolTip() {
-        let shortcut = hotKey.shortcut.map { "（\($0.display)）" } ?? ""
+    private func shortcutsChanged() {
+        panel.previewShortcut = shortcuts.preview
+        let shortcut = shortcuts.registeredGlobal.map { "（\($0.display)）" } ?? ""
         statusItem.button?.toolTip = "文件搜索\(shortcut)"
     }
 
@@ -231,6 +233,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.image = Glyphs.menuBar(.attention)
         }
     }
+}
+
+// `--self-test-shortcuts` checks the shortcut rules and exits.
+if CommandLine.arguments.contains("--self-test-shortcuts") {
+    exit(ShortcutSelfTest.run() ? 0 : 1)
 }
 
 let application = NSApplication.shared

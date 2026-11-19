@@ -14,9 +14,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
     private var current: SettingsPane?
     private var poll: Timer?
 
-    init(service: SearchService, hotKey: HotKey, onShortcutChange: @escaping () -> Void,
-         onShowAccessGuide: @escaping () -> Void) {
-        general = GeneralPane(hotKey: hotKey, onShortcutChange: onShortcutChange)
+    init(service: SearchService, shortcuts: ShortcutCenter, onShowAccessGuide: @escaping () -> Void) {
+        general = GeneralPane(shortcuts: shortcuts)
         scope = ScopePane(service: service, onShowAccessGuide: onShowAccessGuide)
         index = IndexPane(service: service)
         super.init()
@@ -214,9 +213,11 @@ class SettingsPane {
         return (row, field)
     }
 
-    func show(_ row: NSGridRow, _ label: NSTextField, text: String?) {
+    /// `warning` text is red; otherwise it is an ordinary explanation.
+    func show(_ row: NSGridRow, _ label: NSTextField, text: String?, warning: Bool = true) {
         let hidden = text == nil
         if let text { label.stringValue = text }
+        label.textColor = warning ? .systemRed : .secondaryLabelColor
         guard row.isHidden != hidden else { return }
         row.isHidden = hidden
         onSizeChange?()
@@ -226,23 +227,35 @@ class SettingsPane {
 // MARK: General
 
 private final class GeneralPane: SettingsPane {
-    private let hotKey: HotKey
-    private let onShortcutChange: () -> Void
+    /// The controls of one shortcut row.
+    private final class ShortcutRow {
+        let role: ShortcutRole
+        let recorder: ShortcutRecorder
+        let restore = NSButton(title: "恢复默认", target: nil, action: nil)
+        var messageRow: NSGridRow!
+        var message: NSTextField!
+        /// The last refusal stays on screen until the next attempt.
+        var failure: String?
+
+        init(role: ShortcutRole) {
+            self.role = role
+            recorder = ShortcutRecorder(name: role.title, shortcut: role.standard)
+            restore.setAccessibilityLabel("将\(role.title)恢复默认")
+        }
+    }
+
+    private let shortcuts: ShortcutCenter
     private let login = NSButton(checkboxWithTitle: "登录时启动", target: nil, action: nil)
     private var loginMessageRow: NSGridRow!
     private var loginMessage: NSTextField!
     private var loginApprovalRow: NSGridRow!
-    private let recorder = ShortcutRecorder(frame: .zero)
-    private let restore = NSButton(title: "恢复默认", target: nil, action: nil)
-    private var shortcutMessageRow: NSGridRow!
-    private var shortcutMessage: NSTextField!
+    private let shortcutRows = ShortcutRole.allCases.map(ShortcutRow.init)
     private let dock = NSButton(checkboxWithTitle: "在程序坞显示图标", target: nil, action: nil)
     /// The last failure stays on screen until the next attempt.
     private var loginFailure: String?
 
-    init(hotKey: HotKey, onShortcutChange: @escaping () -> Void) {
-        self.hotKey = hotKey
-        self.onShortcutChange = onShortcutChange
+    init(shortcuts: ShortcutCenter) {
+        self.shortcuts = shortcuts
         super.init(identifier: "general", title: "通用", symbol: "gearshape")
 
         login.target = self
@@ -259,24 +272,37 @@ private final class GeneralPane: SettingsPane {
         loginApprovalRow = addRow(nil, approval)
         loginApprovalRow.isHidden = true
 
-        recorder.onRecord = { [weak self] in self?.apply($0) }
-        recorder.onRecordingChange = { [weak self] recording in
-            guard let self else { return }
-            if recording {
-                self.hotKey.suspend()
-                self.show(self.shortcutMessageRow, self.shortcutMessage, text: nil)
-            } else {
-                self.hotKey.resume()
+        for (index, row) in shortcutRows.enumerated() {
+            row.recorder.onRecord = { [weak self, weak row] in
+                if let row { self?.apply($0, to: row) }
             }
+            row.recorder.onRecordingChange = { [weak self, weak row] recording in
+                guard let self, let row else { return }
+                if recording {
+                    // Pressing the current global shortcut must reach the
+                    // recorder, to be recorded or refused like any other.
+                    self.shortcuts.suspendGlobal()
+                    row.failure = nil
+                    self.show(row.messageRow, row.message, text: nil)
+                } else {
+                    self.shortcuts.resumeGlobal()
+                }
+            }
+            row.restore.tag = index
+            row.restore.target = self
+            row.restore.action = #selector(restoreDefault(_:))
+            let controls = NSStackView(views: [row.recorder, row.restore])
+            controls.spacing = 8
+            controls.alignment = .firstBaseline
+            addRow("\(row.role.title)：", controls, gap: index == 0 ? 14 : 10)
+            addRow(nil, note(Self.explanation(row.role)))
+            (row.messageRow, row.message) = messageRow()
         }
-        restore.target = self
-        restore.action = #selector(restoreDefault)
-        let shortcutRow = NSStackView(views: [recorder, restore])
-        shortcutRow.spacing = 8
-        shortcutRow.alignment = .firstBaseline
-        addRow("全局快捷键：", shortcutRow, gap: 14)
-        addRow(nil, note("在任何地方按下这组键都可以打开或收起搜索。点按上面的框，然后按下新的组合键；按 Esc 取消。"))
-        (shortcutMessageRow, shortcutMessage) = messageRow()
+        addRow(nil, note("""
+            点按框后按下新的组合键，按 Esc 取消。组合需包含 ⌃、⌥、⌘ 中的至少一个（F1 至 F12 可以单独使用）；\
+            两个快捷键不能相同，也不能与面板里的固定按键、文本编辑的标准按键或系统已启用的快捷键相同。\
+            其他应用占用的组合无法事先查出：全局快捷键要在登记失败时才知道，有的应用直接截取按键，这种冲突本软件发现不了。
+            """), gap: 4)
 
         dock.target = self
         dock.action = #selector(toggleDock)
@@ -284,15 +310,38 @@ private final class GeneralPane: SettingsPane {
         addRow(nil, note("关闭时只在菜单栏显示图标。"))
     }
 
+    private static func explanation(_ role: ShortcutRole) -> String {
+        switch role {
+        case .global: return "在任何地方按下都可以打开或收起搜索。"
+        case .preview: return "在搜索面板里按下，用快速查看预览选中的文件。⌘Y 也始终可以预览，不能更改。"
+        }
+    }
+
     override func reload() {
         reloadLoginItem()
-        recorder.shortcut = hotKey.shortcut ?? Shortcut.saved
-        restore.isEnabled = recorder.shortcut != .standard
+        for row in shortcutRows {
+            row.recorder.shortcut = shortcuts.current(row.role)
+            row.restore.isEnabled = row.recorder.shortcut != row.role.standard
+            if let failure = row.failure {
+                show(row.messageRow, row.message, text: failure)
+            } else if let notice = shortcuts.notices[row.role] {
+                show(row.messageRow, row.message, text: notice, warning: false)
+            } else if row.role == .preview, shortcuts.isTakenBySystem(.preview) {
+                // System shortcuts can change while this application runs.
+                show(row.messageRow, row.message,
+                     text: "\(row.recorder.shortcut.display) 现已被系统快捷键占用，在面板里按下不会生效，请换一组。")
+            } else if row.role == .global, shortcuts.registeredGlobal == nil {
+                show(row.messageRow, row.message,
+                     text: "\(row.recorder.shortcut.display) 已被其他应用占用，全局快捷键目前不可用，请换一组。")
+            } else {
+                show(row.messageRow, row.message, text: nil)
+            }
+        }
         dock.state = NSApp.activationPolicy() == .regular ? .on : .off
     }
 
     func cancelRecording() {
-        if recorder.isRecording { recorder.window?.makeFirstResponder(nil) }
+        for row in shortcutRows where row.recorder.isRecording { row.recorder.window?.makeFirstResponder(nil) }
     }
 
     // MARK: Login item
@@ -328,22 +377,21 @@ private final class GeneralPane: SettingsPane {
 
     // MARK: Shortcut
 
-    private func apply(_ shortcut: Shortcut) {
-        switch hotKey.register(shortcut) {
-        case .success:
-            shortcut.save()
-            show(shortcutMessageRow, shortcutMessage, text: nil)
-        case .failure(let failure):
-            hotKey.resume()
-            show(shortcutMessageRow, shortcutMessage, text: "\(shortcut.display)：\(failure.message)")
+    private func apply(_ shortcut: Shortcut, to row: ShortcutRow) {
+        if let problem = shortcuts.change(row.role, to: shortcut) {
+            shortcuts.resumeGlobal()
+            row.failure = problem.refusal(for: shortcut)
+        } else {
+            row.failure = nil
         }
         reload()
-        onShortcutChange()
     }
 
-    @objc private func restoreDefault() {
+    @objc private func restoreDefault(_ sender: NSButton) {
+        guard shortcutRows.indices.contains(sender.tag) else { return }
         cancelRecording()
-        apply(.standard)
+        let row = shortcutRows[sender.tag]
+        apply(row.role.standard, to: row)
     }
 
     // MARK: Dock

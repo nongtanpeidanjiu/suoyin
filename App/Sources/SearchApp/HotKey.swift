@@ -6,8 +6,7 @@ struct Shortcut: Equatable {
     var keyCode: UInt32
     var modifiers: UInt32
 
-    /// Option + Shift + Space.
-    static let standard = Shortcut(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey))
+    static let relevantModifiers = UInt32(controlKey | optionKey | shiftKey | cmdKey)
 
     init(keyCode: UInt32, modifiers: UInt32) {
         self.keyCode = keyCode
@@ -15,30 +14,36 @@ struct Shortcut: Equatable {
     }
 
     init(event: NSEvent) {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        self.init(keyCode: UInt32(event.keyCode), modifiers: Self.modifiers(of: event))
+    }
+
+    /// Control, Option, Shift and Command of a key event as Carbon flags;
+    /// Caps Lock, Fn and the keypad flag are ignored.
+    static func modifiers(of event: NSEvent) -> UInt32 {
+        let flags = event.modifierFlags
         var carbon: UInt32 = 0
         if flags.contains(.control) { carbon |= UInt32(controlKey) }
         if flags.contains(.option) { carbon |= UInt32(optionKey) }
         if flags.contains(.shift) { carbon |= UInt32(shiftKey) }
         if flags.contains(.command) { carbon |= UInt32(cmdKey) }
-        self.init(keyCode: UInt32(event.keyCode), modifiers: carbon)
+        return carbon
     }
 
-    /// Shift alone would take over ordinary capital letters everywhere, so
-    /// at least one of Control, Option and Command is required.
-    var hasRequiredModifier: Bool {
-        modifiers & UInt32(controlKey | optionKey | cmdKey) != 0
+    func matches(_ event: NSEvent) -> Bool {
+        UInt32(event.keyCode) == keyCode && Self.modifiers(of: event) == modifiers
     }
 
-    /// Symbols in the system's order, for example "⌥⇧空格".
-    var display: String {
+    static func symbols(_ modifiers: UInt32) -> String {
         var text = ""
         if modifiers & UInt32(controlKey) != 0 { text += "⌃" }
         if modifiers & UInt32(optionKey) != 0 { text += "⌥" }
         if modifiers & UInt32(shiftKey) != 0 { text += "⇧" }
         if modifiers & UInt32(cmdKey) != 0 { text += "⌘" }
-        return text + Self.keyName(keyCode)
+        return text
     }
+
+    /// Symbols in the system's order, for example "⌥⇧空格".
+    var display: String { Self.symbols(modifiers) + Self.keyName(keyCode) }
 
     /// Spoken form for VoiceOver, for example "Option Shift 空格".
     var spoken: String {
@@ -50,46 +55,68 @@ struct Shortcut: Equatable {
         return (parts + [Self.keyName(keyCode)]).joined(separator: " ")
     }
 
-    // MARK: Persistence
-
-    private static let codeKey = "hotKeyCode"
-    private static let modifiersKey = "hotKeyModifiers"
-
-    static var saved: Shortcut {
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: codeKey) != nil, defaults.object(forKey: modifiersKey) != nil else { return .standard }
-        let shortcut = Shortcut(keyCode: UInt32(defaults.integer(forKey: codeKey)),
-                                modifiers: UInt32(defaults.integer(forKey: modifiersKey)))
-        return shortcut.hasRequiredModifier ? shortcut : .standard
+    /// The key equivalent a menu item shows for this combination.
+    var menuKeyEquivalent: (key: String, modifiers: NSEvent.ModifierFlags)? {
+        let key: String
+        if let special = Self.menuKeys[Int(keyCode)] {
+            key = String(Character(UnicodeScalar(special)!))
+        } else if let character = Self.layoutCharacter(keyCode) {
+            key = character
+        } else {
+            return nil
+        }
+        var flags: NSEvent.ModifierFlags = []
+        if modifiers & UInt32(controlKey) != 0 { flags.insert(.control) }
+        if modifiers & UInt32(optionKey) != 0 { flags.insert(.option) }
+        if modifiers & UInt32(shiftKey) != 0 { flags.insert(.shift) }
+        if modifiers & UInt32(cmdKey) != 0 { flags.insert(.command) }
+        return (key, flags)
     }
 
-    func save() {
-        let defaults = UserDefaults.standard
-        if self == .standard {
-            defaults.removeObject(forKey: Self.codeKey)
-            defaults.removeObject(forKey: Self.modifiersKey)
-        } else {
-            defaults.set(Int(keyCode), forKey: Self.codeKey)
-            defaults.set(Int(modifiers), forKey: Self.modifiersKey)
+    private static let menuKeys: [Int: Int] = [
+        kVK_Space: 0x20, kVK_Return: 0x0D, kVK_ANSI_KeypadEnter: 0x03, kVK_Tab: 0x09, kVK_Delete: 0x08,
+        kVK_Escape: 0x1B, kVK_ForwardDelete: NSDeleteFunctionKey, kVK_LeftArrow: NSLeftArrowFunctionKey,
+        kVK_RightArrow: NSRightArrowFunctionKey, kVK_UpArrow: NSUpArrowFunctionKey,
+        kVK_DownArrow: NSDownArrowFunctionKey, kVK_Home: NSHomeFunctionKey, kVK_End: NSEndFunctionKey,
+        kVK_PageUp: NSPageUpFunctionKey, kVK_PageDown: NSPageDownFunctionKey,
+        kVK_F1: NSF1FunctionKey, kVK_F2: NSF2FunctionKey, kVK_F3: NSF3FunctionKey, kVK_F4: NSF4FunctionKey,
+        kVK_F5: NSF5FunctionKey, kVK_F6: NSF6FunctionKey, kVK_F7: NSF7FunctionKey, kVK_F8: NSF8FunctionKey,
+        kVK_F9: NSF9FunctionKey, kVK_F10: NSF10FunctionKey, kVK_F11: NSF11FunctionKey, kVK_F12: NSF12FunctionKey,
+    ]
+
+    // MARK: Persistence
+
+    private static func keys(_ role: ShortcutRole) -> (code: String, modifiers: String, changedAt: String) {
+        switch role {
+        // The names the first version used for the only shortcut it had.
+        case .global: return ("hotKeyCode", "hotKeyModifiers", "hotKeyChangedAt")
+        case .preview: return ("previewKeyCode", "previewKeyModifiers", "previewKeyChangedAt")
         }
     }
 
-    // MARK: Conflicts
+    static func stored(_ role: ShortcutRole) -> SavedShortcut {
+        let defaults = UserDefaults.standard
+        let names = keys(role)
+        let changedAt = defaults.double(forKey: names.changedAt)
+        guard defaults.object(forKey: names.code) != nil, defaults.object(forKey: names.modifiers) != nil
+        else { return SavedShortcut(shortcut: nil, changedAt: changedAt) }
+        let shortcut = Shortcut(keyCode: UInt32(defaults.integer(forKey: names.code)),
+                                modifiers: UInt32(defaults.integer(forKey: names.modifiers)) & relevantModifiers)
+        return SavedShortcut(shortcut: shortcut, changedAt: changedAt)
+    }
 
-    /// True when an enabled system shortcut (Spotlight, input source
-    /// switching, screenshots…) already uses this combination. Registering
-    /// such a combination succeeds but the system keeps the key press.
-    var isTakenBySystem: Bool {
-        var unmanaged: Unmanaged<CFArray>?
-        guard CopySymbolicHotKeys(&unmanaged) == noErr, let list = unmanaged?.takeRetainedValue() as? [[String: Any]]
-        else { return false }
-        let relevant = UInt32(controlKey | optionKey | shiftKey | cmdKey)
-        return list.contains { entry in
-            guard (entry[kHISymbolicHotKeyEnabled as String] as? Bool) == true,
-                  let code = (entry[kHISymbolicHotKeyCode as String] as? NSNumber)?.uint32Value,
-                  let flags = (entry[kHISymbolicHotKeyModifiers as String] as? NSNumber)?.uint32Value
-            else { return false }
-            return code == keyCode && flags & relevant == modifiers & relevant
+    /// The default is stored as nothing, so a later version can change it.
+    func save(as role: ShortcutRole) {
+        let defaults = UserDefaults.standard
+        let names = Self.keys(role)
+        if self == role.standard {
+            defaults.removeObject(forKey: names.code)
+            defaults.removeObject(forKey: names.modifiers)
+            defaults.removeObject(forKey: names.changedAt)
+        } else {
+            defaults.set(Int(keyCode), forKey: names.code)
+            defaults.set(Int(modifiers), forKey: names.modifiers)
+            defaults.set(Date().timeIntervalSince1970, forKey: names.changedAt)
         }
     }
 
@@ -123,17 +150,20 @@ struct Shortcut: Equatable {
         guard status == noErr, length > 0 else { return "?" }
         return String(utf16CodeUnits: characters, count: length).uppercased()
     }
+
+    /// The lowercase character a key types on the current layout, or nil
+    /// for keys that type none.
+    static func layoutCharacter(_ code: UInt32) -> String? {
+        guard specialKeys[Int(code)] == nil else { return nil }
+        let name = keyName(code)
+        return name == "?" ? nil : name.lowercased()
+    }
 }
 
 /// The one system-wide shortcut, registered through the Carbon hot key
 /// service, which needs no accessibility or input-monitoring permission.
+/// The rules for which combinations are allowed live in ShortcutCenter.
 final class HotKey {
-    enum Failure: Error {
-        case missingModifier
-        case takenBySystem
-        case taken
-    }
-
     private var reference: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private var serial: UInt32 = 0
@@ -165,20 +195,19 @@ final class HotKey {
 
     private static let signature = OSType(0x4653_4831)
 
-    /// Switches to `new`. On failure the previous shortcut stays registered.
-    func register(_ new: Shortcut) -> Result<Void, Failure> {
-        guard new.hasRequiredModifier else { return .failure(.missingModifier) }
-        if new == shortcut, reference != nil { return .success(()) }
-        if new.isTakenBySystem { return .failure(.takenBySystem) }
+    /// Switches to `new`. Fails when another application registered the
+    /// combination first; the previous shortcut then stays registered.
+    func register(_ new: Shortcut) -> Bool {
+        if new == shortcut, reference != nil { return true }
         var created: EventHotKeyRef?
         let id = EventHotKeyID(signature: Self.signature, id: serial + 1)
         let status = RegisterEventHotKey(new.keyCode, new.modifiers, id, GetApplicationEventTarget(), 0, &created)
-        guard status == noErr, let created else { return .failure(.taken) }
+        guard status == noErr, let created else { return false }
         if let reference { UnregisterEventHotKey(reference) }
         reference = created
         serial += 1
         shortcut = new
-        return .success(())
+        return true
     }
 
     /// Stops listening while a new shortcut is being recorded, so pressing
@@ -194,16 +223,6 @@ final class HotKey {
         let id = EventHotKeyID(signature: Self.signature, id: serial)
         if RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, id, GetApplicationEventTarget(), 0, &created) == noErr {
             reference = created
-        }
-    }
-}
-
-extension HotKey.Failure {
-    var message: String {
-        switch self {
-        case .missingModifier: return "快捷键需要包含 ⌃、⌥ 或 ⌘ 中的至少一个。"
-        case .takenBySystem: return "这组按键已被系统快捷键占用，仍使用原来的快捷键。"
-        case .taken: return "这组按键已被其他应用占用，仍使用原来的快捷键。"
         }
     }
 }

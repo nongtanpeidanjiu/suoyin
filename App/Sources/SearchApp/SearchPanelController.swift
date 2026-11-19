@@ -131,6 +131,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var reloadingResults = false
     /// Asked to open the settings window (Command-comma in the panel).
     var onOpenSettings: (() -> Void)?
+    /// The user's key for Quick Look; Command-Y always works as well.
+    var previewShortcut = ShortcutRole.preview.standard {
+        didSet { showPreviewShortcutInMenu() }
+    }
+    private var previewMenuItem: NSMenuItem?
 
     init(service: SearchService) {
         self.service = service
@@ -263,6 +268,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         table.target = self
         table.doubleAction = #selector(openSelection)
         table.rowMenu = makeRowMenu()
+        showPreviewShortcutInMenu()
         table.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
         installCopyShortcut()
         installOutsideDismissal()
@@ -300,11 +306,22 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         let menu = NSMenu()
         menu.addItem(withTitle: "打开", action: #selector(openSelection), keyEquivalent: "").target = self
         menu.addItem(withTitle: "在访达中显示", action: #selector(revealSelection), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "快速查看", action: #selector(showPreview), keyEquivalent: "").target = self
+        let preview = menu.addItem(withTitle: "快速查看", action: #selector(showPreview), keyEquivalent: "")
+        preview.target = self
+        previewMenuItem = preview
         menu.addItem(.separator())
         menu.addItem(withTitle: "复制完整路径", action: #selector(copyPath), keyEquivalent: "").target = self
         menu.addItem(withTitle: "复制名称", action: #selector(copyName), keyEquivalent: "").target = self
         return menu
+    }
+
+    /// The row menu lists the current preview key next to “快速查看”. The
+    /// menu exists only while it is open, so the key does not act through it.
+    private func showPreviewShortcutInMenu() {
+        guard let item = previewMenuItem else { return }
+        let equivalent = previewShortcut.menuKeyEquivalent
+        item.keyEquivalent = equivalent?.key ?? ""
+        item.keyEquivalentModifierMask = equivalent?.modifiers ?? []
     }
 
     // MARK: Showing and hiding
@@ -670,42 +687,47 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
-    /// Command-C copies the selected file's path unless text is selected in
-    /// the field; Command-comma opens the settings.
+    /// The keys the panel acts on before the search field sees them: the
+    /// preview key, and the fixed keys with a panel action in PanelKeys.
+    /// The arrows, Return, Tab and Esc come through the field's text
+    /// system instead (see `control(_:textView:doCommandBy:)`).
     private func installCopyShortcut() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.isVisible else { return event }
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            // Option-Space and Command-Y open and close Quick Look, also while
-            // its panel has key status. Catching Option-Space here keeps the
-            // field from receiving the no-break space it would otherwise type.
-            let optionSpace = event.keyCode == 49 && flags == .option
-            let commandY = flags == .command && event.charactersIgnoringModifiers?.lowercased() == "y"
-            if optionSpace || commandY, event.window === self.panel || event.window is QLPreviewPanel {
+            let inPanel = event.window === self.panel
+            let action = PanelKeys.action(for: event)
+            // The preview key and Command-Y open and close Quick Look, also
+            // while its panel has key status. The preview key is caught even
+            // without a selection, so that Option-Space and the like never
+            // type a character into the field.
+            let isPreviewKey = self.previewShortcut.matches(event)
+            if isPreviewKey || action == .quickLook, inPanel || event.window is QLPreviewPanel {
                 if self.isPreviewShown || self.selectedHit != nil {
                     self.togglePreview()
                     return nil
                 }
-                return optionSpace ? nil : event
+                return isPreviewKey ? nil : event
             }
-            guard event.window === self.panel, flags == .command else { return event }
-            if event.charactersIgnoringModifiers == "," {
+            guard inPanel, let action else { return event }
+            switch action {
+            case .settings:
                 self.hide()
                 self.onOpenSettings?()
                 return nil
-            }
-            // The field editor never turns Command-Return into a command, so
-            // catch the key itself (Return and keypad Enter).
-            if event.keyCode == 36 || event.keyCode == 76 {
+            case .reveal:
+                // The field editor never turns Command-Return into a command.
                 guard self.selectedHit != nil else { return event }
                 self.revealSelection()
                 return nil
+            case .copyPath:
+                // Selected text in the field is copied as usual.
+                guard (self.field.currentEditor()?.selectedRange.length ?? 0) == 0,
+                      self.selectedHit != nil else { return event }
+                self.copyPath()
+                return nil
+            case .quickLook:
+                return event
             }
-            guard event.charactersIgnoringModifiers == "c",
-                  (self.field.currentEditor()?.selectedRange.length ?? 0) == 0,
-                  self.selectedHit != nil else { return event }
-            self.copyPath()
-            return nil
         }
     }
 
@@ -731,7 +753,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
     }
 
-    /// Option-Space and Command-Y: opens Quick Look on the selected file, or
+    /// The preview key and Command-Y: opens Quick Look on the selected file, or
     /// closes it when it is already open.
     @objc func togglePreview() {
         if isPreviewShown { closePreview() } else { showPreview() }

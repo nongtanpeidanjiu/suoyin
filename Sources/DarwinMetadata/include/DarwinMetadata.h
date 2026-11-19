@@ -46,15 +46,22 @@ typedef struct {
     const uint32_t *fold_offsets;
     const uint32_t *fold_rows;
     const uint8_t *suppressed_rows;
+    const uint8_t *file_kinds;
     size_t row_count, name_bytes, fold_bytes, fold_count;
 } DMQueryView;
 
 bool dm_has_non_ascii(const uint8_t *name, size_t length);
+enum {
+    DM_KIND_ANY, DM_KIND_FOLDER, DM_KIND_DOCUMENT, DM_KIND_IMAGE,
+    DM_KIND_AUDIO, DM_KIND_VIDEO, DM_KIND_ARCHIVE, DM_KIND_APPLICATION
+};
+uint8_t dm_file_kind(const char *name, uint8_t attribute);
+void dm_classify_kinds(const DMQueryView *view, uint8_t *kinds);
 void dm_name_order(const DMQueryView *view, uint32_t *order);
 bool dm_column_order(const DMQueryView *view, uint32_t *order, int column);
 size_t dm_query(const DMQueryView *view, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *word_offsets, size_t words,
-                bool path, bool descending, bool show_all, size_t offset,
+                bool path, bool descending, bool show_all, uint8_t kind, size_t offset,
                 size_t limit, uint32_t *results);
 
 #endif

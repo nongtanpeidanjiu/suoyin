@@ -181,9 +181,11 @@ public struct SearchIndex {
     /// Bounded exact selection formats only the requested rows.
     public func directSearch(_ query: String, mode: QueryMode = .name,
                              column: SearchColumn = .name, direction: SearchDirection = .ascending,
-                             showAll: Bool = false, offset: Int = 0, limit: Int = 50) -> [SearchRow] {
+                             showAll: Bool = false, kind: EngineKind = .any,
+                             offset: Int = 0, limit: Int = 50) -> [SearchRow] {
         guard let capacity = pageCapacity(offset: offset, limit: limit) else { return [] }
         let words = Self.queryWords(query).map { Data($0) }
+        let type = kind.code
         func before(_ a: UInt32, _ b: UInt32) -> Bool {
             let order = compare(a, b, column)
             return direction == .ascending ? order < 0 : order > 0
@@ -192,6 +194,11 @@ public struct SearchIndex {
         first.reserveCapacity(min(capacity, records.count))
         for i in records.indices where visible(attributes[i], showAll) && !isSuppressed(i) {
             let id = UInt32(i)
+            if kind == .folder {
+                guard attributes[i] & Kind.mask == Kind.directory else { continue }
+            } else if kind != .any {
+                guard name(id).withCString({ dm_file_kind($0, attributes[i]) }) == type else { continue }
+            }
             if !words.isEmpty {
                 let text = mode == .name ? name(id) : fullPath(id)
                 let bytes = Data(Self.key(text))

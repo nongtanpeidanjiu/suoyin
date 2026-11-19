@@ -266,6 +266,9 @@ private final class ScanSession {
             })
         }
         index = consume retained
+        if let coverage = index.tracking {
+            for path in coverage.restricted { restrictions[path] = coverage.denialErrors?[path] ?? 0 }
+        }
         index.volumes = listeners.checkpoints
         if scope.wholeDisk { index.reserve(2_250_000, nameBytes: 52_000_000) }
     }
@@ -470,8 +473,7 @@ private func CFUUIDCreateString(_ value: CFUUID) -> CFString {
 extension WalkScope {
     var dataVolumeRoots: [String] { [dataRoot] + mirrors.map { String($0.dropFirst(dataRoot.count)) } }
 
-    var protectedStartupRoots: [String] {
-        let home = NSHomeDirectory()
+    func protectedAccessRoots(home: String) -> [String] {
         return [
             "/Desktop", "/Documents", "/Downloads", "/Library/Mail", "/Library/Messages",
             "/Library/Calendars", "/Library/Safari", "/Library/CloudStorage",

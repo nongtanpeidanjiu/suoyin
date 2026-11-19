@@ -8,12 +8,14 @@ private struct EngineCommand: Decodable {
     let column: SearchColumn?
     let direction: SearchDirection?
     let showAll: Bool?
+    let kind: String?
     let offset: Int?
     let limit: Int?
 
     var engineQuery: EngineQuery {
         EngineQuery(text: query ?? "", mode: mode ?? .name, column: column ?? .name,
                     direction: direction ?? .ascending, showAll: showAll ?? false,
+                    kind: kind.flatMap(EngineKind.init(rawValue:)) ?? .any,
                     offset: offset ?? 0, limit: limit ?? 50)
     }
 }
@@ -28,6 +30,7 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
         "inaccessibleLocations": status.inaccessibleLocations.map(encodeLocation),
         "rawInaccessibleLocations": status.rawInaccessibleLocations.map(encodeLocation),
         "inaccessibleLocationCount": status.inaccessibleLocationCount,
+        "inaccessibleLocationsVerified": status.inaccessibleLocationsVerified,
         "awaitingFullDiskAccess": status.awaitingFullDiskAccess,
         "pendingFullDiskAccessPaths": status.pendingFullDiskAccessPaths,
         "pendingFullDiskAccessCount": status.pendingFullDiskAccessCount,
@@ -37,9 +40,10 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
     case .starting: result["phase"] = "starting"
     case .scanning: result["phase"] = "scanning"
     case .ready: result["phase"] = "ready"
-    case let .supplementing(name):
+    case let .supplementing(name, indexed):
         result["phase"] = "supplementing"
         result["name"] = name
+        result["indexed"] = indexed
     case .recovering: result["phase"] = "recovering"
     case let .failed(error):
         result["phase"] = "failed"
@@ -83,6 +87,10 @@ func runEngineCLI(_ args: [String]) throws {
             }
             switch command.op {
             case "query":
+                guard command.kind == nil || command.kind.flatMap(EngineKind.init(rawValue:)) != nil else {
+                    try write("bad-command")
+                    return false
+                }
                 let query = command.engineQuery
                 let start = DispatchTime.now().uptimeNanoseconds
                 let result = engine.search(query)

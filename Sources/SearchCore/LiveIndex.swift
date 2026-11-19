@@ -104,6 +104,8 @@ struct LiveIndex {
     var state: TrackingState
     private var directories: [String: UInt32] = [:]
     private let links: DirectoryLinks?
+    private var countedCloudRoots: CloudRoots?
+    private(set) var cloudEntryCounts: [String: Int] = [:]
 
     init(base: SearchIndex, root: String, linkChildren: Bool = true) {
         self.base = base
@@ -127,13 +129,54 @@ struct LiveIndex {
         prepareDelta()
     }
 
+    mutating func countCloudEntries(in roots: CloudRoots) {
+        guard countedCloudRoots == nil, let links else { return }
+        countedCloudRoots = roots
+        var starts: [UInt32: String] = [:]
+        let storageRoots = roots.storage.map { [$0, dataRoot + $0] } ?? []
+        for storage in storageRoots {
+            for (name, id) in baseChildren(storage) {
+                let path = joinedPath(storage, name)
+                if base.attributes[Int(id)] & Kind.mask == Kind.directory,
+                   let provider = roots.provider(containing: path) { starts[id] = provider }
+            }
+        }
+        if let iCloud = roots.iCloud {
+            for path in [iCloud, dataRoot + iCloud] {
+                if let id = directoryID(path) { starts[id] = path }
+            }
+        }
+        for (path, id) in links.anchors {
+            if let provider = roots.provider(containing: path) { starts[id] = provider }
+        }
+        for (id, provider) in starts {
+            var count = 0
+            var pending = [id]
+            while let row = pending.popLast() {
+                let i = Int(row)
+                if base.visible(base.attributes[i], true) && !base.isSuppressed(i) { count += 1 }
+                links.forEachChild(row) { pending.append($0) }
+            }
+            cloudEntryCounts[provider, default: 0] += count
+        }
+        for (path, entry) in state.changes where base.visible(entry.attribute, true) {
+            if let provider = roots.provider(containing: path) { cloudEntryCounts[provider, default: 0] += 1 }
+        }
+    }
+
     private static func partition(_ path: String) -> Int {
         let hash = path.utf8.reduce(UInt32(2_166_136_261)) { ($0 ^ UInt32($1)) &* 16_777_619 }
         return Int(hash) & (partitionCount - 1)
     }
 
     private mutating func change(_ value: TrackedEntry?, at path: String) {
-        guard state.changes[path] != value else { return }
+        let previous = state.changes[path]
+        guard previous != value else { return }
+        if let provider = countedCloudRoots?.provider(containing: path) {
+            let wasCounted = previous.map { base.visible($0.attribute, true) } ?? false
+            let isCounted = value.map { base.visible($0.attribute, true) } ?? false
+            if wasCounted != isCounted { cloudEntryCounts[provider, default: 0] += isCounted ? 1 : -1 }
+        }
         rowRevision &+= 1
         let parent = parentPath(path)
         state.changes[path] = value
@@ -260,6 +303,13 @@ struct LiveIndex {
                                         observe: (String) -> DirectoryObservation?) -> [String] {
         var reopened: [String] = []
         for path in paths where inside(path, state.root) {
+            // A reopened ancestor is reconciled after startup verification.
+            // Revisit its historical denials then, even if their directories
+            // have disappeared and won't be discovered in the new listing.
+            if isRestricted(path, includingSelf: false) {
+                if reopened.contains(where: { inside(path, $0) }) { reopened.append(path) }
+                continue
+            }
             switch observe(path) {
             case let .readable(own, children, denied):
                 if state.restricted.contains(path) { reopened.append(path) }
@@ -267,8 +317,11 @@ struct LiveIndex {
                     reopened += reconcile(path: path, observed: .readable(own: own, children: children, denied: denied))
                 }
             case .absent: reopened += reconcile(path: path, observed: .absent)
-            case .pending(let dataless): _ = reconcile(path: path, observed: .pending(dataless: dataless))
-            case .deferred, .restricted, nil: _ = reconcile(path: path, observed: .restricted)
+            case .pending(let dataless):
+                state.clearDenials(in: path)
+                _ = reconcile(path: path, observed: .pending(dataless: dataless))
+            case .deferred: state.clearDenials(in: path)
+            case .restricted, nil: _ = reconcile(path: path, observed: .restricted)
             case .denied(let error): _ = reconcile(path: path, observed: .denied(error))
             }
         }
@@ -412,31 +465,39 @@ struct LiveIndex {
             return
         }
         if value == baseEntry(original) {
-            suppressBase(Int(original), false)
+            suppressBase(Int(original), false, provider: countedCloudRoots?.provider(containing: path))
             change(nil, at: path)
         } else {
-            suppressBase(Int(original), true)
+            suppressBase(Int(original), true, provider: countedCloudRoots?.provider(containing: path))
             change(value, at: path)
         }
     }
 
-    private mutating func suppressBase(_ id: Int, _ suppress: Bool) {
+    private mutating func suppressBase(_ id: Int, _ suppress: Bool, provider: String?) {
         guard base.isSuppressed(id) != suppress else { return }
         base.setSuppressed(id, suppress)
         if base.visible(base.attributes[id], true) {
             baseEntryCount += suppress ? -1 : 1
+            if let provider { cloudEntryCounts[provider, default: 0] += suppress ? -1 : 1 }
             rowRevision &+= 1
         }
     }
 
     mutating func removeSubtree(_ path: String, includingRoot: Bool) {
         if let root = directoryID(path) {
-            if includingRoot { suppressBase(Int(root), true) }
+            let provider = countedCloudRoots?.provider(containing: path)
+            let containsCloudRoots = provider == nil &&
+                [countedCloudRoots?.storage, countedCloudRoots?.iCloud].compactMap { $0 }.contains {
+                    inside($0, path) || inside(dataRoot + $0, path)
+                }
+            if includingRoot { suppressBase(Int(root), true, provider: provider) }
             if let links {
                 var parents = [root]
                 while let parent = parents.popLast() {
                     links.forEachChild(parent) { id in
-                        suppressBase(Int(id), true)
+                        let childProvider = containsCloudRoots
+                            ? countedCloudRoots?.provider(containing: base.fullPath(id)) : provider
+                        suppressBase(Int(id), true, provider: childProvider)
                         if links.head(id) != .max { parents.append(id) }
                     }
                 }
@@ -520,10 +581,12 @@ struct LiveIndex {
             return []
         case .restricted:
             removeSubtree(path, includingRoot: false)
+            state.clearDenials(in: path)
             state.recordDenial(path, error: nil)
             return []
         case .denied(let error):
             removeSubtree(path, includingRoot: false)
+            state.clearDenials(in: path)
             state.recordDenial(path, error: error)
             return []
         case .absent:
@@ -545,7 +608,9 @@ struct LiveIndex {
                 }
             }
             for (name, error) in denied {
-                state.recordDenial(joinedPath(path, name), error: error)
+                let child = joinedPath(path, name)
+                state.clearDenials(in: child)
+                state.recordDenial(child, error: error)
             }
             if path != state.root, let existing = entry(at: path) {
                 var flags = (existing.attribute & ~Kind.dataless) | (own.attribute & Kind.dataless)
@@ -622,19 +687,19 @@ struct LiveSearchView {
     let entryCount: Int
 
     func search(_ query: String, mode: QueryMode, column: SearchColumn, direction: SearchDirection,
-                showAll: Bool, offset: Int, limit: Int) -> [SearchRow] {
+                showAll: Bool, kind: EngineKind = .any, offset: Int, limit: Int) -> [SearchRow] {
         guard offset >= 0, limit > 0, offset <= Int.max - limit else { return [] }
         if overlays.isEmpty {
             return base.search(query, mode: mode, column: column, direction: direction,
-                               showAll: showAll, offset: offset, limit: limit)
+                               showAll: showAll, kind: kind, offset: offset, limit: limit)
         }
         let capacity = offset + limit
         var top = base.search(query, mode: mode, column: column, direction: direction,
-                              showAll: showAll, limit: capacity)
+                              showAll: showAll, kind: kind, limit: capacity)
         for (part, overlay) in overlays.enumerated() where !overlay.records.isEmpty {
             let mask = UInt32(1 << 31) | (UInt32(part) << 27)
             let changed = overlay.search(query, mode: mode, column: column, direction: direction,
-                                         showAll: showAll, limit: capacity).map { item in
+                                         showAll: showAll, kind: kind, limit: capacity).map { item in
                 SearchRow(id: item.id | mask, name: item.name, path: item.path,
                           size: item.size, modified: item.modified, attribute: item.attribute)
             }

@@ -49,6 +49,7 @@ struct PreparedSearch {
     var keyOffsets: [UInt32]
     var changedRows: [UInt32] = []
     var nameOrder: [UInt32] = []
+    var fileKinds: [UInt8] = []
     let columnOrders = ColumnOrders()
 
     init(keyOffsets: [UInt32]) { self.keyOffsets = keyOffsets }
@@ -71,6 +72,15 @@ struct PreparedSearch {
                 keyBytes.append(0)
             }
         }
+        classifyKinds(in: index)
+    }
+
+    mutating func classifyKinds(in index: SearchIndex) {
+        var kinds = [UInt8](repeating: 0, count: index.recordCount)
+        withView(index: index) { view in
+            kinds.withUnsafeMutableBufferPointer { dm_classify_kinds(&view, $0.baseAddress) }
+        }
+        fileKinds = kinds
     }
 
     func withView<T>(index: SearchIndex, _ body: (inout DMQueryView) -> T) -> T {
@@ -81,14 +91,17 @@ struct PreparedSearch {
                         keyOffsets.withUnsafeBufferPointer { offsets in
                             changedRows.withUnsafeBufferPointer { changed in
                                 index.suppressed.withUnsafeBufferPointer { suppressed in
-                                    var view = DMQueryView(rows: rows.baseAddress,
-                                        attributes: attributes.baseAddress, names: names.baseAddress,
-                                        folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
-                                        fold_rows: changed.baseAddress,
-                                        suppressed_rows: suppressed.isEmpty ? nil : suppressed.baseAddress,
-                                        row_count: rows.count, name_bytes: names.count,
-                                        fold_bytes: folded.count, fold_count: changed.count)
-                                    return body(&view)
+                                    fileKinds.withUnsafeBufferPointer { kinds in
+                                        var view = DMQueryView(rows: rows.baseAddress,
+                                            attributes: attributes.baseAddress, names: names.baseAddress,
+                                            folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
+                                            fold_rows: changed.baseAddress,
+                                            suppressed_rows: suppressed.isEmpty ? nil : suppressed.baseAddress,
+                                            file_kinds: kinds.baseAddress,
+                                            row_count: rows.count, name_bytes: names.count,
+                                            fold_bytes: folded.count, fold_count: changed.count)
+                                        return body(&view)
+                                    }
                                 }
                             }
                         }
@@ -133,6 +146,7 @@ extension SearchIndex {
         return [
             "recordsAndAttributes": records.capacity * MemoryLayout<DMRecord>.stride + attributes.capacity,
             "names": names.capacity, "foldedKeys": keyBytes, "sortTables": order,
+            "fileKinds": prepared?.fileKinds.capacity ?? 0,
             "suppressedRows": suppressed.capacity,
         ]
     }
@@ -162,12 +176,12 @@ extension SearchIndex {
 
     public func search(_ query: String, mode: QueryMode = .name, column: SearchColumn = .name,
                        direction: SearchDirection = .ascending, showAll: Bool = false,
-                       offset: Int = 0, limit: Int = 50) -> [SearchRow] {
+                       kind: EngineKind = .any, offset: Int = 0, limit: Int = 50) -> [SearchRow] {
         guard let capacity = pageCapacity(offset: offset, limit: limit),
               !query.utf8.contains(0) else { return [] }
         guard let prepared, let order = prepared.order(for: column, index: self) else {
             return directSearch(query, mode: mode, column: column, direction: direction,
-                                showAll: showAll, offset: offset, limit: limit)
+                                showAll: showAll, kind: kind, offset: offset, limit: limit)
         }
         var words: [UInt8] = []
         var offsets: [UInt32] = []
@@ -185,7 +199,7 @@ extension SearchIndex {
                         ids.withUnsafeMutableBufferPointer { ids in
                             dm_query(&view, order.baseAddress, words.baseAddress, offsets.baseAddress,
                                      offsets.count, mode == .path, direction == .descending,
-                                     showAll, offset, ids.count, ids.baseAddress)
+                                     showAll, kind.code, offset, ids.count, ids.baseAddress)
                         }
                     }
                 }
@@ -193,7 +207,7 @@ extension SearchIndex {
         }
         guard emitted >= 0 && emitted <= length else {
             return directSearch(query, mode: mode, column: column, direction: direction,
-                                showAll: showAll, offset: offset, limit: limit)
+                                showAll: showAll, kind: kind, offset: offset, limit: limit)
         }
         return ids.prefix(emitted).map { row($0) }
     }

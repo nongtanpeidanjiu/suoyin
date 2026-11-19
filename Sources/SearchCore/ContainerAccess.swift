@@ -2,10 +2,12 @@ import Darwin
 import Foundation
 
 struct ContainerAccess {
+    let home: String
     let roots: [String]
     let hasFullDiskAccess: () -> Bool
 
     init(home: String, probe: (() -> Bool)? = nil) {
+        self.home = home
         let library = joinedPath(home, "Library")
         roots = ["Containers", "Group Containers"].map { joinedPath(library, $0) }
         hasFullDiskAccess = probe ?? {

@@ -93,6 +93,7 @@ final class CloudCompletion {
     private var closed = false
     private var online = true
     private var status = CloudCompletionStatus()
+    private(set) var selectedProvider: String?
     var changed: (CloudCompletionStatus) -> Void = { _ in }
     var beforeApply: () -> Void = {}
     var apply: (String, DirectoryObservation) -> Bool = { _, _ in false }
@@ -257,7 +258,9 @@ final class CloudCompletion {
         status.recentFailures = failures.count
         status.pending = jobs.count
         status.inFlight = call != nil
-        status.activeProvider = call.flatMap { roots.provider(containing: $0.path) }.map(leafName)
+        let activeProvider = call.flatMap { roots.provider(containing: $0.path) }
+        status.activeProvider = activeProvider.map(leafName)
+        selectedProvider = jobs.isEmpty ? nil : activeProvider ?? jobs.keys.min().flatMap(roots.provider(containing:))
         changed(status)
     }
 }

@@ -203,6 +203,8 @@ extension SearchIndex {
             var normalized = PreparedSearch(index: index)
             normalized.nameOrder = tables.nameOrder
             tables = normalized
+        } else {
+            tables.classifyKinds(in: index)
         }
         index.prepared = tables
         index.loadedPrepared = true

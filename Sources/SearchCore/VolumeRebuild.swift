@@ -1,7 +1,8 @@
 import Foundation
 
 /// Copy only the sealed system rows and the bridge directories used by Data.
-func sealedVolume(from source: SearchIndex, excluding targets: [String]) -> SearchIndex {
+func sealedVolume(from source: SearchIndex, excluding targets: [String],
+                  coverage: TrackingState? = nil) -> SearchIndex {
     var result = SearchIndex()
     result.reserve(source.recordCount / 4, nameBytes: source.names.count / 4)
     var navigator = LiveIndex(base: source, root: "/", linkChildren: false)
@@ -21,9 +22,15 @@ func sealedVolume(from source: SearchIndex, excluding targets: [String]) -> Sear
             let end = i + 1 < source.recordCount ? Int(source.records[i + 1].offset) : pool.count
             let raw = UnsafeBufferPointer(start: pool.baseAddress!.advanced(by: Int(row.offset)),
                                           count: end - Int(row.offset) - 1)
+            let attribute = source.attributes[i] | (source.isSuppressed(i) ? Kind.suppressed : 0)
             remap[i] = result.append(bytes: raw, parent: parent, size: row.size,
-                                     modified: row.modified, attribute: source.attributes[i])
+                                     modified: row.modified, attribute: attribute)
         }
+    }
+    if let coverage {
+        let retained = coverage.restricted.filter { path in !targets.contains { inside(path, $0) } }
+        result.tracking = TrackingState(root: coverage.root, changes: [:], restricted: retained,
+                                        denialErrors: coverage.denialErrors?.filter { retained.contains($0.key) })
     }
     return result
 }

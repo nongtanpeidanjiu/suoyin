@@ -159,21 +159,37 @@ struct CloudVolumeTests {
         let rootID = base.append("ExampleProvider", parent: storage, attribute: Kind.directory)
         base.append("a", parent: rootID, attribute: Kind.directory | Kind.pending)
         base.append("b", parent: rootID, attribute: Kind.directory | Kind.pending)
+        base.append("already-indexed.pdf", parent: rootID)
+        base.append("unrelated.pdf", parent: baseRoot)
         let deleted = base.append(".Trash", parent: rootID, attribute: Kind.directory | Kind.pending)
         base.append("stale-recycle.txt", parent: deleted)
         base.volumes = [identity.checkpoint(checkpoint)]
         base.prepare()
         let snapshot = own.appendingPathComponent("index").path
         try base.savePrepared(to: snapshot)
-        let timing = CloudCompletion.Timing(timeout: 1_000_000_000, spacing: 10_000_000,
+        let timing = CloudCompletion.Timing(timeout: 3_000_000_000, spacing: 10_000_000,
                                             firstRetry: 60_000_000_000, maximumRetry: 60_000_000_000)
+        let release = DispatchSemaphore(value: 0)
         let first = try ChangeTracker(root: root.path, snapshot: snapshot, ownData: own.path,
                                       wallTime: { Date().timeIntervalSince1970 }, cloudRoots: roots, cloudTiming: timing,
                                       cloudReader: { path, _ in
             guard path == a.path else { throw CocoaError(.fileReadUnknown) }
+            _ = release.wait(timeout: .now() + .seconds(2))
             return .readable(own: folder, children: ["first-metadata.txt": file])
         })
-        first.start()
+        let engine = SearchEngine(dataDirectory: own, tracker: first)
+        defer { engine.stop() }
+        let progress = ProgressEvents()
+        engine.onStatusChange = { progress.record($0.phase) }
+        engine.start()
+        let initial = EnginePhase.supplementing(name: "ExampleProvider", indexed: 4)
+        let advanced = EnginePhase.supplementing(name: "ExampleProvider", indexed: 5)
+        let sawInitial = until { progress.phases.contains(initial) }
+        release.signal()
+        #expect(sawInitial)
+        #expect(until { progress.phases.contains(advanced) })
+        let times = progress.times
+        #expect(zip(times, times.dropFirst()).allSatisfy { $1 - $0 >= 500_000_000 })
         #expect(until {
             let status = first.snapshotStatus().cloud
             return status.completed == 1 && status.totalFailures >= 1 && status.pending == 1
@@ -183,7 +199,7 @@ struct CloudVolumeTests {
         #expect(first.search("stale-recycle", showAll: true).isEmpty)
         try first.save()
         #expect(first.snapshotStatus().journalFrames > 0)
-        try first.stop()
+        engine.stop()
 
         let lock = NSLock()
         var calls: [String] = []
@@ -363,6 +379,7 @@ struct CloudVolumeTests {
         let active = mounts.searchable()
         #expect(active.count == 2)
         #expect(mounts.statuses().allSatisfy { $0.name == "SameName" && $0.slow && $0.entries == 1 })
+        #expect(active.allSatisfy { $0.tracker.engineState().indexed == 1 && $0.tracker.engineState().accessChecked })
         mounts.updateMounts([volumes[1]])
         #expect(mounts.searchable().map { $0.mount.identity.root } == [paths[1].path])
         #expect(mounts.statuses().filter { !$0.online }.count == 1)
@@ -373,5 +390,17 @@ struct CloudVolumeTests {
         let replacement = mounts.searchable().first { $0.mount.identity.root == paths[0].path }
         #expect(replacement?.key != former?.key)
         #expect(replacement?.tracker.snapshotStatus().recovery == "missing")
+    }
+
+    private final class ProgressEvents: @unchecked Sendable {
+        private let lock = NSLock()
+        private var events: [(EnginePhase, UInt64)] = []
+
+        var phases: [EnginePhase] { lock.withLock { events.map(\.0) } }
+        var times: [UInt64] { lock.withLock { events.map(\.1) } }
+
+        func record(_ phase: EnginePhase) {
+            lock.withLock { events.append((phase, DispatchTime.now().uptimeNanoseconds)) }
+        }
     }
 }

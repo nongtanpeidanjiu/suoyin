@@ -157,15 +157,20 @@ struct TrackingTests {
         let dir = try scratch()
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("index").path
+        // An older archive may contain stale denials below a denied parent.
+        let nested = "/fixture/b/removed/missing"
+        older.state.recordDenial(nested, error: EACCES)
         try older.archive().savePrepared(to: path)
         var restarted = LiveIndex(base: try SearchIndex.load(from: path), root: "/fixture")
-        let reopened = restarted.verifyStartupCoverage(at: ["/fixture/b"]) { _ in
+        let reopened = restarted.verifyStartupCoverage(at: ["/fixture/b", nested]) { _ in
             .readable(own: folder, children: ["restored": file])
         }
-        #expect(reopened == ["/fixture/b"])
+        #expect(reopened == ["/fixture/b", nested])
         #expect(filePaths(restarted, query: "deep").isEmpty)
         for path in reopened {
-            _ = restarted.reconcile(path: path, observed: .readable(own: folder, children: ["restored": file]))
+            let observation: DirectoryObservation = path == nested
+                ? .absent : .readable(own: folder, children: ["restored": file])
+            _ = restarted.reconcile(path: path, observed: observation)
         }
         restarted.prepareDelta()
         #expect(restarted.state.restricted.isEmpty)
@@ -207,7 +212,10 @@ struct TrackingTests {
         let dir = try scratch()
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("legacy-index").path
-        let original = fixture()
+        var original = fixture()
+        original.prepared = nil
+        original.append("legacy-type.TXT", parent: 0)
+        original.prepare()
         try original.savePrepared(to: path)
         var data = try Data(contentsOf: URL(fileURLWithPath: path))
         #expect(data[28] == 2)
@@ -225,6 +233,7 @@ struct TrackingTests {
         #expect(loaded.prepared?.columnOrders.bytes == 0)
         #expect(loaded.prepared?.nameOrder == original.prepared?.nameOrder)
         #expect(loaded.search("", column: .path) == original.directSearch("", column: .path))
+        #expect(loaded.search("legacy-type", kind: .document).map(\.name) == ["legacy-type.TXT"])
     }
 
     @Test func privateTemporaryPathsUseTheSameSpellingAsEventPaths() throws {
@@ -341,9 +350,15 @@ struct TrackingTests {
         old.append("sealed", parent: oldRoot)
         let compactedParent = old.append("/Users/fixture/removed", attribute: Kind.anchor)
         old.append("removed-with-parent.txt", parent: compactedParent)
-        let result = sealedVolume(from: old, excluding: ["/Users"])
-        #expect(result.records.count == 2)
+        let suppressed = old.append("previously-withheld", parent: oldRoot)
+        old.setSuppressed(Int(suppressed), true)
+        let coverage = TrackingState(root: "/", changes: [:], restricted: ["/Users/fixture", "/System/fixture"],
+                                     denialErrors: ["/Users/fixture": EPERM, "/System/fixture": EACCES])
+        let result = sealedVolume(from: old, excluding: ["/Users"], coverage: coverage)
+        #expect(result.records.count == 3)
         #expect(result.restoredRows().map(\.path) == ["/sealed"])
+        #expect(result.tracking?.restricted == ["/System/fixture"])
+        #expect(result.tracking?.denialErrors == ["/System/fixture": EACCES])
     }
 
     @Test func lagAgesAppliedPositionsAndCannotOvertakeDeferredWork() {

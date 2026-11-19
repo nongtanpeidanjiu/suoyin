@@ -1,4 +1,22 @@
 import Foundation
+import DarwinMetadata
+
+public enum EngineKind: String, Sendable, CaseIterable {
+    case any, folder, document, image, audio, video, archive, application
+
+    var code: UInt8 {
+        switch self {
+        case .any: return UInt8(DM_KIND_ANY)
+        case .folder: return UInt8(DM_KIND_FOLDER)
+        case .document: return UInt8(DM_KIND_DOCUMENT)
+        case .image: return UInt8(DM_KIND_IMAGE)
+        case .audio: return UInt8(DM_KIND_AUDIO)
+        case .video: return UInt8(DM_KIND_VIDEO)
+        case .archive: return UInt8(DM_KIND_ARCHIVE)
+        case .application: return UInt8(DM_KIND_APPLICATION)
+        }
+    }
+}
 
 public struct EngineQuery: Sendable {
     public var text: String
@@ -6,17 +24,20 @@ public struct EngineQuery: Sendable {
     public var column: SearchColumn
     public var direction: SearchDirection
     public var showAll: Bool
+    public var kind: EngineKind
     public var offset: Int
     public var limit: Int
 
     public init(text: String, mode: QueryMode = .name, column: SearchColumn = .name,
                 direction: SearchDirection = .ascending, showAll: Bool = false,
+                kind: EngineKind = .any,
                 offset: Int = 0, limit: Int = 50) {
         self.text = text
         self.mode = mode
         self.column = column
         self.direction = direction
         self.showAll = showAll
+        self.kind = kind
         self.offset = offset
         self.limit = limit
     }
@@ -54,7 +75,7 @@ public enum EnginePhase: Sendable, Equatable {
     case starting
     case scanning(indexed: Int)
     case ready
-    case supplementing(name: String)
+    case supplementing(name: String, indexed: Int)
     case recovering
     case failed(String)
 }
@@ -64,6 +85,7 @@ public struct EngineStatus: Sendable {
     public let indexedCount: Int
     public let inaccessibleLocations: [InaccessibleLocation]
     public let rawInaccessibleLocations: [InaccessibleLocation]
+    public let inaccessibleLocationsVerified: Bool
     public let pendingFullDiskAccessPaths: [String]
     public let indexBytesOnDisk: Int64
 
@@ -91,6 +113,10 @@ public final class SearchEngine: @unchecked Sendable {
     private var pendingDisk = false
     private var nextRefresh: DispatchTime = .now()
     private var nextIndexNotification: DispatchTime = .now()
+    // The notification queue owns status delivery. A pending delivery reads
+    // the newest reported state, even when progress changes several times.
+    private var statusDeliveryScheduled = false
+    private var nextStatusNotification: DispatchTime = .now()
     private let accessDenials = AccessDenials(home: NSHomeDirectory())
     private var lastCoverage: [String: InaccessibleLocation.Reason] = [:]
     private var reported: EngineStatus
@@ -115,7 +141,8 @@ public final class SearchEngine: @unchecked Sendable {
         directory = dataDirectory
         self.tracker = tracker
         reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessibleLocations: [],
-                                rawInaccessibleLocations: [], pendingFullDiskAccessPaths: [],
+                                rawInaccessibleLocations: [], inaccessibleLocationsVerified: false,
+                                pendingFullDiskAccessPaths: [],
                                 indexBytesOnDisk: Self.diskBytes(directory))
         tracker.observeEngineChanges { [weak self] in self?.scheduleRefresh(for: $0) }
     }
@@ -161,7 +188,7 @@ public final class SearchEngine: @unchecked Sendable {
         }
         let lookahead = query.offset + query.limit < Int.max
         let rows = tracker.search(query.text, mode: query.mode, column: query.column, direction: query.direction,
-                                  showAll: query.showAll, offset: query.offset,
+                                  showAll: query.showAll, kind: query.kind, offset: query.offset,
                                   limit: query.limit + (lookahead ? 1 : 0))
         if rows.isEmpty {
             return EngineResult(hits: [], total: 0, totalIsExact: query.offset == 0)
@@ -202,11 +229,14 @@ public final class SearchEngine: @unchecked Sendable {
             nextRefresh = .now() + .milliseconds(250)
             return pending
         }
-        let local = tracker.snapshotStatus()
-        let external = tracker.engineExternalStates()
-        let count = tracker.indexedEntryCount()
+        let localState = tracker.engineState()
+        let local = localState.status
+        let attached = tracker.engineExternalStates()
+        let external = attached.volumes
+        let count = localState.indexed + external.reduce(0) { $0 + $1.state.indexed }
+        let verified = localState.accessChecked && attached.discovered && external.allSatisfy { $0.state.accessChecked }
         var coverage: [String: InaccessibleLocation.Reason] = [:]
-        for state in [local] + external.map(\.status) {
+        for state in verified ? [local] + external.map(\.state.status) : [] {
             for path in state.coverageRestricted {
                 let reason = accessDenials.reason(at: path, error: state.coverageDenialErrors?[path],
                                                   missingFullDiskAccess: local.awaitingFullDiskAccess)
@@ -223,31 +253,34 @@ public final class SearchEngine: @unchecked Sendable {
         let phase: EnginePhase
         if let error = local.error {
             phase = .failed(error)
-        } else if local.indexReconciling || external.contains(where: { $0.status.indexReconciling }) {
+        } else if local.indexReconciling || external.contains(where: { $0.state.status.indexReconciling }) {
             phase = .recovering
         } else if local.phase == "starting" {
             phase = .starting
         } else if local.phase == "scan-start" || local.phase == "scan-partial" {
             phase = .scanning(indexed: count)
-        } else if let volume = external.first(where: { $0.status.phase != "caught-up" && $0.status.error == nil }) {
-            phase = .supplementing(name: volume.name)
-        } else if local.cloud.pending != 0 {
-            phase = .supplementing(name: tracker.engineCloudProvider() ?? "云盘")
+        } else if let volume = external.first(where: {
+            $0.state.status.phase != "caught-up" && $0.state.status.error == nil
+        }) {
+            phase = .supplementing(name: volume.name, indexed: volume.state.indexed)
+        } else if let cloud = localState.cloudProgress {
+            phase = .supplementing(name: cloud.name, indexed: cloud.indexed)
         } else {
             phase = .ready
         }
         let updated = EngineStatus(phase: phase, indexedCount: count, inaccessibleLocations: restrictions,
-                                   rawInaccessibleLocations: raw,
+                                   rawInaccessibleLocations: raw, inaccessibleLocationsVerified: verified,
                                    pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
                                    indexBytesOnDisk: bytes)
-        let (statusCallback, indexCallback) = lock.withLock {
+        let indexCallback = lock.withLock {
             reported = updated
-            return (statusHandler, indexHandler)
+            return indexHandler
         }
         if phase != previous.phase || count != previous.indexedCount ||
+            verified != previous.inaccessibleLocationsVerified ||
             coverageChanged || updated.pendingFullDiskAccessPaths != previous.pendingFullDiskAccessPaths ||
             bytes != previous.indexBytesOnDisk {
-            statusCallback?(updated)
+            scheduleStatusDelivery()
         }
         if index, let indexCallback {
             let deliver = lock.withLock {
@@ -258,6 +291,18 @@ public final class SearchEngine: @unchecked Sendable {
             }
             if deliver { indexCallback() }
             else { scheduleRefresh(for: .index) }
+        }
+    }
+
+    private func scheduleStatusDelivery() {
+        guard !statusDeliveryScheduled else { return }
+        statusDeliveryScheduled = true
+        notifications.asyncAfter(deadline: nextStatusNotification) { [weak self] in
+            guard let self else { return }
+            self.statusDeliveryScheduled = false
+            let (callback, status) = self.lock.withLock { (self.statusHandler, self.reported) }
+            callback?(status)
+            self.nextStatusNotification = .now() + .milliseconds(500)
         }
     }
 

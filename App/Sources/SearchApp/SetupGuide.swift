@@ -202,13 +202,13 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         let points = smallNote("接下来用几步完成设置。每一步的选择立即生效；\n随时可以关闭本窗口，以后在“设置”里也都能更改。",
                                color: .tertiaryLabelColor)
         points.alignment = .center
-        return page(icon: NSApp.applicationIconImage, symbol: nil, title: "欢迎使用文件搜索",
+        return page(icon: NSApp.applicationIconImage, symbol: nil, title: "欢迎使用\(AppName.short)",
                     body: "按文件名搜索整台电脑，输入几个字就能找到文件。\n只读取文件名、大小和修改时间，不读文件内容，不联网。",
                     below: [points])
     }
 
     private func accessPage() -> NSView {
-        accessSteps.stringValue = "在“完整磁盘访问权限”列表里打开“文件搜索预览”的开关。\n列表里没有时，点下方的“＋”，从“应用程序”里添加。"
+        accessSteps.stringValue = "在“完整磁盘访问权限”列表里打开“\(AppName.displayed)”的开关。\n列表里没有时，点下方的“＋”，从“应用程序”里添加。"
         accessSteps.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         accessSteps.textColor = .secondaryLabelColor
         accessSteps.alignment = .center

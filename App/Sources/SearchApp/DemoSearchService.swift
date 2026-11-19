@@ -67,7 +67,7 @@ final class DemoSearchService: SearchService {
     private var forgetError: ExternalVolumeSettingsError?
     private let launchVolumeError: ExternalVolumeSettingsError? = {
         let arguments = CommandLine.arguments
-        guard let flag = arguments.firstIndex(of: "--demo-volume-error") else { return nil }
+        guard TestHooks.enabled, let flag = arguments.firstIndex(of: "--demo-volume-error") else { return nil }
         let categories: [String: ExternalVolumeSettingsError.Category] = [
             "readSettings": .readSettings, "invalidSettings": .invalidSettings, "backupSettings": .backupSettings,
             "writeSettings": .writeSettings, "inspectIndex": .inspectIndex, "verifyIdentity": .verifyIdentity,

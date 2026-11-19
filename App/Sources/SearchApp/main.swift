@@ -3,17 +3,17 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The real core by default; `--demo` keeps the stand-in data for interface
     /// work. `--data-dir <path>` points the core at another data directory, so
-    /// tests that change the index leave the user's own alone.
+    /// tests that change the index leave the user's own alone. Both are test
+    /// hooks (see TestHooks.swift).
     private let service: SearchService = {
-        if !CommandLine.arguments.contains("--demo"),
+        if !TestHooks.flag("--demo"),
            let real = try? CoreSearchService(dataDirectory: AppDelegate.testDataDirectory) { return real }
         return DemoSearchService()
     }()
 
     private static var testDataDirectory: URL? {
-        guard let flag = CommandLine.arguments.firstIndex(of: "--data-dir"),
-              CommandLine.arguments.indices.contains(flag + 1) else { return nil }
-        let path = (CommandLine.arguments[flag + 1] as NSString).expandingTildeInPath
+        guard let value = TestHooks.value(after: "--data-dir") else { return nil }
+        let path = (value as NSString).expandingTildeInPath
         return URL(fileURLWithPath: path, isDirectory: true)
     }
     private var panel: SearchPanelController!
@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.setAccessibilityLabel("文件搜索")
+            button.setAccessibilityLabel(AppName.short)
         }
 
         hotKey = HotKey { [weak self] in self?.panel.toggle(anchor: nil) }
@@ -79,12 +79,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // is the one the earlier single-page access guide set, so whoever saw
         // that one is not asked again. `--show-setup` opens it regardless,
         // for testing.
-        let forced = CommandLine.arguments.contains("--show-setup")
-        if forced || (!UserDefaults.standard.bool(forKey: "accessGuideShown") && !CommandLine.arguments.contains("--show")) {
+        let forced = TestHooks.flag("--show-setup")
+        if forced || (!UserDefaults.standard.bool(forKey: "accessGuideShown") && !TestHooks.flag("--show")) {
             if !forced { UserDefaults.standard.set(true, forKey: "accessGuideShown") }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.setupGuide.show(at: .welcome) }
         }
 
+        if TestHooks.enabled { installTestHooks() }
+    }
+
+    /// Distributed notifications and launch arguments that drive the
+    /// interface from test scripts. Only with test hooks enabled.
+    private func installTestHooks() {
         // Lets test scripts open the panel the way the shortcut does.
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.show"),
                                                             object: nil, queue: .main) { [weak self] _ in
@@ -125,19 +131,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.panel.moveSelectionForTesting(by: Int(note.object as? String ?? "") ?? 1)
         }
 
-        if CommandLine.arguments.contains("--show") {
+        if TestHooks.flag("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 self.panel.show(anchor: nil)
-                if let flag = CommandLine.arguments.firstIndex(of: "--query"),
-                   CommandLine.arguments.indices.contains(flag + 1) {
-                    self.panel.prefill(CommandLine.arguments[flag + 1])
+                if let query = TestHooks.value(after: "--query") {
+                    self.panel.prefill(query)
                 }
-                if let flag = CommandLine.arguments.firstIndex(of: "--snapshot"),
-                   CommandLine.arguments.indices.contains(flag + 1) {
-                    let path = CommandLine.arguments[flag + 1]
+                if let path = TestHooks.value(after: "--snapshot") {
                     var wait = 1.5
-                    if let d = CommandLine.arguments.firstIndex(of: "--snapshot-delay"),
-                       CommandLine.arguments.indices.contains(d + 1), let seconds = Double(CommandLine.arguments[d + 1]) {
+                    if let seconds = TestHooks.value(after: "--snapshot-delay").flatMap(Double.init) {
                         wait = seconds
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
@@ -221,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func shortcutsChanged() {
         panel.previewShortcut = shortcuts.preview
         let shortcut = shortcuts.registeredGlobal.map { "（\($0.display)）" } ?? ""
-        statusItem.button?.toolTip = "文件搜索\(shortcut)"
+        statusItem.button?.toolTip = "\(AppName.short)\(shortcut)"
     }
 
     /// Not shown while the application has no Dock icon, but it still
@@ -231,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于文件搜索", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+        appMenu.addItem(withTitle: "关于\(AppName.short)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
@@ -297,7 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // `--self-test-shortcuts` checks the shortcut rules and exits.
-if CommandLine.arguments.contains("--self-test-shortcuts") {
+if TestHooks.flag("--self-test-shortcuts") {
     exit(ShortcutSelfTest.run() ? 0 : 1)
 }
 
@@ -305,11 +307,11 @@ let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
 // `--regular` gives the preview a Dock icon so that testing tools can see it.
-let showsDockIcon = Preferences.showDockIcon || CommandLine.arguments.contains("--regular")
+let showsDockIcon = Preferences.showDockIcon || TestHooks.flag("--regular")
 application.setActivationPolicy(showsDockIcon ? .regular : .accessory)
 // `--appearance dark` or `light` fixes this application's appearance, so both
 // can be checked in screenshots without changing the system setting.
-if let flag = CommandLine.arguments.firstIndex(of: "--appearance"), CommandLine.arguments.indices.contains(flag + 1) {
-    application.appearance = NSAppearance(named: CommandLine.arguments[flag + 1] == "dark" ? .darkAqua : .aqua)
+if let appearance = TestHooks.value(after: "--appearance") {
+    application.appearance = NSAppearance(named: appearance == "dark" ? .darkAqua : .aqua)
 }
 application.run()

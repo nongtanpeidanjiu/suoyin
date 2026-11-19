@@ -479,7 +479,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     func windowDidResignKey(_ notification: Notification) {
         // `--pin` keeps the panel open while it is being inspected by testing tools.
         // Quick Look taking key status is not a reason to go away.
-        guard !CommandLine.arguments.contains("--pin"), !previewRequested, !isPreviewShown else { return }
+        guard !TestHooks.flag("--pin"), !previewRequested, !isPreviewShown else { return }
         hide()
     }
 
@@ -569,7 +569,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     }
 
     private func debugLog(_ text: @autoclosure () -> String) {
-        guard let path = ProcessInfo.processInfo.environment["FILESEARCH_DEBUG_LOG"] else { return }
+        guard let path = TestHooks.debugLogPath else { return }
         let line = String(format: "%.3f ", CACurrentMediaTime()) + text() + "\n"
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile(); handle.write(Data(line.utf8)); handle.closeFile()
@@ -859,7 +859,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// to another application. Losing key status alone is not reliable for a
     /// non-activating panel owned by a background application.
     private func installOutsideDismissal() {
-        guard !CommandLine.arguments.contains("--pin") else { return }
+        guard !TestHooks.flag("--pin") else { return }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
             self?.hide()
         }

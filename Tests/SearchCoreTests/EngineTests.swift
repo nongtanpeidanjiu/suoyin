@@ -855,6 +855,14 @@ struct EngineTests {
         #expect(try hit("cloud-directory").isCloudPlaceholder && hit("cloud-directory").isDirectory)
         #expect(try !hit("queued-directory").isCloudPlaceholder && hit("queued-directory").isDirectory)
 
+        let own = TrackedEntry(size: 0, modified: 0, attribute: Kind.directory)
+        for pending in [false, true] {
+            let file = TrackedEntry(size: 17, modified: 2, attribute: pending ? Kind.file | Kind.pending : Kind.file)
+            _ = live.reconcile(path: "/fixture", observed: .readable(own: own, children: ["cloud-file": file]))
+            live.prepareDelta()
+            #expect(try hit("cloud-file").isCloudPlaceholder == pending)
+        }
+
         var external = SearchRow(id: 7, name: "item", path: "/fixture/item", size: 0, modified: 0,
                                  volumeID: "fixture-volume", attribute: Kind.directory)
         external.volumeSlot = 2

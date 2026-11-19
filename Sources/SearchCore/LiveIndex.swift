@@ -109,11 +109,15 @@ struct LiveIndex {
 
     private var overlays = [OverlayPartition](repeating: OverlayPartition(), count: partitionCount)
     private var changedChildren: [String: Set<String>] = [:]
+    // Links between parents of overlay rows, including intermediate directories
+    // that have no row of their own in either the overlay or the base.
+    private var overlayBranches: [String: Set<String>] = [:]
     private var partitionParents = [Set<String>](repeating: [], count: partitionCount)
     private var modifiedPaths = [Set<String>](repeating: [], count: partitionCount)
     private var dirtyPartitions: Set<Int> = []
     private var baseEntryCount = 0
     private(set) var rowRevision: UInt64 = 0
+    private(set) var journalChanges = JournalChanges()
     var state: TrackingState
     private var directories: [String: UInt32] = [:]
     private let links: DirectoryLinks?
@@ -136,10 +140,13 @@ struct LiveIndex {
         links = linkChildren ? DirectoryLinks(base) : nil
         for path in state.changes.keys {
             let parent = parentPath(path)
-            let shard = Self.partition(parent)
+            if changedChildren[parent] == nil {
+                let shard = Self.partition(parent)
+                partitionParents[shard].insert(parent)
+                dirtyPartitions.insert(shard)
+                addOverlayParent(parent)
+            }
             changedChildren[parent, default: []].insert(path)
-            partitionParents[shard].insert(parent)
-            dirtyPartitions.insert(shard)
         }
         prepareDelta()
     }
@@ -184,6 +191,25 @@ struct LiveIndex {
         return Int(hash) & (partitionCount - 1)
     }
 
+    private mutating func addOverlayParent(_ path: String) {
+        var child = path
+        while child != "/" {
+            let parent = parentPath(child)
+            guard overlayBranches[parent, default: []].insert(child).inserted else { break }
+            child = parent
+        }
+    }
+
+    private mutating func removeOverlayParent(_ path: String) {
+        var child = path
+        while child != "/", changedChildren[child] == nil, overlayBranches[child] == nil {
+            let parent = parentPath(child)
+            overlayBranches[parent]?.remove(child)
+            if overlayBranches[parent]?.isEmpty == true { overlayBranches.removeValue(forKey: parent) }
+            child = parent
+        }
+    }
+
     private mutating func change(_ value: TrackedEntry?, at path: String) {
         let previous = state.changes[path]
         guard previous != value else { return }
@@ -196,14 +222,19 @@ struct LiveIndex {
         let parent = parentPath(path)
         let shard = Self.partition(parent)
         state.changes[path] = value
+        journalChanges.paths.insert(path)
         if value == nil {
             changedChildren[parent]?.remove(path)
             if changedChildren[parent]?.isEmpty == true {
                 changedChildren.removeValue(forKey: parent)
                 partitionParents[shard].remove(parent)
+                removeOverlayParent(parent)
             }
         } else {
-            if changedChildren[parent] == nil { partitionParents[shard].insert(parent) }
+            if changedChildren[parent] == nil {
+                partitionParents[shard].insert(parent)
+                addOverlayParent(parent)
+            }
             changedChildren[parent, default: []].insert(path)
         }
         modifiedPaths[shard].insert(path)
@@ -278,6 +309,10 @@ struct LiveIndex {
     func journalImage(at positions: [String: UInt64]) -> JournalImage {
         JournalImage(rows: state.changes, masks: base.suppressed, coverage: state.restricted,
                      positions: positions)
+    }
+
+    mutating func markJournalSaved() {
+        journalChanges = JournalChanges()
     }
 
     /// Rebuild row IDs without expanding every base row into a path string.
@@ -473,7 +508,7 @@ struct LiveIndex {
         }
     }
 
-    mutating func refreshFile(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
+    mutating func refreshFile(_ path: String, renamed: Bool = false, observation: (UInt8) -> EntryObservation) -> Bool {
         guard !isRestricted(path) else { return false }
         let parent = parentPath(path)
         let folder = entry(at: parent)
@@ -486,8 +521,25 @@ struct LiveIndex {
         case .unverified: return false
         }
         guard former?.directory != true, value?.directory != true else { return false }
+        if renamed, former == nil, value != nil, hasIndexedCaseVariant(of: path, in: parent) { return false }
         if value != former { set(value, path: path, original: baseID(at: path)) }
         return true
+    }
+
+    private mutating func hasIndexedCaseVariant(of path: String, in parent: String) -> Bool {
+        let leaf = leafName(path)
+        func matches(_ other: String) -> Bool {
+            other != leaf && other.compare(leaf, options: .caseInsensitive) == .orderedSame
+        }
+        if changedChildren[parent]?.contains(where: { matches(leafName($0)) }) == true { return true }
+        guard let links, let directory = directoryID(parent) else { return false }
+        var found = false
+        links.forEachChild(directory) { row in
+            if !found, base.attributes[Int(row)] & Kind.excluded == 0, !base.isSuppressed(Int(row)) {
+                found = matches(base.name(row))
+            }
+        }
+        return found
     }
 
     mutating func refreshDirectory(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
@@ -523,6 +575,7 @@ struct LiveIndex {
     private mutating func suppressBase(_ id: Int, _ suppress: Bool, provider: String?) {
         guard base.isSuppressed(id) != suppress else { return }
         base.setSuppressed(id, suppress)
+        journalChanges.maskBytes.insert(Int(id) >> 3)
         if base.visible(base.attributes[id], true) {
             baseEntryCount += suppress ? -1 : 1
             if let provider { cloudEntryCounts[provider, default: 0] += suppress ? -1 : 1 }
@@ -550,8 +603,14 @@ struct LiveIndex {
                 }
             }
         }
-        let removed = state.changes.keys.filter { (includingRoot || $0 != path) && inside($0, path) }
-        for location in removed { change(nil, at: location) }
+        if includingRoot { change(nil, at: path) }
+        var parents = [path]
+        while let parent = parents.popLast() {
+            if let branches = overlayBranches[parent] { parents.append(contentsOf: branches) }
+            for location in changedChildren[parent] ?? [] where location != path {
+                change(nil, at: location)
+            }
+        }
     }
 
     mutating func clearCloudPending(at path: String) {

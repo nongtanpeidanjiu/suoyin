@@ -11,6 +11,7 @@ struct VolumeEvent {
     var historyDone: Bool { flags & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
     var recursive: Bool { flags & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 }
     var isDirectory: Bool { flags & UInt32(kFSEventStreamEventFlagItemIsDir) != 0 }
+    var renamed: Bool { flags & UInt32(kFSEventStreamEventFlagItemRenamed) != 0 }
     var structural: Bool {
         flags & UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved |
                        kFSEventStreamEventFlagItemRenamed) != 0

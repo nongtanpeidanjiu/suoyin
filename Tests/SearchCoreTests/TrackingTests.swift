@@ -118,6 +118,32 @@ struct TrackingTests {
         #expect(filePaths(live, query: "report") == ["/fixture/a/report"])
     }
 
+    @Test func removingSubtreeFindsOverlayRowsWithUnindexedParents() {
+        var base = fixture()
+        base.tracking = TrackingState(root: "/fixture", changes: [
+            "/fixture/b": folder,
+            "/fixture/b/orphan/deeper/extra": file,
+            "/fixture/b/orphan/another": file,
+            "/fixture/b-other/orphan/keep": file,
+        ], restricted: [])
+        var index = LiveIndex(base: base, root: "/fixture")
+        _ = index.reconcile(path: "/fixture/b", observed: .denied(EACCES))
+        index.prepareDelta()
+        #expect(index.state.changes.keys.sorted() == ["/fixture/b", "/fixture/b-other/orphan/keep"])
+        #expect(filePaths(index, query: "deep").isEmpty)
+
+        _ = index.reconcile(path: "/fixture/b", observed: .readable(own: folder, children: ["orphan": folder]))
+        _ = index.reconcile(path: "/fixture/b/orphan", observed: .readable(own: folder, children: ["restored": file]))
+        index.prepareDelta()
+        #expect(filePaths(index, query: "restored") == ["/fixture/b/orphan/restored"])
+
+        _ = index.reconcile(path: "/fixture/b", observed: .absent)
+        index.prepareDelta()
+        #expect(index.state.changes.keys.sorted() == ["/fixture/b-other/orphan/keep"])
+        #expect(filePaths(index, query: "restored").isEmpty)
+        #expect(filePaths(index, query: "keep") == ["/fixture/b-other/orphan/keep"])
+    }
+
     @Test func incrementalOverlayMatchesRebuiltPagesAndPreservesCapturedViews() throws {
         let paths = (0..<32).map { "/fixture/group-\($0)" }
         let partitions = Dictionary(grouping: paths) { path in
@@ -347,6 +373,98 @@ struct TrackingTests {
         })
     }
 
+    @Test func fileReplacementCaseRenameAndSubtreeMoveApplyFromEvents() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let own = root.appendingPathComponent("owned")
+        let source = root.appendingPathComponent("source")
+        let destination = root.appendingPathComponent("destination")
+        let fileChanges = root.appendingPathComponent("file-changes")
+        let aliasChanges = root.appendingPathComponent("alias-changes")
+        let replacement = root.appendingPathComponent("replacement")
+        let caseTreeParent = root.appendingPathComponent("case-trees")
+        let typeParent = root.appendingPathComponent("type-change")
+        let oldTree = source.appendingPathComponent("moved-tree")
+        let newTree = destination.appendingPathComponent("renamed-tree")
+        let nested = oldTree.appendingPathComponent("nested")
+        let oldCaseTree = caseTreeParent.appendingPathComponent("old-case-tree")
+        let newCaseTree = caseTreeParent.appendingPathComponent("OLD-case-tree")
+        let typeChange = typeParent.appendingPathComponent("directory-now-file")
+        for path in [own, nested, destination, fileChanges, aliasChanges, replacement, oldCaseTree, typeChange] {
+            try fm.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        try Data([1]).write(to: nested.appendingPathComponent("tree-marker"))
+        try Data([1]).write(to: oldCaseTree.appendingPathComponent("case-child"))
+        try Data([1]).write(to: typeChange.appendingPathComponent("former-child"))
+        let oldName = fileChanges.appendingPathComponent("case-marker")
+        let newName = fileChanges.appendingPathComponent("CASE-marker")
+        let oldAlias = aliasChanges.appendingPathComponent("alias-marker")
+        let newAlias = aliasChanges.appendingPathComponent("ALIAS-marker")
+        let replaced = replacement.appendingPathComponent("replace-marker")
+        let incoming = own.appendingPathComponent("replacement")
+        try Data([1]).write(to: oldName)
+        try Data([1]).write(to: oldAlias)
+        try Data([1]).write(to: replaced)
+        try Data([1, 2, 3]).write(to: incoming)
+        var oldInfo = stat()
+        try #require(lstat(replaced.path, &oldInfo) == 0)
+        let tracker = try ChangeTracker(root: root.path, snapshot: own.appendingPathComponent("base").path,
+                                        ownData: own.path)
+        tracker.start()
+        defer { try? tracker.stop() }
+        try awaitStatus(tracker) { $0.phase == "caught-up" }
+        let id = tracker.snapshotStatus().appliedEvents.values.max() ?? 1
+        let renameFile = UInt32(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsFile)
+        let renameDirectory = UInt32(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsDir)
+        let removeDirectory = UInt32(kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemIsDir)
+        try tracker.deliverForTesting([
+            // The new spelling alone must also discard the old indexed spelling.
+            VolumeEvent(path: newName.path, id: id + 1, flags: renameFile),
+            VolumeEvent(path: replaced.path, id: id + 2, flags: renameFile),
+            VolumeEvent(path: oldTree.path, id: id + 3, flags: renameDirectory),
+            VolumeEvent(path: newTree.path, id: id + 4, flags: renameDirectory),
+            VolumeEvent(path: oldAlias.path, id: id + 5, flags: renameFile),
+            VolumeEvent(path: oldCaseTree.path, id: id + 6, flags: renameDirectory),
+            VolumeEvent(path: newCaseTree.path, id: id + 7, flags: renameDirectory),
+            VolumeEvent(path: typeChange.path, id: id + 8, flags: removeDirectory),
+        ], writing: {
+            try #require(rename(oldName.path, newName.path) == 0)
+            try #require(rename(oldAlias.path, newAlias.path) == 0)
+            try #require(rename(incoming.path, replaced.path) == 0)
+            try fm.moveItem(at: oldTree, to: newTree)
+            try #require(rename(oldCaseTree.path, newCaseTree.path) == 0)
+            try fm.removeItem(at: typeChange)
+            try Data([1, 2]).write(to: typeChange)
+        }, check: {
+            var currentInfo = stat()
+            #expect(lstat(replaced.path, &currentInfo) == 0)
+            #expect(currentInfo.st_ino != oldInfo.st_ino)
+            #expect(tracker.search("replace-marker").first?.size == 3)
+            #expect(tracker.search("case-marker").map(\.path) == [newName.path])
+            if fm.fileExists(atPath: oldAlias.path) {
+                #expect(tracker.search("alias-marker").map(\.path) == [newAlias.path])
+            }
+            #expect(tracker.search("tree-marker").map(\.path) == [newTree.path + "/nested/tree-marker"])
+            #expect(tracker.search("case-child").map(\.path) == [newCaseTree.path + "/case-child"])
+            #expect(tracker.search("former-child").isEmpty)
+            #expect(tracker.search("directory-now-file").first?.size == 2)
+        })
+    }
+
+    @Test func explicitRecursiveReconciliationCannotBeCoveredByAParentListing() {
+        var structural = DirectoryUpdate()
+        structural.requestReconciliation(recursive: true, maySkipAfterParent: true)
+        #expect(structural.maySkipAfterParent)
+        var explicit = DirectoryUpdate()
+        explicit.requestReconciliation(recursive: true, maySkipAfterParent: false)
+        var combined = structural
+        combined.merge(explicit)
+        #expect(combined.recursive == true && !combined.maySkipAfterParent)
+        explicit.merge(structural)
+        #expect(explicit.recursive == true && !explicit.maySkipAfterParent)
+    }
+
     @Test func onlyUnambiguousFileContentNotificationsAreCoalesced() {
         let file = kFSEventStreamEventFlagItemIsFile
         let modified = kFSEventStreamEventFlagItemModified
@@ -464,7 +582,8 @@ struct TrackingTests {
         let second = ReplayLag.second
         let mount = "/Volumes/TestDisk"
         func request(_ event: UInt64, structural: Bool = true) -> DirectoryUpdate {
-            DirectoryUpdate(files: [mount + "/entry": structural], pending: [0: event], structural: structural)
+            DirectoryUpdate(files: [mount + "/entry": structural ? .structural : []],
+                            pending: [0: event], structural: structural)
         }
         var schedule = DirectorySchedule()
         let start = 90 * second

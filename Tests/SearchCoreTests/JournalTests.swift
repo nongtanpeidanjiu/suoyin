@@ -86,6 +86,35 @@ struct JournalTests {
         #expect(current.delta(after: current) == nil)
     }
 
+    @Test func journalTracksMutationsUntilTheSavedImageAdvances() {
+        var live = LiveIndex(base: base(), root: "/fixture")
+        let initial = live.journalImage(at: ["/fixture": 10])
+        _ = live.refreshFile("/fixture/old") { _ in .missing }
+        _ = live.refreshFile("/fixture/new") { _ in .entry(item) }
+        _ = live.refreshFile("/fixture/transient") { _ in .entry(item) }
+        _ = live.refreshFile("/fixture/transient") { _ in .missing }
+        _ = live.reconcile(path: "/fixture/locked", observed: .restricted)
+        let next = live.journalImage(at: ["/fixture": 20])
+        let first = next.delta(after: initial, changes: live.journalChanges)
+        #expect(first?.rows.map(\.path) == ["/fixture/new"])
+        #expect(first?.rows.first?.value == item)
+        #expect(first?.masks.map(\.0) == [1])
+        #expect(first?.masks.map(\.1) == [true])
+        #expect(first?.coverage.map(\.0) == ["/fixture/locked"])
+
+        live.markJournalSaved()
+        #expect(live.journalChanges.paths.isEmpty && live.journalChanges.maskBytes.isEmpty)
+        _ = live.refreshFile("/fixture/new") { _ in .missing }
+        _ = live.refreshFile("/fixture/old") { _ in .entry(TrackedEntry(size: 0, modified: 0, attribute: Kind.file)) }
+        let final = live.journalImage(at: ["/fixture": 30])
+        let second = final.delta(after: next, changes: live.journalChanges)
+        #expect(second?.rows.map(\.path) == ["/fixture/new"])
+        #expect(second?.rows.first?.value == nil)
+        #expect(second?.masks.map(\.0) == [1])
+        #expect(second?.masks.map(\.1) == [false])
+        #expect(second?.positions["/fixture"] == 30)
+    }
+
     @Test func compactionPreservesMetadataAndNestedDirectoryEdits() {
         var index = base()
         let directory = index.append("folder", parent: 0, attribute: Kind.directory)

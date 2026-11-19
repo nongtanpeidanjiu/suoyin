@@ -81,6 +81,44 @@ struct CloudVolumeTests {
             metrics = mark.external
         }
         #expect(metrics?.restoredDirectories == 4 && metrics?.checkpointBytes == 0)
+        #expect(try ExternalScanLog.retainedEntries(at: logPath.path) == 6)
+    }
+
+    @Test func retainedPreviewPrecedesVerificationAndDiscardsChangedDirectory() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let volume = root.appendingPathComponent("volume")
+        let child = volume.appendingPathComponent("changeable")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        let previous = child.appendingPathComponent("previous-fixture.txt")
+        try Data().write(to: previous)
+        for i in 0..<2_048 { try Data().write(to: volume.appendingPathComponent("stored-\(i)")) }
+        let path = root.appendingPathComponent("fixture.scanlog").path
+        let scope = try WalkScope(root: volume.path)
+        _ = try SearchIndex.scanForTracking(scope: scope, workers: 2, excluding: [], cancelled: { false },
+                                            scanLog: ExternalScanLog(path: path), profileExternal: true) { _, _ in }
+        #expect(try ExternalScanLog.retainedEntries(at: path) == 2_050)
+        var preview = false, invalidated = false, completed = false
+        let result = try SearchIndex.scanForTracking(scope: scope, workers: 2, excluding: [], cancelled: { false },
+                                                     scanLog: ExternalScanLog(path: path), profileExternal: true) {
+            mark, rows in
+            if mark.phase == "restore-preview" {
+                #expect(mark.external?.restoring == true)
+                #expect(rows.visibleEntryCount == 2_050)
+                #expect(rows.directSearch("previous-fixture").count == 1)
+                preview = true
+                try FileManager.default.moveItem(at: previous, to: child.appendingPathComponent("updated-fixture.txt"))
+            } else if mark.phase == "restore-invalidated" {
+                #expect(rows.directSearch("previous-fixture").isEmpty)
+                #expect(rows.directSearch("updated-fixture").count == 1)
+                invalidated = true
+            } else if mark.phase == "restore-complete" {
+                #expect(mark.external?.restoring == false)
+                completed = true
+            }
+        }
+        #expect(preview && invalidated && completed)
+        #expect(result.visibleEntryCount == 2_050 && result.directSearch("updated-fixture").count == 1)
     }
 
     @Test func cloudQueueTimesOutWithoutReleasingTheSingleSlot() throws {

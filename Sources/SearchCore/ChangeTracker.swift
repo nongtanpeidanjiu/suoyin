@@ -61,6 +61,7 @@ public struct TrackingStatus: Codable {
     public var directDirectoriesObserved: UInt64 = 0
     public var error: String?
     public var externalScan: ExternalScanStatistics?
+    public var externalRetainedEntries: Int?
 }
 
 public struct ApplyInterval: Codable {
@@ -115,6 +116,7 @@ public final class ChangeTracker {
     private var needsVolumePolling = false
     private var compactionNeedsRetry = false
     private var view: LiveSearchView?
+    private var restoringPreview = false
     private var publishedCoverage = Set<String>()
     private var status = TrackingStatus()
     private var current: LiveIndex?
@@ -241,6 +243,7 @@ public final class ChangeTracker {
     }
 
     public func start(onPhase: @escaping (String) -> Void = { _ in }) {
+        mounts?.start(deferIndexing: true)
         update.async {
             self.observer = onPhase
             do { try self.bootstrap() }
@@ -257,7 +260,7 @@ public final class ChangeTracker {
 
     func engineState() -> EngineTrackerState {
         lock.withLock {
-            let progress = cloudProvider.map { (leafName($0), cloudEntryCounts[$0, default: 0]) }
+            let progress = cloudProvider.map { (CloudRoots.display(for: $0).name, cloudEntryCounts[$0, default: 0]) }
             return EngineTrackerState(status: status, indexed: view?.entryCount ?? 0,
                                       accessChecked: accessBootstrapComplete && status.phase == "caught-up" && !status.indexReconciling &&
                                           status.error == nil && pendingAccessChecks == 0,
@@ -344,7 +347,14 @@ public final class ChangeTracker {
     private func fail(_ error: Error) {
         pollTimer?.cancel()
         pollTimer = nil
-        lock.withLock { status.error = String(describing: error) }
+        let discarded = lock.withLock {
+            status.error = String(describing: error)
+            guard restoringPreview else { return false }
+            restoringPreview = false
+            view = nil
+            return true
+        }
+        if discarded { engineObserver?(.index) }
         note("error")
     }
 
@@ -497,6 +507,10 @@ public final class ChangeTracker {
                     }
                 } else {
                     needsBaseWrite = true
+                }
+                if external != nil {
+                    let retained = value.retainedEntries
+                    lock.withLock { status.externalRetainedEntries = retained }
                 }
                 if external != nil && !identities[0].permitsReplay(value.volumes.first) {
                     reason = "invalid-checkpoint"
@@ -1277,22 +1291,45 @@ public final class ChangeTracker {
             index = try SearchIndex.scanDataVolume(scope: scope, keeping: consume sealed, excluding: exclusions)
         } else {
             var lastPartial: Double = 0
-            let scanLog = try initial ? externalScanLog.map(ExternalScanLog.init(path:)) : nil
+            var previewPublished = false
+            let scanLog = try initial ? externalScanLog.map { path in
+                try ExternalScanLog(path: path, onRetained: { [weak self] count in
+                    guard let self else { return }
+                    self.lock.withLock { self.status.externalRetainedEntries = count }
+                    self.engineObserver?(.status)
+                })
+            } : nil
             index = try SearchIndex.scanForTracking(scope: scope, workers: external?.scanWorkers ?? 4,
                                                     excluding: exclusions, cancelled: { self.detached },
                                                     scanLog: scanLog, profileExternal: external != nil,
                                                     directoryLengths: external?.filesystem == "exfat") {
                 mark, partial in
                 if let stats = mark.external {
-                    let written = self.lock.withLock {
+                    let (written, stage) = self.lock.withLock {
                         let changed = self.status.externalScan?.checkpointBytes != stats.checkpointBytes
+                        let stage = self.status.externalScan?.restoring != stats.restoring
                         self.status.externalScan = stats
-                        return changed
+                        return (changed, stage)
                     }
                     if written { self.engineObserver?(.disk) }
+                    if stage { self.engineObserver?(.status) }
                 }
+                if initial && mark.phase == "restore-preview" {
+                    var cached = partial
+                    cached.prepare()
+                    self.publish(LiveIndex(base: cached, root: self.root, linkChildren: false), changed: true)
+                    previewPublished = true
+                    self.lock.withLock { self.restoringPreview = true }
+                    return
+                }
+                if mark.phase == "restore-invalidated" || mark.phase == "restore-complete" {
+                    previewPublished = false
+                    self.lock.withLock { self.restoringPreview = false }
+                }
+                if previewPublished && mark.external?.restoring == true { return }
                 let localPassFinished = self.external == nil && mark.phase == "local_complete"
-                if initial && (mark.phase == "partial" || localPassFinished ||
+                if initial && (mark.phase == "restore-complete" || mark.phase == "restore-invalidated" ||
+                               mark.phase == "partial" || localPassFinished ||
                                mark.phase == "batch" && mark.seconds >= lastPartial + 0.5) {
                     lastPartial = mark.seconds
                     var searchable = partial
@@ -1363,7 +1400,7 @@ public final class ChangeTracker {
         }
         if caughtUp {
             cloud?.setEnabled(true)
-            mounts?.start()
+            mounts?.enableIndexing()
             if needsVolumePolling { startVolumePolling() }
             releaseTemporaryPages()
             engineObserver?(.status)
@@ -1457,10 +1494,12 @@ public final class ChangeTracker {
 
     private func didSave(_ image: JournalImage) {
         durableImage = image
+        let retained = external == nil ? nil : current?.readView().entryCount
         lock.withLock {
             status.durableEvents = image.positions
             status.durableGeneration = status.generation
             status.journalLength = journal?.length ?? 0
+            if let retained { status.externalRetainedEntries = retained }
         }
         saveScheduled = false
         saveTicket += 1

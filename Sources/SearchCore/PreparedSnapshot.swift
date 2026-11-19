@@ -47,6 +47,55 @@ private struct SnapshotMetadata: Codable {
 extension SearchIndex {
     private static let hotMagic = Array("M2INDEX2".utf8)
 
+    static func retainedEntries(at path: String) throws -> Int {
+        let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? file.close() }
+        guard let header = try file.read(upToCount: 64), header.count == 64 else { throw SnapshotError.invalid }
+        func field<T: FixedWidthInteger>(_ offset: Int, _: T.Type) -> T {
+            header.withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: T.self)) }
+        }
+        let hot = header.starts(with: hotMagic)
+        guard hot || header.starts(with: "M1INDEX1".utf8) else { throw SnapshotError.invalid }
+        let rows = Int(field(hot ? 8 : 12, UInt32.self))
+        guard rows <= 20_000_000 else { throw SnapshotError.invalid }
+        let size = try file.seekToEnd()
+        let attributeOffset = 64 + rows * MemoryLayout<DMRecord>.stride
+        guard UInt64(attributeOffset + rows) <= size else { throw SnapshotError.invalid }
+        try file.seek(toOffset: UInt64(attributeOffset))
+        var attributes = try file.read(upToCount: rows) ?? Data()
+        guard attributes.count == rows else { throw SnapshotError.invalid }
+        var tracking: TrackingState?
+        if hot {
+            let version = field(28, UInt32.self)
+            let metadataBytes = Int(field(24, UInt32.self))
+            guard (version == 1 || version == 2), metadataBytes <= 64_000_000,
+                  metadataBytes > 0, UInt64(metadataBytes) <= size - UInt64(attributeOffset + rows)
+            else { throw SnapshotError.invalid }
+            let metadataOffset = 64 + rows * (version == 1 ? 45 : 33) + Int(field(20, UInt32.self)) * 4 +
+                Int(field(12, UInt32.self)) + Int(field(16, UInt32.self))
+            guard UInt64(metadataOffset + metadataBytes) == size else { throw SnapshotError.invalid }
+            try file.seek(toOffset: UInt64(metadataOffset))
+            guard let bytes = try file.read(upToCount: metadataBytes), bytes.count == metadataBytes else {
+                throw SnapshotError.invalid
+            }
+            let metadata = try JSONDecoder().decode(SnapshotMetadata.self, from: bytes)
+            tracking = metadata.tracking
+            try ChangeJournal(snapshot: path, identity: header.suffix(32))
+                .applyRetainedMetadata(attributes: &attributes, tracking: &tracking, volumes: metadata.volumes)
+        }
+        return countRetained(attributes, overlay: tracking)
+    }
+
+    private static func countRetained<T: Sequence>(_ attributes: T, overlay: TrackingState?) -> Int where T.Element == UInt8 {
+        func visible(_ value: UInt8) -> Bool {
+            value & Kind.mask != Kind.anchor && value & (Kind.excluded | Kind.suppressed) == 0
+        }
+        return attributes.reduce(0) { $0 + (visible($1) ? 1 : 0) } +
+            (overlay?.changes.values.reduce(0) { $0 + (visible($1.attribute) ? 1 : 0) } ?? 0)
+    }
+
+    var retainedEntries: Int { Self.countRetained(attributes, overlay: tracking) }
+
     static func preparedIdentity(at path: String) throws -> Data {
         let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? file.close() }

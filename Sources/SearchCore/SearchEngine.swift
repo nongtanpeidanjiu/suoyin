@@ -82,6 +82,7 @@ public enum EnginePhase: Sendable, Equatable {
 
 public struct EngineSourceStatus: Sendable, Equatable {
     public enum Kind: String, Sendable { case externalVolume, cloudProvider }
+    public enum CloudProviderKind: String, Sendable { case iCloudDrive, fileProvider }
 
     public let id: String
     public let name: String
@@ -92,6 +93,7 @@ public struct EngineSourceStatus: Sendable, Equatable {
     public let rawInaccessibleLocations: [InaccessibleLocation]
     public let error: String?
     public let scan: ExternalScanStatistics?
+    public let cloudProviderKind: CloudProviderKind?
 }
 
 public struct EngineStatus: Sendable {
@@ -112,13 +114,29 @@ public struct EngineStatus: Sendable {
 }
 
 public struct EngineVolume: Sendable, Equatable {
+    public enum Progress: String, Sendable { case idle, restoring, scanning }
+
     public let id: String
     public let name: String
+    public let nameIsPlaceholder: Bool
     public let isOnline: Bool
     public let isIncluded: Bool
     public let isScanning: Bool
     public let indexedCount: Int
+    public let retainedCount: Int?
+    public let progress: Progress
+    public let filesystem: String?
+    public let capacityBytes: Int64?
     public let detail: String?
+}
+
+public struct EngineVolumeSettingsError: Sendable, Equatable {
+    public enum Category: String, Sendable {
+        case readSettings, invalidSettings, backupSettings, writeSettings, inspectIndex, verifyIdentity, removeIndex
+    }
+
+    public let category: Category
+    public let underlyingMessage: String
 }
 
 /// In-process access to the local and attached-volume indexes. One instance
@@ -137,7 +155,7 @@ public final class SearchEngine: @unchecked Sendable {
     private var volumesHandler: (@Sendable () -> Void)?
     private var reportedVolumes: [EngineVolume] = []
     private var reportedIncludesNew = false
-    private var reportedVolumeError: String?
+    private var reportedVolumeError: EngineVolumeSettingsError?
     private var refreshScheduled = false
     private var pendingIndex = false
     private var pendingDisk = false
@@ -199,7 +217,7 @@ public final class SearchEngine: @unchecked Sendable {
 
     public var externalVolumes: [EngineVolume] { tracker.externalVolumeManager?.catalog() ?? [] }
 
-    public var externalVolumeSettingsError: String? { tracker.externalVolumeManager?.settingsError }
+    public var externalVolumeSettingsError: EngineVolumeSettingsError? { tracker.externalVolumeManager?.settingsError }
 
     public func setExternalVolume(_ id: String, included: Bool) {
         tracker.externalVolumeManager?.setIncluded(id, included: included)
@@ -310,17 +328,20 @@ public final class SearchEngine: @unchecked Sendable {
             return EngineSourceStatus(id: volume.id, name: volume.name, kind: .externalVolume,
                                       indexed: volume.state.indexed, inaccessibleLocationsVerified: checked,
                                       inaccessibleLocations: AccessDenials.summarize(raw),
-                                      rawInaccessibleLocations: raw, error: status.error, scan: status.externalScan)
+                                      rawInaccessibleLocations: raw, error: status.error, scan: status.externalScan,
+                                      cloudProviderKind: nil)
         }
         let providers = Set(localState.cloudEntries.keys).union(localState.pendingProviders).union(cloudPaths.keys)
         for provider in providers.sorted() {
             let checked = verified && !localState.pendingProviders.contains(provider)
             let raw = checked ? locations(local, paths: cloudPaths[provider] ?? []) : []
-            sources.append(EngineSourceStatus(id: provider, name: leafName(provider), kind: .cloudProvider,
+            let label = CloudRoots.display(for: provider)
+            sources.append(EngineSourceStatus(id: provider, name: label.name, kind: .cloudProvider,
                                               indexed: localState.cloudEntries[provider, default: 0],
                                               inaccessibleLocationsVerified: checked,
                                               inaccessibleLocations: AccessDenials.summarize(raw),
-                                              rawInaccessibleLocations: raw, error: nil, scan: nil))
+                                              rawInaccessibleLocations: raw, error: nil, scan: nil,
+                                              cloudProviderKind: label.kind))
         }
         let bytes = disk ? Self.diskBytes(directory) : previous.indexBytesOnDisk
         let phase: EnginePhase

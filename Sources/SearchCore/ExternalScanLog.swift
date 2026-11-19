@@ -16,10 +16,14 @@ final class ExternalScanLog {
     private let offsets: [String: Range<Int>]
     private var length: Int
     private var pending = Data()
+    private var savedCounts: [String: Int] = [:]
+    private var pendingCounts: [String: Int] = [:]
+    private let onRetained: (Int) -> Void
     private var lastFlush = DispatchTime.now().uptimeNanoseconds
     private(set) var written = 0
+    private(set) var retainedCount = 0
 
-    init(path: String) throws {
+    init(path: String, onRetained: @escaping (Int) -> Void = { _ in }) throws {
         let fd = Darwin.open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw SnapshotError.filesystem(errno) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -30,6 +34,7 @@ final class ExternalScanLog {
         }
         let bytes = try handle.readToEnd() ?? Data()
         var offsets: [String: Range<Int>] = [:]
+        var counts: [String: Int] = [:]
         var valid = 0
         if bytes.starts(with: Self.magic) {
             valid = Self.magic.count
@@ -38,10 +43,9 @@ final class ExternalScanLog {
                 guard let count = frame.read(UInt32.self), count <= Self.maximumFrame,
                       let digest = frame.take(32), let payload = frame.take(Int(count)),
                       digest.elementsEqual(SHA256.hash(data: payload)) else { break }
-                var directory = JournalReader(bytes: payload, cursor: payload.startIndex)
-                guard let path = Self.readRelativePath(&directory), let stamp = directory.take(40),
-                      !stamp.isEmpty else { break }
-                offsets[path] = directory.cursor - 40 ..< frame.cursor
+                guard let item = Self.inspect(payload) else { break }
+                offsets[item.path] = item.offset ..< frame.cursor
+                counts[item.path] = item.count
                 valid = frame.cursor
             }
         }
@@ -50,8 +54,39 @@ final class ExternalScanLog {
         file = handle
         self.bytes = bytes
         self.offsets = offsets
+        self.onRetained = onRetained
+        savedCounts = counts
+        retainedCount = counts.values.reduce(0, +)
         length = valid
         if valid == 0 { pending = Self.magic }
+        onRetained(retainedCount)
+    }
+
+    private static func inspect(_ payload: Data) -> (path: String, offset: Int, count: Int)? {
+        var reader = JournalReader(bytes: payload, cursor: payload.startIndex)
+        guard let path = readRelativePath(&reader) else { return nil }
+        let offset = reader.cursor
+        guard reader.take(40) != nil, let count = reader.count(minWidth: 28) else { return nil }
+        return (path, offset, count)
+    }
+
+    /// Count the latest durable frame for each relative directory. At most
+    /// one frame is read at a time; no records, name pool or search view loaded.
+    static func retainedEntries(at path: String) throws -> Int {
+        let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? file.close() }
+        let prefix = try file.read(upToCount: magic.count) ?? Data()
+        if prefix.isEmpty { return 0 }
+        guard prefix == magic else { throw SnapshotError.invalid }
+        var counts: [String: Int] = [:]
+        while let header = try file.read(upToCount: 36), header.count == 36 {
+            let length = Int(header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) })
+            guard length <= maximumFrame, let payload = try file.read(upToCount: length),
+                  payload.count == length, header.dropFirst(4).elementsEqual(SHA256.hash(data: payload)),
+                  let item = inspect(payload) else { break }
+            counts[item.path] = item.count
+        }
+        return counts.values.reduce(0, +)
     }
 
     private static func readRelativePath(_ reader: inout JournalReader) -> String? {
@@ -85,8 +120,18 @@ final class ExternalScanLog {
         default: throw ScanError.metadata(path: path, error: error)
         }
         guard stamp.inode == inode, stamp.modified == modified, stamp.changed == changed,
-              stamp.created == created, stamp.size == size,
-              let count = reader.count(minWidth: 28) else { return nil }
+              stamp.created == created, stamp.size == size else { return nil }
+        return Self.decode(&reader, end: range.upperBound)
+    }
+
+    func cached(_ relative: String) -> DirectoryBatch? {
+        guard let range = offsets[relative] else { return nil }
+        var reader = JournalReader(bytes: bytes[range], cursor: range.lowerBound + 40)
+        return Self.decode(&reader, end: range.upperBound)
+    }
+
+    private static func decode(_ reader: inout JournalReader, end: Int) -> DirectoryBatch? {
+        guard let count = reader.count(minWidth: 28) else { return nil }
         let batch = DirectoryBatch()
         batch.items.reserveCapacity(count)
         for _ in 0..<count {
@@ -99,7 +144,7 @@ final class ExternalScanLog {
                                     modified: modified, flags: flags, type: type))
             batch.names.append(contentsOf: name)
         }
-        return reader.cursor == range.upperBound ? batch : nil
+        return reader.cursor == end ? batch : nil
     }
 
     // The scan coordinator serializes append and flush. Each entry's metadata
@@ -127,6 +172,7 @@ final class ExternalScanLog {
         pending.put(UInt32(payload.count))
         pending.append(contentsOf: SHA256.hash(data: payload))
         pending.append(payload)
+        pendingCounts[relative] = batch.items.count
         if pending.count >= Self.flushBytes || DispatchTime.now().uptimeNanoseconds - lastFlush >= Self.flushDelay {
             try flush()
         }
@@ -138,7 +184,12 @@ final class ExternalScanLog {
         try file.synchronize()
         length += pending.count
         written += pending.count
+        for (path, count) in pendingCounts {
+            retainedCount += count - (savedCounts.updateValue(count, forKey: path) ?? 0)
+        }
+        pendingCounts.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
         lastFlush = DispatchTime.now().uptimeNanoseconds
+        onRetained(retainedCount)
     }
 }

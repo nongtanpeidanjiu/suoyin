@@ -33,6 +33,7 @@ public struct ScanMark: Codable, Sendable {
 
 public struct ExternalScanStatistics: Codable, Sendable, Equatable {
     public internal(set) var workers = 1
+    public internal(set) var restoring = false
     public internal(set) var observedDirectories = 0
     public internal(set) var restoredDirectories = 0
     public internal(set) var observedEntries = 0
@@ -258,6 +259,8 @@ private final class ScanSession {
     var cachedJobs: [ScanJob] = []
     var cloudJobs: [ScanJob] = []
     var workersActive = 0
+    var cachedWorkers = 0
+    var previewCurrent = false
     var error: Error?
     var counts = DMCounts()
     var pending = 0
@@ -332,14 +335,32 @@ private final class ScanSession {
         else { jobs.append(job) }
     }
 
+    func beginRestoration() {
+        externalMetrics?.restoring = !cachedJobs.isEmpty
+    }
+
+    /// Materialize a provisional view from the durable tree after the live
+    /// root itself was accessible and still matched its saved fingerprint.
+    /// Child fingerprints are rechecked by the normal scan before declaring
+    /// the volume ready.
+    func restorePreview(using scanLog: ExternalScanLog) throws {
+        while let job = cachedJobs.popLast() {
+            if cancelled() { throw CancellationError() }
+            if let batch = scanLog.cached(relativePath(job.path)) { add(batch, job) }
+        }
+    }
+
     func walk() {
         scanWorkerSlots.wait()
         defer { scanWorkerSlots.signal() }
         while true {
             condition.lock()
-            while cachedJobs.isEmpty && jobs.isEmpty && workersActive > 0 && error == nil { condition.wait() }
+            while cachedJobs.isEmpty && workersActive > 0 && error == nil &&
+                    (jobs.isEmpty || externalMetrics?.restoring == true && cachedWorkers > 0) { condition.wait() }
             if cancelled(), error == nil { error = CancellationError(); condition.broadcast() }
-            guard error == nil, let job = cachedJobs.popLast() ?? jobs.popLast() else { condition.unlock(); return }
+            let cached = cachedJobs.popLast()
+            guard error == nil, let job = cached ?? jobs.popLast() else { condition.unlock(); return }
+            if cached != nil { cachedWorkers += 1 }
             workersActive += 1
             condition.unlock()
 
@@ -347,11 +368,27 @@ private final class ScanSession {
             condition.lock()
             switch attempt {
             case .success(let observation):
-                do { try apply(observation, to: job) } catch { self.error = self.error ?? error }
+                do {
+                    try apply(observation, to: job)
+                    if previewCurrent, cached != nil, !observation.restored {
+                        previewCurrent = false
+                        try publish(mark("restore-invalidated"), withCoverage())
+                    }
+                } catch { self.error = self.error ?? error }
             case .failure(let failure):
                 if !(failure is CancellationError) || error == nil { error = failure }
             }
             workersActive -= 1
+            if cached != nil { cachedWorkers -= 1 }
+            if error == nil && cachedWorkers == 0 && cachedJobs.isEmpty && externalMetrics?.restoring == true {
+                externalMetrics?.restoring = false
+                previewCurrent = false
+                publishedEntries = entries
+                nextPublication = entries + 20_000
+                lastPublication = DispatchTime.now().uptimeNanoseconds
+                do { try publish(mark("restore-complete"), withCoverage()) }
+                catch { self.error = error }
+            }
             condition.broadcast()
             condition.unlock()
         }
@@ -460,12 +497,13 @@ private final class ScanSession {
             externalMetrics = metrics
         }
         let now = externalMetrics == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        let restoring = externalMetrics?.restoring == true
         let timedPublication = externalMetrics != nil && entries >= publishedEntries + 1_024 &&
-            now - lastPublication >= 5_000_000_000
+            now - lastPublication >= (restoring ? 1_000_000_000 : 5_000_000_000)
         if local && (entries >= nextPublication || timedPublication) {
             let phase = publishedEntries == 0 ? "partial" : "batch"
             publishedEntries = entries
-            nextPublication = entries + max(20_000, externalMetrics == nil ? 0 : entries / 20)
+            nextPublication = entries + (restoring ? 8_192 : max(20_000, externalMetrics == nil ? 0 : entries / 20))
             lastPublication = now
             try publish(mark(phase), withCoverage())
             if externalMetrics != nil {
@@ -597,7 +635,27 @@ extension SearchIndex {
         try onProgress(session.mark("listener_ready"), session.index)
         session.addRoot(root)
         if scope.wholeDisk { session.addRoot(dataRoot) }
+        session.beginRestoration()
         try onProgress(session.mark("scan_start"), session.index)
+        if let scanLog, profileExternal, (2_048...1_000_000).contains(scanLog.retainedCount) {
+            let preview: SearchIndex? = try {
+                scanWorkerSlots.wait()
+                defer { scanWorkerSlots.signal() }
+                guard try scanLog.restored(root, relative: "", device: scope.primaryDevice, cancelled: cancelled) != nil
+                else { return nil }
+                let cached = ScanSession(scope: scope, ordinary: ordinary, listeners: listeners,
+                                         excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: SearchIndex(),
+                                         scanLog: scanLog, profileExternal: false, directoryLengths: directoryLengths,
+                                         cancelled: cancelled, publish: { _, _ in })
+                cached.addRoot(root)
+                try cached.restorePreview(using: scanLog)
+                return cached.entries > 0 ? cached.withCoverage() : nil
+            }()
+            if let preview {
+                session.previewCurrent = true
+                try onProgress(session.mark("restore-preview"), preview)
+            }
+        }
         try session.run(workers)
         try onProgress(session.mark("local_complete"), session.withCoverage())
         session.local = false

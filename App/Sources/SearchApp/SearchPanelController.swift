@@ -115,6 +115,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         static let groupGap: CGFloat = 14
         static let countGap: CGFloat = 12
         static let countFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        /// Quick Look docked at the panel's right while the screen is wide enough.
+        static let previewWidth: CGFloat = 560
+        static let previewGap: CGFloat = 12
+        static let previewMinHeight: CGFloat = 360
+        static let screenMargin: CGFloat = 24
     }
 
     private let service: SearchService
@@ -142,6 +147,22 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var terms: [String] = []
     private var searchesPath = false
     private var topEdge: CGFloat = 0
+    /// Where the panel rests when no preview is docked: centred when shown,
+    /// then wherever the user drags it.
+    private var homeX: CGFloat = 0
+    private var userPlaced = false
+    /// The origin of the panel's last programmatic move, so `windowDidMove`
+    /// can tell those apart from the user dragging the panel.
+    private var lastSetOrigin: NSPoint?
+    /// The panel's left edge while Quick Look is docked beside it; nil when
+    /// the preview is not docked (closed, or the screen is too narrow).
+    private var dockedX: CGFloat?
+    /// Docked at some point since Quick Look last opened; it then neither
+    /// zooms in from nor back into the row.
+    private var previewWasDocked = false
+    private var slideTimer: Timer?
+    private var placingPreview = false
+    private var previewObservers: [NSObjectProtocol] = []
     private var lastDismissal = Date.distantPast
     private(set) var isVisible = false
     /// The Quick Look panel while this controller drives it.
@@ -389,8 +410,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         var top = area.maxY - (area.height * 0.31).rounded()
         top = min(max(top, area.minY + 24 + expanded), area.maxY - 16)
         topEdge = top
-        panel.setFrame(NSRect(x: (area.midX - Layout.width / 2).rounded(), y: top - height,
-                              width: Layout.width, height: height), display: true)
+        homeX = (area.midX - Layout.width / 2).rounded()
+        userPlaced = false
+        dockedX = nil
+        slideTimer?.invalidate()
+        slideTimer = nil
+        setPanelFrame(NSRect(x: homeX, y: top - height, width: Layout.width, height: height))
         layoutForCurrentHeight()
 
         isVisible = true
@@ -451,8 +476,27 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         hide()
     }
 
+    /// Only a move the user made counts; the panel's own resizing and its
+    /// slide beside the preview set `lastSetOrigin` first.
     func windowDidMove(_ notification: Notification) {
-        topEdge = panel.frame.maxY
+        let frame = panel.frame
+        if let set = lastSetOrigin, abs(set.x - frame.minX) < 0.5, abs(set.y - frame.minY) < 0.5 { return }
+        topEdge = frame.maxY
+        homeX = frame.minX
+        userPlaced = true
+        // A drag while the preview is docked ends the slide; the preview
+        // follows the panel, and closing it leaves the panel where it was put.
+        guard dockedX != nil else { return }
+        slideTimer?.invalidate()
+        slideTimer = nil
+        dockedX = frame.minX
+        placePreview()
+    }
+
+    /// Every programmatic frame change goes through here.
+    private func setPanelFrame(_ frame: NSRect) {
+        lastSetOrigin = frame.origin
+        panel.setFrame(frame, display: true)
     }
 
     // MARK: Sizing
@@ -529,8 +573,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         var frame = panel.frame
         frame.origin.y = topEdge - height
         frame.size.height = height
-        panel.setFrame(frame, display: true)
+        setPanelFrame(frame)
         layoutForCurrentHeight()
+        placePreview()
     }
 
     private func finishResize() {
@@ -624,7 +669,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         generation += 1
         let token = generation
         let text = field.stringValue
-        let request = SearchRequest(text: text, scope: searchesPath ? .path : .name,
+        let request = SearchRequest(text: normalizedQuery(text), scope: searchesPath ? .path : .name,
                                     includeSystemFiles: Preferences.includeSystemFiles, kind: kind)
         let service = self.service
         queryQueue.async { [weak self] in
@@ -902,10 +947,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         // Above the search panel, which floats over ordinary windows.
         quickLook.level = NSWindow.Level(rawValue: panel.level.rawValue + 1)
         quickLook.reloadData()
-        if !quickLook.isVisible { quickLook.orderFront(nil) }
+        let opening = !quickLook.isVisible
+        if opening { dockPreview() }
+        if opening { quickLook.orderFront(nil) }
         // Without a controller there is nothing to show; do not leave the
         // panel unable to dismiss itself.
         guard previewPanel != nil else { closePreview(); previewRequested = false; return }
+        if opening { placePreview(); settlePreview() }
         // Ordering Quick Look in can leave it holding key status; give it back.
         if !panel.isKeyWindow { refocusField() }
     }
@@ -914,10 +962,119 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private func followSelectionInPreview() {
         guard !reloadingResults, let previewPanel, selectedHit?.path != previewedPath else { return }
         previewPanel.reloadData()
+        placePreview()
+        settlePreview()
+    }
+
+    // MARK: Docking the preview
+
+    /// Where the panel and Quick Look go when the preview opens, or nil when
+    /// the screen cannot hold both side by side with a margin on each side.
+    private func dockedPanelX() -> CGFloat? {
+        guard let area = (panel.screen ?? NSScreen.main)?.visibleFrame else { return nil }
+        let group = Layout.width + Layout.previewGap + Layout.previewWidth
+        guard area.width >= group + 2 * Layout.screenMargin else { return nil }
+        // Untouched, the pair is centred; after a drag the panel stays put
+        // unless the preview would run off the right edge.
+        if !userPlaced { return (area.midX - group / 2).rounded() }
+        let rightmost = area.maxX - Layout.screenMargin - group
+        return max(area.minX + Layout.screenMargin, min(homeX, rightmost)).rounded()
+    }
+
+    /// Quick Look's frame while docked: right of the panel, tops aligned,
+    /// as tall as the panel but never shorter than a useful preview.
+    private func dockedPreviewFrame() -> NSRect? {
+        guard let x = dockedX, let area = (panel.screen ?? NSScreen.main)?.visibleFrame else { return nil }
+        let room = topEdge - area.minY
+        let height = min(max(panel.frame.height, Layout.previewMinHeight), room).rounded()
+        return NSRect(x: x + Layout.width + Layout.previewGap, y: topEdge - height,
+                      width: Layout.previewWidth, height: height)
+    }
+
+    /// Slides the panel aside so the preview fits next to it.
+    private func dockPreview() {
+        guard isVisible, let x = dockedPanelX() else { dockedX = nil; previewWasDocked = false; return }
+        dockedX = x
+        previewWasDocked = true
+        slidePanel(to: x)
+    }
+
+    /// Slides the panel back to where it rested before the preview opened.
+    private func undockPreview() {
+        guard dockedX != nil else { return }
+        dockedX = nil
+        // Hiding fades the panel out where it is; `show` places it afresh.
+        guard isVisible else { slideTimer?.invalidate(); slideTimer = nil; return }
+        slidePanel(to: homeX)
+    }
+
+    /// Moves the panel sideways, 0.18 s ease-out like the height changes.
+    private func slidePanel(to x: CGFloat) {
+        slideTimer?.invalidate()
+        slideTimer = nil
+        let start = panel.frame.minX
+        guard abs(start - x) > 0.5 else { return }
+        guard !Motion.reduced else { moveSideways(to: x); return }
+        let began = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let t = min(1, (CACurrentMediaTime() - began) / Motion.resize)
+            let eased = 1 - pow(1 - t, 3)
+            self.moveSideways(to: (start + (x - start) * CGFloat(eased)).rounded())
+            if t >= 1 {
+                timer.invalidate()
+                self.slideTimer = nil
+                self.panel.invalidateShadow()
+            }
+        }
+        slideTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func moveSideways(to x: CGFloat) {
+        var frame = panel.frame
+        frame.origin.x = x
+        frame.origin.y = topEdge - frame.height
+        setPanelFrame(frame)
+    }
+
+    /// Puts Quick Look in its docked place, if it is docked and not there.
+    private func placePreview() {
+        guard !placingPreview, isPreviewShown, let target = dockedPreviewFrame() else { return }
+        let quickLook = QLPreviewPanel.shared()!
+        guard !NSEqualRects(quickLook.frame.integral, target) else { return }
+        placingPreview = true
+        quickLook.setFrame(target, display: true, animate: false)
+        placingPreview = false
+        debugLog("placePreview \(target)")
+    }
+
+    /// Quick Look sizes itself to each new item a moment after loading it;
+    /// put it back once that has happened, in case no notification caught it.
+    private func settlePreview() {
+        for delay in [0.05, 0.25] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.placePreview() }
+        }
+    }
+
+    /// Catches Quick Look moving or resizing itself and puts it straight back.
+    private func watchPreviewFrame(_ quickLook: QLPreviewPanel) {
+        stopWatchingPreviewFrame()
+        for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
+            previewObservers.append(NotificationCenter.default.addObserver(
+                forName: name, object: quickLook, queue: nil) { [weak self] _ in self?.placePreview() })
+        }
+    }
+
+    private func stopWatchingPreviewFrame() {
+        previewObservers.forEach(NotificationCenter.default.removeObserver)
+        previewObservers = []
     }
 
     private func closePreview() {
         guard isPreviewShown else { previewRequested = false; return }
+        // The panel heads home while Quick Look fades, not after it.
+        undockPreview()
         QLPreviewPanel.shared().orderOut(nil)
     }
 
@@ -937,10 +1094,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         previewPanel = quickLook
         quickLook.dataSource = self
         quickLook.delegate = self
+        watchPreviewFrame(quickLook)
     }
 
     fileprivate func endPreview(_ quickLook: QLPreviewPanel) {
         debugLog("endPreview visible=\(quickLook.isVisible)")
+        stopWatchingPreviewFrame()
+        undockPreview()
         previewPanel = nil
         quickLook.dataSource = nil
         quickLook.delegate = nil
@@ -980,7 +1140,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// Lets Quick Look zoom out of, and back into, the selected row.
     func previewPanel(_ quickLook: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!) -> NSRect {
         let row = table.selectedRow
-        guard isVisible, hits.indices.contains(row) else { return .zero }
+        // Docked, the preview simply appears in its place: a zoom from the
+        // row would land in the middle of the screen first.
+        // The same on the way out, while the panel is already sliding home.
+        guard isVisible, !previewWasDocked, hits.indices.contains(row) else { return .zero }
         let rect = table.rect(ofRow: row)
         guard table.visibleRect.intersects(rect) else { return .zero }
         return self.panel.convertToScreen(table.convert(rect, to: nil))

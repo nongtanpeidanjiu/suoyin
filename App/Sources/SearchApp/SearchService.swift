@@ -127,9 +127,26 @@ protocol SearchService: AnyObject {
     func rebuild()
 }
 
-/// Splits a query the same way the core does: whitespace-separated terms,
+/// The query text as sent to the core: every kind of space becomes a plain
+/// space, so a no-break space (Option-Space), an ideographic space or a
+/// zero-width space separates terms like an ordinary one. The text shown in
+/// the field is left as typed.
+func normalizedQuery(_ text: String) -> String {
+    var scalars = String.UnicodeScalarView()
+    for scalar in text.unicodeScalars {
+        let isSpace = scalar.properties.isWhitespace || invisibleSpaces.contains(scalar.value)
+        scalars.append(isSpace ? " " : scalar)
+    }
+    return String(scalars)
+}
+
+/// Zero-width spaces that Unicode does not class as whitespace: zero width
+/// space, word joiner, Mongolian vowel separator, byte order mark.
+private let invisibleSpaces: Set<UInt32> = [0x200B, 0x2060, 0x180E, 0xFEFF]
+
+/// Splits a query the same way the core does: space-separated terms,
 /// case-insensitive, NFC.
 func queryTerms(_ text: String) -> [String] {
-    text.precomposedStringWithCanonicalMapping.lowercased()
-        .split(whereSeparator: \.isWhitespace).map(String.init)
+    normalizedQuery(text).precomposedStringWithCanonicalMapping.lowercased()
+        .split(separator: " ").map(String.init)
 }

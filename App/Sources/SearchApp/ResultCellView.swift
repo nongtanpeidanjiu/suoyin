@@ -27,6 +27,13 @@ final class ResultCellView: NSTableCellView {
         return fullDate.string(from: date)
     }
 
+    /// Keeps the start of a name and its extension, cutting the middle.
+    private static let singleLine: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingMiddle
+        return style
+    }()
+
     private let icon = NSImageView()
     private let name = NSTextField(labelWithString: "")
     private let location = NSTextField(labelWithString: "")
@@ -47,6 +54,14 @@ final class ResultCellView: NSTableCellView {
         modified.alignment = .right
         badge.contentTintColor = .tertiaryLabelColor
         badge.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        // One line each, however long: a name without spaces must not wrap
+        // onto the location line below it.
+        for label in [name, location] {
+            label.maximumNumberOfLines = 1
+            label.usesSingleLineMode = true
+            label.cell?.wraps = false
+            label.cell?.truncatesLastVisibleLine = true
+        }
         for view in [icon, name, location, modified, badge] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
@@ -135,8 +150,11 @@ final class ResultCellView: NSTableCellView {
         guard let hit else { return }
         let selected = isChosen && Self.invertsWhenChosen
         let base: NSColor = selected ? .alternateSelectedControlTextColor : .labelColor
+        // The attributed string carries its own line breaking; without this
+        // paragraph style it wraps instead of cutting in the middle.
         let text = NSMutableAttributedString(string: hit.name, attributes: [
             .font: NSFont.systemFont(ofSize: Self.compact ? 13 : 14), .foregroundColor: base,
+            .paragraphStyle: Self.singleLine,
         ])
         let whole = hit.name as NSString
         for term in terms {

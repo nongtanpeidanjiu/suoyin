@@ -22,6 +22,13 @@ struct EngineTests {
         return condition()
     }
 
+    private func fixtureEngine(data: URL, local: URL, mounts: ExternalVolumes) throws -> SearchEngine {
+        let tracker = try ChangeTracker(root: local.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                        externalVolumes: mounts)
+        return SearchEngine(dataDirectory: data, tracker: tracker)
+    }
+
     @Test func lifecycleQueriesAndPersistence() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -303,6 +310,136 @@ struct EngineTests {
         #expect(manager.catalog().first(where: { $0.id == newID })?.isIncluded == false)
     }
 
+    @Test(arguments: [false, true])
+    func forgetOfflineVolumePersistsAndReinsertUsesCurrentDefault(withData: Bool) throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let local = root.appendingPathComponent("local")
+        let external = root.appendingPathComponent("fixture-volume")
+        for folder in [data, local, external] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        let id = UUID().uuidString
+        let identity = VolumeIdentity(root: external.path, mount: external.path, device: try WalkScope.device(external.path),
+                                      uuid: id, log: nil, readOnly: false)
+        let mount = ExternalMount(identity: identity, name: "Fixture volume", fileEvents: false)
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        let running = try fixtureEngine(data: data, local: local, mounts: manager)
+        defer { running.stop() }
+        manager.updateMounts([mount])
+        #expect(running.externalVolumes.map(\.canForget) == [false])
+        #expect(throws: EngineVolumeForgetError.online) { try running.forgetExternalVolume(id) }
+        #expect(running.externalVolumes.map(\.id) == [id])
+
+        manager.updateMounts([])
+        let cache = data.appendingPathComponent("external-volumes")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: false)
+        let unrelated = cache.appendingPathComponent("\(UUID().uuidString)-exfat.scanlog")
+        try ExternalScanLog(path: unrelated.path).flush()
+        let contents = try Data(contentsOf: unrelated)
+        let key = "\(id)-\(UUID().uuidString)"
+        let snapshot = cache.appendingPathComponent("\(key).snapshot")
+        let changes = cache.appendingPathComponent("\(key).snapshot.changes")
+        let budget = cache.appendingPathComponent("\(key).snapshot.budget")
+        let scanLog = cache.appendingPathComponent("\(id)-exfat.scanlog")
+        if withData {
+            running.setExternalVolume(id, included: true)
+            var index = SearchIndex()
+            let parent = index.append("/fixture", attribute: Kind.anchor)
+            index.append("retained-fixture.txt", parent: parent)
+            index.prepare()
+            try index.savePrepared(to: snapshot.path)
+            var journal = ChangeJournal(snapshot: snapshot.path, identity: try SearchIndex.preparedIdentity(at: snapshot.path))
+            _ = try journal.reset()
+            try Data("[]".utf8).write(to: budget)
+            try ExternalScanLog(path: scanLog.path).flush()
+            #expect(try SearchIndex.retainedEntries(at: snapshot.path) == 1)
+        }
+        running.start()
+        #expect(running.externalVolumes.first?.isIncluded == withData)
+        #expect(running.externalVolumes.map(\.canForget) == [true])
+        let changed = DispatchSemaphore(value: 0)
+        running.onExternalVolumesChange = { [weak running] in
+            if running?.externalVolumes.isEmpty == true { changed.signal() }
+        }
+        #expect(try running.forgetExternalVolume(id) == .removed)
+        #expect(running.externalVolumes.isEmpty)
+        #expect(changed.wait(timeout: .now() + 3) == .success)
+        #expect([snapshot, changes, budget, scanLog].allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(try Data(contentsOf: unrelated) == contents)
+        running.stop()
+
+        let reopenedManager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        let reopened = try fixtureEngine(data: data, local: local, mounts: reopenedManager)
+        defer { reopened.stop() }
+        reopened.start()
+        #expect(reopened.externalVolumes.isEmpty)
+        #expect(throws: EngineVolumeForgetError.notFound) { try reopened.forgetExternalVolume(id) }
+        #expect(!reopened.includesNewExternalVolumes)
+        reopened.includesNewExternalVolumes = !withData
+        reopenedManager.updateMounts([mount])
+        #expect(reopened.externalVolumes.map(\.id) == [id])
+        #expect(reopened.externalVolumes.first?.isIncluded == !withData)
+        #expect(reopened.externalVolumes.first?.canForget == false)
+    }
+
+    @Test func forgetWhileAnOldScanIsRetiringSerializesConcurrentRequestsAndReattachment() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let local = root.appendingPathComponent("local")
+        let external = root.appendingPathComponent("fixture-volume")
+        for folder in [data, local, external] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        let id = UUID().uuidString
+        let identity = VolumeIdentity(root: external.path, mount: external.path, device: try WalkScope.device(external.path),
+                                      uuid: id, log: nil, readOnly: false)
+        let mount = ExternalMount(identity: identity, name: "Fixture volume", fileEvents: false, filesystem: "exfat")
+        let entered = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false, onAccess: { path in
+            if path == external.path {
+                entered.signal()
+                _ = resume.wait(timeout: .now() + 12)
+            }
+        })
+        let engine = try fixtureEngine(data: data, local: local, mounts: manager)
+        defer { engine.stop() }
+        defer { resume.signal() }
+        engine.start()
+        manager.updateMounts([mount])
+        engine.setExternalVolume(id, included: true)
+        try #require(entered.wait(timeout: .now() + 3) == .success)
+        let artifact = data.appendingPathComponent("external-volumes/\(id)-exfat.scanlog")
+        try #require(FileManager.default.fileExists(atPath: artifact.path))
+
+        manager.updateMounts([])
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            do {
+                #expect(try engine.forgetExternalVolume(id) == .pending)
+            } catch {
+                Issue.record("Unexpected removal error: \(error)")
+            }
+        }
+        #expect(FileManager.default.fileExists(atPath: artifact.path))
+        manager.updateMounts([mount])
+        #expect(manager.searchable().isEmpty)
+        #expect(throws: EngineVolumeForgetError.online) { try engine.forgetExternalVolume(id) }
+        let changed = DispatchSemaphore(value: 0)
+        engine.onExternalVolumesChange = { [weak engine] in
+            if engine?.externalVolumes.first?.retainedCount == 0 &&
+                !FileManager.default.fileExists(atPath: artifact.path) { changed.signal() }
+        }
+        resume.signal()
+        try #require(changed.wait(timeout: .now() + 5) == .success)
+        #expect(engine.externalVolumes.first?.isOnline == true)
+        #expect(engine.externalVolumes.first?.isIncluded == false)
+        #expect(manager.searchable().isEmpty)
+        #expect(engine.externalVolumeSettingsError == nil)
+    }
+
     @Test func mountedVolumesAppearWhileLocalBootstrapIsBlocked() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -379,6 +516,12 @@ struct EngineTests {
             try ExternalScanLog(path: artifact.path).flush()
             manager.removeData(original.id)
             manager.updateMounts([])
+            do {
+                _ = try manager.forget(original.id)
+                Issue.record("Forgetting a volume must persist its removal intent before deleting data.")
+            } catch EngineVolumeForgetError.settings(let error) {
+                #expect(error.category == .writeSettings)
+            }
             #expect(manager.catalog().first?.isIncluded == true)
             #expect(FileManager.default.fileExists(atPath: artifact.path))
         }

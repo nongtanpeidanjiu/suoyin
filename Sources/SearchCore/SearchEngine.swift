@@ -128,6 +128,22 @@ public struct EngineVolume: Sendable, Equatable {
     public let filesystem: String?
     public let capacityBytes: Int64?
     public let detail: String?
+
+    public var canForget: Bool { !isOnline }
+}
+
+public enum EngineVolumeForgetResult: Sendable, Equatable {
+    /// The registration and all local index data for the volume have been removed.
+    case removed
+    /// The request is saved and cleanup will finish after the old volume tracker stops.
+    case pending
+}
+
+public enum EngineVolumeForgetError: Error, Sendable, Equatable {
+    case online
+    case notFound
+    case unavailable
+    case settings(EngineVolumeSettingsError)
 }
 
 public struct EngineVolumeSettingsError: Sendable, Equatable {
@@ -159,6 +175,7 @@ public final class SearchEngine: @unchecked Sendable {
     private var refreshScheduled = false
     private var pendingIndex = false
     private var pendingDisk = false
+    private var pendingVolumeRemoval = false
     private var nextRefresh: DispatchTime = .now()
     private var nextIndexNotification: DispatchTime = .now()
     // The notification queue owns status delivery. A pending delivery reads
@@ -227,6 +244,16 @@ public final class SearchEngine: @unchecked Sendable {
         tracker.externalVolumeManager?.removeData(id)
     }
 
+    /// Forgets a disconnected volume and deletes its local snapshots, journals, and scan checkpoints.
+    /// Completion of a pending request is reported through onExternalVolumesChange.
+    @discardableResult
+    public func forgetExternalVolume(_ id: String) throws -> EngineVolumeForgetResult {
+        guard let manager = tracker.externalVolumeManager else {
+            throw EngineVolumeForgetError.unavailable
+        }
+        return try manager.forget(id)
+    }
+
     public var status: EngineStatus { lock.withLock { reported } }
 
     public func start() {
@@ -283,7 +310,8 @@ public final class SearchEngine: @unchecked Sendable {
     private func scheduleRefresh(for change: EngineChange) {
         lock.withLock {
             if change == .index { pendingIndex = true }
-            if change == .disk { pendingDisk = true }
+            if change == .disk || change == .volumeRemoved { pendingDisk = true }
+            if change == .volumeRemoved { pendingVolumeRemoval = true }
             guard !refreshScheduled else { return }
             refreshScheduled = true
             notifications.asyncAfter(deadline: max(nextRefresh, nextIndexNotification)) { [weak self] in self?.refresh() }
@@ -291,10 +319,11 @@ public final class SearchEngine: @unchecked Sendable {
     }
 
     private func refresh() {
-        let (index, disk, previous) = lock.withLock {
-            let pending = (pendingIndex, pendingDisk, reported)
+        let (index, disk, volumeRemoved, previous) = lock.withLock {
+            let pending = (pendingIndex, pendingDisk, pendingVolumeRemoval, reported)
             pendingIndex = false
             pendingDisk = false
+            pendingVolumeRemoval = false
             refreshScheduled = false
             nextRefresh = .now() + .milliseconds(250)
             return pending
@@ -369,7 +398,7 @@ public final class SearchEngine: @unchecked Sendable {
                                    indexBytesOnDisk: bytes)
         let (indexCallback, volumeCallback) = lock.withLock {
             reported = updated
-            let changed = volumes != reportedVolumes || includesNew != reportedIncludesNew ||
+            let changed = volumeRemoved || volumes != reportedVolumes || includesNew != reportedIncludesNew ||
                 volumeError != reportedVolumeError
             reportedVolumes = volumes
             reportedIncludesNew = includesNew

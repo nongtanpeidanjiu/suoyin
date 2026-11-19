@@ -76,7 +76,7 @@ private struct EventBatch {
 }
 
 enum EngineChange {
-    case status, index, disk
+    case status, index, disk, volumeRemoved
 }
 
 struct EngineTrackerState {

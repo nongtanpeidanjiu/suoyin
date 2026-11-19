@@ -101,6 +101,7 @@ final class ExternalVolumes {
         var included: Bool
         var detail: String?
         var removing = false
+        var forgetting: Bool?
         var nameIsPlaceholder: Bool?
         var filesystem: String?
         var capacityBytes: Int64?
@@ -242,7 +243,8 @@ final class ExternalVolumes {
 
     func setIncluded(_ id: String, included: Bool) {
         queue.sync {
-            guard !closed, var choice = preferences.volumes[id], choice.included != included else { return }
+            guard !closed, var choice = preferences.volumes[id], choice.forgetting != true,
+                  choice.included != included else { return }
             var next = preferences
             choice.included = included
             next.volumes[id] = choice
@@ -259,17 +261,49 @@ final class ExternalVolumes {
 
     func removeData(_ id: String) {
         queue.sync {
-            guard !closed, var choice = preferences.volumes[id] else { return }
-            var next = preferences
-            choice.included = false
-            choice.removing = true
-            next.volumes[id] = choice
-            if save(next, applyOnFailure: false) {
+            guard !closed, let choice = preferences.volumes[id] else { return }
+            if saveRemoval(id, choice: choice) {
                 if let mounted = searchable().first(where: { $0.key == id }) { retire(mounted) }
                 finishRemoval(id)
             }
             engineObserver?(.status)
         }
+    }
+
+    func forget(_ id: String) throws -> EngineVolumeForgetResult {
+        try queue.sync {
+            guard !closed else { throw EngineVolumeForgetError.unavailable }
+            guard let choice = preferences.volumes[id] else { throw EngineVolumeForgetError.notFound }
+            guard !attachmentIDs.values.contains(id) else { throw EngineVolumeForgetError.online }
+            if choice.forgetting != true, !saveRemoval(id, choice: choice, forget: true) {
+                engineObserver?(.status)
+                throw EngineVolumeForgetError.settings(writeSettingsError)
+            }
+            if retiring.contains(id) {
+                engineObserver?(.status)
+                return .pending
+            }
+            guard finishRemoval(id) else {
+                throw EngineVolumeForgetError.settings(preferenceFailure ?? writeSettingsError)
+            }
+            return .removed
+        }
+    }
+
+    private func saveRemoval(_ id: String, choice: Choice, forget: Bool = false) -> Bool {
+        var next = preferences
+        var pending = choice
+        pending.included = false
+        pending.removing = true
+        if forget { pending.forgetting = true }
+        next.volumes[id] = pending
+        return save(next, applyOnFailure: false)
+    }
+
+    private var writeSettingsError: EngineVolumeSettingsError {
+        EngineVolumeSettingsError(category: .writeSettings,
+                                  underlyingMessage: (preferenceFailure ?? startupFailure)?.underlyingMessage
+                                      ?? "External volume settings could not be saved.")
     }
 
     @discardableResult
@@ -287,22 +321,28 @@ final class ExternalVolumes {
         }
     }
 
-    private static func indexFiles(in directory: String) throws -> [(String, String)] {
+    private static func isMissing(_ error: CocoaError) -> Bool {
+        error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile
+    }
+
+    private static func indexFiles(in directory: String, owner: String? = nil) throws -> [(String, String)] {
         let fm = FileManager.default
         let files: [String]
         do { files = try fm.contentsOfDirectory(atPath: directory) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return [] }
+        catch let error as CocoaError where isMissing(error) { return [] }
         return try files.compactMap { file in
-            guard file.count > 36, let id = UUID(uuidString: String(file.prefix(36)))?.uuidString else { return nil }
+            guard file.count > 36, let id = UUID(uuidString: String(file.prefix(36)))?.uuidString,
+                  owner == nil || owner == id else { return nil }
             let path = joinedPath(directory, file)
             let suffix = String(file.dropFirst(36))
             let apfs = suffix.first == "-" && suffix.count > 37 &&
                 UUID(uuidString: String(suffix.dropFirst().prefix(36))) != nil &&
                 [".snapshot", ".snapshot.changes", ".snapshot.budget"].contains(String(suffix.dropFirst(37)))
-            guard suffix == "-exfat.scanlog" || apfs,
-                  try fm.attributesOfItem(atPath: path)[.type] as? FileAttributeType == .typeRegular
-            else { return nil }
-            return (file, id)
+            guard suffix == "-exfat.scanlog" || apfs else { return nil }
+            do {
+                let fields = try fm.attributesOfItem(atPath: path)
+                return fields[.type] as? FileAttributeType == .typeRegular ? (file, id) : nil
+            } catch let error as CocoaError where isMissing(error) { return nil }
         }
     }
 
@@ -310,7 +350,7 @@ final class ExternalVolumes {
         let directory = self.directory
         DispatchQueue.global(qos: .utility).async {
             var counts: [String: Int] = [:]
-            var unavailable: Set<String> = []
+            var errors: [String: EngineVolumeSettingsError] = [:]
             var failed: EngineVolumeSettingsError?
             do {
                 let files = try Self.indexFiles(in: directory).filter {
@@ -328,44 +368,57 @@ final class ExternalVolumes {
                                 : SearchIndex.retainedEntries(at: path)
                         }
                     } catch {
-                        unavailable.insert(id)
-                        failed = Self.issue(.inspectIndex, error)
+                        errors[id] = Self.issue(.inspectIndex, error)
                     }
                 }
             } catch { failed = Self.issue(.inspectIndex, error) }
-            self.queue.async { [counts, unavailable, failed] in
+            self.queue.async { [counts, errors, failed] in
                 guard !self.closed else { return }
                 for (id, count) in counts where !self.retentionInvalidated.contains(id) { self.retained[id] = count }
-                self.retainedUnavailable.formUnion(unavailable.subtracting(self.retentionInvalidated))
+                let unavailable = Set(errors.keys).subtracting(self.retentionInvalidated)
+                self.retainedUnavailable.formUnion(unavailable)
                 self.retainedLoaded = true
-                if self.preferenceFailure == nil { self.preferenceFailure = failed }
+                if self.preferenceFailure == nil {
+                    self.preferenceFailure = failed ?? unavailable.min().flatMap { errors[$0] }
+                }
                 self.engineObserver?(.status)
             }
         }
     }
 
-    private func finishRemoval(_ id: String) {
-        guard !retiring.contains(id), var choice = preferences.volumes[id], choice.removing else { return }
+    @discardableResult
+    private func finishRemoval(_ id: String) -> Bool {
+        guard !retiring.contains(id), var choice = preferences.volumes[id], choice.removing else { return false }
         do {
-            for (file, owner) in try Self.indexFiles(in: directory) where owner == id {
+            for (file, _) in try Self.indexFiles(in: directory, owner: id) {
                 try FileManager.default.removeItem(atPath: joinedPath(directory, file))
             }
             var next = preferences
             retentionInvalidated.insert(id)
             retained[id] = 0
             retainedUnavailable.remove(id)
-            if attachmentIDs.values.contains(id) {
+            let online = attachmentIDs.values.contains(id)
+            let forget = choice.forgetting == true
+            if online && !forget {
                 choice.removing = false
                 next.volumes[id] = choice
             } else {
                 next.volumes.removeValue(forKey: id)
+            }
+            guard save(next, applyOnFailure: false) else {
+                engineObserver?(.disk)
+                return false
+            }
+            if next.volumes[id] == nil {
                 lock.withLock { offline[id] = nil }
             }
-            _ = save(next)
-            engineObserver?(.disk)
+            if forget && online { refresh() }
+            engineObserver?(forget ? .volumeRemoved : .disk)
+            return true
         } catch {
             preferenceFailure = Self.issue(.removeIndex, error)
-            engineObserver?(.status)
+            engineObserver?(.disk)
+            return false
         }
     }
 

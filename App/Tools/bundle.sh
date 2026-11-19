@@ -98,7 +98,9 @@ else
 fi
 
 update_keys=""
-if [[ -n "$public_key" ]]; then
+# 预览版即使有公钥也不写更新配置：否则它会去读正式版的更新地址，被“更新”成正式版。
+# 要测更新流程，用 --release 打包，或给预览版加测试参数 --feed-url。
+if [[ -n "$public_key" ]] && $release; then
     # SUEnableSystemProfiling=false：不发送系统信息。SUEnableAutomaticChecks 写明
     # 后 Sparkle 不再弹窗询问是否自动检查；SUAutomaticallyUpdate=true 加上应用里
     # “安装前询问”缺省为真，就是默认的“自动下载，安装前询问”（见 Updater.swift）。

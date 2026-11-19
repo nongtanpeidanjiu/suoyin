@@ -100,8 +100,11 @@ struct PreparedSearch {
         let existingBytes = nameFilter.isEmpty ? 0 : previousNameBytes
         nameFilter.append(contentsOf: repeatElement(0, count: words - nameFilter.count))
         index.names.withUnsafeBufferPointer { names in
-            nameFilter.withUnsafeMutableBufferPointer { filter in
-                dm_prepare_name_filter(names.baseAddress, names.count, existingBytes, filter.baseAddress)
+            index.records.withUnsafeBufferPointer { rows in
+                nameFilter.withUnsafeMutableBufferPointer { filter in
+                    dm_prepare_name_filter(names.baseAddress, names.count, rows.baseAddress, rows.count,
+                                           existingBytes, filter.baseAddress)
+                }
             }
         }
     }

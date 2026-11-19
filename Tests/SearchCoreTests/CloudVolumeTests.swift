@@ -366,6 +366,7 @@ struct CloudVolumeTests {
 
         let mounts = ExternalVolumes(directory: root.path)
         defer { try? mounts.stop() }
+        mounts.setIncludesNew(true)
         mounts.updateMounts([formerlyMounted])
         #expect(until { mounts.statuses().first?.caughtUp == true })
         let first = try #require(mounts.searchable().first)
@@ -433,6 +434,7 @@ struct CloudVolumeTests {
         let device = try WalkScope.device(root.path)
         let mounts = ExternalVolumes(directory: root.path)
         defer { try? mounts.stop() }
+        mounts.setIncludesNew(true)
         let volumes = paths.map {
             ExternalMount(identity: VolumeIdentity(root: $0.path, mount: $0.path, device: device, uuid: nil,
                                                    log: nil, readOnly: false), name: "SameName", fileEvents: false)

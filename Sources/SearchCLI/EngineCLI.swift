@@ -11,6 +11,8 @@ private struct EngineCommand: Decodable {
     let kind: String?
     let offset: Int?
     let limit: Int?
+    let volumeID: String?
+    let included: Bool?
 
     var engineQuery: EngineQuery {
         EngineQuery(text: query ?? "", mode: mode ?? .name, column: column ?? .name,
@@ -95,6 +97,11 @@ func runEngineCLI(_ args: [String]) throws {
             if let error = source.error { FileHandle.standardError.write(Data((error + "\n").utf8)) }
         }
     }
+    engine.onExternalVolumesChange = { [weak engine] in
+        if let error = engine?.externalVolumeSettingsError {
+            FileHandle.standardError.write(Data((error + "\n").utf8))
+        }
+    }
     engine.start()
     defer { engine.stop() }
     let decoder = JSONDecoder()
@@ -124,6 +131,28 @@ func runEngineCLI(_ args: [String]) throws {
                                     "totalIsExact": result.totalIsExact, "nanoseconds": elapsed])
             case "status":
                 try write("status", ["status": encodeStatus(engine.status), "cpuSeconds": usageAtProcess().0])
+            case "volumes":
+                let rows: [[String: Any]] = engine.externalVolumes.map {
+                    ["id": $0.id, "name": $0.name, "isOnline": $0.isOnline, "isIncluded": $0.isIncluded,
+                     "isScanning": $0.isScanning, "indexedCount": $0.indexedCount,
+                     "detail": $0.detail as Any? ?? NSNull()]
+                }
+                try write("volumes", ["volumes": rows, "includesNew": engine.includesNewExternalVolumes,
+                                      "error": engine.externalVolumeSettingsError as Any? ?? NSNull()])
+            case "set-volume":
+                guard let id = command.volumeID, let included = command.included else {
+                    try write("bad-command"); return false
+                }
+                engine.setExternalVolume(id, included: included)
+                try write("set-volume")
+            case "include-new-external":
+                guard let included = command.included else { try write("bad-command"); return false }
+                engine.includesNewExternalVolumes = included
+                try write("include-new-external")
+            case "remove-volume":
+                guard let id = command.volumeID else { try write("bad-command"); return false }
+                engine.removeExternalVolumeData(id)
+                try write("remove-volume")
             case "recheck-access":
                 engine.recheckAccess()
                 try write("recheck-access")

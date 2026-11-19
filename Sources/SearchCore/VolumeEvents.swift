@@ -125,6 +125,7 @@ struct VolumeIdentity {
 
 final class VolumeEventStream {
     private let queue = DispatchQueue(label: "index.volume-events")
+    private let streamLock = NSLock()
     private var stream: FSEventStreamRef?
     let volume: VolumeIdentity
     let deliver: ([VolumeEvent]) -> Void
@@ -159,12 +160,18 @@ final class VolumeEventStream {
     }
 
     func flush() {
-        if let stream { FSEventStreamFlushSync(stream) }
+        streamLock.withLock {
+            if let stream { FSEventStreamFlushSync(stream) }
+        }
     }
 
     func stop() {
-        guard let value = stream else { return }
-        stream = nil
+        let detached = streamLock.withLock {
+            let value = stream
+            stream = nil
+            return value
+        }
+        guard let value = detached else { return }
         FSEventStreamStop(value)
         FSEventStreamInvalidate(value)
         FSEventStreamRelease(value)

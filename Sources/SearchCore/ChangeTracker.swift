@@ -100,14 +100,17 @@ public final class ChangeTracker {
     private var deferredContainerPaths: [String] = []
     private var activeExclusions: [String] { excluded + deferredContainerPaths }
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
+    private let mountedNameQueries = DispatchQueue(label: "index.mounted-name-query", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var cloud: CloudCompletion?
     private let mounts: ExternalVolumes?
+    var externalVolumeManager: ExternalVolumes? { mounts }
     private let external: ExternalMount?
     private let externalPersistence: Bool
     private let externalScanLog: String?
     var onExternalIdentityChange: (() -> Void)?
     private var externalCancelled = false
+    private var externalEventSource: VolumeEventStream?
     private var directoryEvents = false
     private var pollTimer: DispatchSourceTimer?
     private var needsVolumePolling = false
@@ -293,15 +296,25 @@ public final class ChangeTracker {
     }
 
     func cancelExternalWork() {
-        lock.withLock { externalCancelled = true; view = nil }
+        revokeExternalWork(unfinishedOnly: false)
     }
 
     func cancelUnfinishedExternalScan() {
-        lock.withLock {
-            if status.phase != "caught-up" {
-                externalCancelled = true
-                view = nil
-            }
+        revokeExternalWork(unfinishedOnly: true)
+    }
+
+    private func revokeExternalWork(unfinishedOnly: Bool) {
+        let stream = lock.withLock { () -> VolumeEventStream? in
+            guard !unfinishedOnly || status.phase != "caught-up" else { return nil }
+            externalCancelled = true
+            view = nil
+            let stream = externalEventSource
+            externalEventSource = nil
+            return stream
+        }
+        if let stream {
+            // The writer may still be waiting for an issued device read.
+            DispatchQueue.global(qos: .utility).async { stream.stop() }
         }
     }
 
@@ -347,19 +360,39 @@ public final class ChangeTracker {
         }
         guard offset >= 0, limit > 0, offset <= Int.max - limit else { return [] }
         let capacity = offset + limit
-        var groups: [[SearchRow]] = []
-        groups.append(captured?.search(query, mode: mode, column: column, direction: direction,
-                                       showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? [])
-        for volume in volumes {
-            groups.append(volume.tracker.search(query, mode: mode, column: column, direction: direction,
-                                                 showAll: showAll, kind: kind, limit: capacity).map {
-                var row = SearchRow(id: $0.id, name: $0.name, path: $0.path,
-                                    size: $0.size, modified: $0.modified, volumeID: volume.key,
-                                    attribute: $0.attribute)
-                row.volumeSlot = volume.slot
-                return row
-            })
+        let attached = volumes.map { volume in
+            (volume, volume.tracker.lock.withLock { volume.tracker.view })
         }
+        func searchAttached() -> [[SearchRow]] {
+            attached.map { volume, view in
+                let rows = view?.search(query, mode: mode, column: column, direction: direction,
+                                        showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? []
+                return rows.map {
+                    var row = SearchRow(id: $0.id, name: $0.name, path: $0.path,
+                                        size: $0.size, modified: $0.modified, volumeID: volume.key,
+                                        attribute: $0.attribute)
+                    row.volumeSlot = volume.slot
+                    return row
+                }
+            }
+        }
+        // Search the immutable views in parallel with at most one attached
+        // search per engine. It uses no scanner workers or directory slots.
+        var attachedRows: [[SearchRow]] = []
+        let attachedWork: DispatchWorkItem?
+        if mode == .name, !query.isEmpty, captured != nil,
+           attached.contains(where: { ($0.1?.entryCount ?? 0) > 0 }) {
+            let work = DispatchWorkItem { attachedRows = searchAttached() }
+            mountedNameQueries.async(execute: work)
+            attachedWork = work
+        } else {
+            attachedWork = nil
+        }
+        let local = captured?.search(query, mode: mode, column: column, direction: direction,
+                                     showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? []
+        if let attachedWork { attachedWork.wait() }
+        else { attachedRows = searchAttached() }
+        let groups = [local] + attachedRows
         let present = [true] + volumes.map { mounts?.isCurrent($0) == true }
         var heads = [Int](repeating: 0, count: groups.count)
         var result: [SearchRow] = []
@@ -586,6 +619,17 @@ public final class ChangeTracker {
             needsReplay.remove(volume)
             cursors[volume] = newCursor(for: identities[volume])
             sources[volume] = try? open(nil, fileEvents: false)
+        }
+        if external != nil, let stream = sources[volume] {
+            let keep = lock.withLock {
+                guard !externalCancelled else { return false }
+                externalEventSource = stream
+                return true
+            }
+            if !keep {
+                stream.stop()
+                sources[volume] = nil
+            }
         }
         needsVolumePolling = external != nil && (sources[volume] == nil || directoryEvents && identities[volume].log == nil)
     }

@@ -67,14 +67,18 @@ final class ExternalScanLog {
 
     /// Lookup data is immutable throughout a scan. A read slot is held only
     /// for the directory open and fstat, not while decoding saved entries.
-    func restored(_ path: String, relative: String, device: Int32) throws -> DirectoryBatch? {
+    func restored(_ path: String, relative: String, device: Int32,
+                  cancelled: () -> Bool = { false }) throws -> DirectoryBatch? {
         guard let range = offsets[relative] else { return nil }
         var reader = JournalReader(bytes: bytes[range], cursor: range.lowerBound)
         guard let inode = reader.read(UInt64.self), let modified = reader.read(Int64.self),
               let changed = reader.read(Int64.self), let created = reader.read(Int64.self),
               let size = reader.read(Int64.self) else { return nil }
         var stamp = DMDirectoryStamp()
-        let error = readDirectory { dm_directory_stamp(path, device, &stamp) }
+        let error = try readDirectory {
+            if cancelled() { throw CancellationError() }
+            return dm_directory_stamp(path, device, &stamp)
+        }
         switch error {
         case 0: break
         case EACCES, EPERM, ENOENT, ENOTDIR, ELOOP, ESTALE: return nil

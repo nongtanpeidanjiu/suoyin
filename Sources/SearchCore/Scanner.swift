@@ -372,7 +372,8 @@ private final class ScanSession {
         if cancelled() { throw CancellationError() }
         let relative = scanLog == nil ? "" : relativePath(job.path)
         let restoreStart = scanLog == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        if let restored = try scanLog?.restored(job.path, relative: relative, device: scope.primaryDevice) {
+        if let restored = try scanLog?.restored(job.path, relative: relative, device: scope.primaryDevice,
+                                               cancelled: cancelled) {
             return Observation(batch: restored, delta: DMCounts(), code: 0, relative: relative, restored: true,
                                slotWait: 0, listing: 0,
                                restoreTime: DispatchTime.now().uptimeNanoseconds - restoreStart)

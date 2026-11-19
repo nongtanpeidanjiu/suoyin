@@ -107,6 +107,60 @@ struct CoreTests {
         }
     }
 
+    @Test func packedNameVerificationRetainsExactPagedOrder() {
+        var index = SearchIndex()
+        let root = index.append("/test", attribute: Kind.anchor)
+        for i in 0..<2_100 {
+            index.append("00-unrelated-\(i)", parent: root)
+            index.append("zz-unrelated-\(i)", parent: root)
+        }
+        for i in 0..<720 {
+            let key = (i * 347) % 720
+            let flags = key.isMultiple(of: 10) ? Kind.file | Kind.hidden : Kind.file
+            index.append("\(key + 1_000)-AbCdEfGh12345678IJkLmNö.txt", parent: root, attribute: flags)
+            index.append("\(key + 1_000)-AbCdEfGh123X5678IJkLmNö.md", parent: root)
+        }
+        index.prepare()
+        for direction in SearchDirection.allCases {
+            for term in ["abcdefgh", "abcdefgh12345678", "abcdefgh12345678i", "abcdefgh12345678ijklmnö",
+                         "abcdefgh txt"] {
+                let expected = index.directSearch(term, direction: direction, kind: .document, offset: 75, limit: 200)
+                #expect(expected.count == 200)
+                #expect(index.search(term, direction: direction, kind: .document, offset: 75, limit: 200) == expected)
+            }
+        }
+    }
+
+    @Test func denseNameQueryKeepsMatchesWhenSparseBufferFills() {
+        var index = SearchIndex()
+        let root = index.append("/test", attribute: Kind.anchor)
+        for i in 0..<2_100 { index.append("unrelated-\(i)", parent: root, size: -1) }
+        for i in 0..<4_105 {
+            index.append("z-CommonRepeatedCommon-\(i).txt", parent: root, size: Int64(i % 11))
+        }
+        index.append("z-CommonRepeatedCommon-Cafe\u{301}.txt", parent: root, size: 11)
+        index.prepare()
+        for column in [SearchColumn.name, .size] {
+            let expected = index.directSearch("common txt", column: column, offset: 3_990, limit: 201)
+            #expect(expected.count == 116)
+            #expect(index.search("common txt", column: column, offset: 3_990, limit: 201) == expected)
+        }
+    }
+
+    @Test func pathRenderingJoinsRawComponentsWithUTF8Repair() {
+        var index = SearchIndex()
+        let root = index.append("/", attribute: Kind.anchor)
+        let directory = index.append("Cafe\u{301}", parent: root, attribute: Kind.directory)
+        let bytes: [UInt8] = [0x66, 0xff, 0x80, 0x6f]
+        let leaf = bytes.withUnsafeBufferPointer {
+            index.append(bytes: $0, parent: directory, size: 0, modified: 0, attribute: Kind.file)
+        }
+        #expect(index.fullPath(root) == "/")
+        #expect(index.fullPath(directory) == "/" + index.name(directory))
+        let expected = "/" + index.name(directory) + "/" + index.name(leaf)
+        #expect(index.fullPath(leaf).utf8.elementsEqual(expected.utf8))
+    }
+
     @Test func normalizationStoresOnlyChangedNonASCIIKeys() {
         var index = SearchIndex()
         let root = index.append("/UPPER", attribute: Kind.anchor)

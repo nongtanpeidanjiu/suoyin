@@ -111,6 +111,16 @@ public struct EngineStatus: Sendable {
     public var inaccessiblePaths: [String] { inaccessibleLocations.map(\.path) }
 }
 
+public struct EngineVolume: Sendable, Equatable {
+    public let id: String
+    public let name: String
+    public let isOnline: Bool
+    public let isIncluded: Bool
+    public let isScanning: Bool
+    public let indexedCount: Int
+    public let detail: String?
+}
+
 /// In-process access to the local and attached-volume indexes. One instance
 /// owns the data directory. Use a fresh instance to start again after stop.
 public final class SearchEngine: @unchecked Sendable {
@@ -124,6 +134,10 @@ public final class SearchEngine: @unchecked Sendable {
     private let notifications = DispatchQueue(label: "index.engine-notifications", qos: .utility)
     private var statusHandler: (@Sendable (EngineStatus) -> Void)?
     private var indexHandler: (@Sendable () -> Void)?
+    private var volumesHandler: (@Sendable () -> Void)?
+    private var reportedVolumes: [EngineVolume] = []
+    private var reportedIncludesNew = false
+    private var reportedVolumeError: String?
     private var refreshScheduled = false
     private var pendingIndex = false
     private var pendingDisk = false
@@ -171,6 +185,28 @@ public final class SearchEngine: @unchecked Sendable {
     public var onIndexChange: (@Sendable () -> Void)? {
         get { lock.withLock { indexHandler } }
         set { lock.withLock { indexHandler = newValue } }
+    }
+
+    public var onExternalVolumesChange: (@Sendable () -> Void)? {
+        get { lock.withLock { volumesHandler } }
+        set { lock.withLock { volumesHandler = newValue } }
+    }
+
+    public var includesNewExternalVolumes: Bool {
+        get { tracker.externalVolumeManager?.includesNew ?? false }
+        set { tracker.externalVolumeManager?.setIncludesNew(newValue) }
+    }
+
+    public var externalVolumes: [EngineVolume] { tracker.externalVolumeManager?.catalog() ?? [] }
+
+    public var externalVolumeSettingsError: String? { tracker.externalVolumeManager?.settingsError }
+
+    public func setExternalVolume(_ id: String, included: Bool) {
+        tracker.externalVolumeManager?.setIncluded(id, included: included)
+    }
+
+    public func removeExternalVolumeData(_ id: String) {
+        tracker.externalVolumeManager?.removeData(id)
     }
 
     public var status: EngineStatus { lock.withLock { reported } }
@@ -248,6 +284,7 @@ public final class SearchEngine: @unchecked Sendable {
         let localState = tracker.engineState()
         let local = localState.status
         let external = tracker.engineExternalStates()
+        let (volumes, includesNew, volumeError) = tracker.externalVolumeManager?.catalogState() ?? ([], false, nil)
         let count = localState.indexed + external.reduce(0) { $0 + $1.state.indexed }
         let verified = localState.accessChecked
         func locations(_ state: TrackingStatus, paths: [String]) -> [InaccessibleLocation] {
@@ -309,9 +346,14 @@ public final class SearchEngine: @unchecked Sendable {
                                    rawInaccessibleLocations: raw, inaccessibleLocationsVerified: verified,
                                    pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
                                    indexBytesOnDisk: bytes)
-        let indexCallback = lock.withLock {
+        let (indexCallback, volumeCallback) = lock.withLock {
             reported = updated
-            return indexHandler
+            let changed = volumes != reportedVolumes || includesNew != reportedIncludesNew ||
+                volumeError != reportedVolumeError
+            reportedVolumes = volumes
+            reportedIncludesNew = includesNew
+            reportedVolumeError = volumeError
+            return (indexHandler, changed ? volumesHandler : nil)
         }
         if phase != previous.phase || count != previous.indexedCount || sources != previous.sources ||
             verified != previous.inaccessibleLocationsVerified ||
@@ -329,6 +371,7 @@ public final class SearchEngine: @unchecked Sendable {
             if deliver { indexCallback() }
             else { scheduleRefresh(for: .index) }
         }
+        volumeCallback?()
     }
 
     private func scheduleStatusDelivery() {

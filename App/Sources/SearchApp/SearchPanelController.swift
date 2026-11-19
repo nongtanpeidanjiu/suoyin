@@ -173,6 +173,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// The file Quick Look was last given, so background refreshes of the
     /// list do not reload an unchanged preview.
     private var previewedPath: String?
+    /// Stand-ins that let Quick Look show text it has no preview for.
+    private let previewContent = PreviewContent()
+    /// Test hook: a file to preview instead of the selected row, until the
+    /// selection moves.
+    private var previewPathOverride: String?
+    /// The file the preview shows.
+    private var previewTarget: String? { previewPathOverride ?? selectedHit?.path }
     private var reloadingResults = false
     /// Asked to open the settings window (Command-comma in the panel).
     var onOpenSettings: (() -> Void)?
@@ -917,6 +924,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     private func moveSelection(by delta: Int) {
         guard !hits.isEmpty else { return }
+        if previewPathOverride != nil {
+            previewPathOverride = nil
+            followSelectionInPreview()
+        }
         let row = min(max(table.selectedRow + delta, 0), hits.count - 1)
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
@@ -937,7 +948,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// Opens Quick Look on the selected file without taking focus from the
     /// search field, so typing and the arrow keys keep working on the list.
     @objc private func showPreview() {
-        guard isVisible, selectedHit != nil, let quickLook = QLPreviewPanel.shared() else { return }
+        guard isVisible, previewTarget != nil, let quickLook = QLPreviewPanel.shared() else { return }
         previewRequested = true
         // Quick Look finds its controller through the key window, so the
         // search panel must hold key status when the preview is asked for.
@@ -960,7 +971,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     /// Shows the newly selected file in the open preview.
     private func followSelectionInPreview() {
-        guard !reloadingResults, let previewPanel, selectedHit?.path != previewedPath else { return }
+        guard !reloadingResults, let previewPanel, previewTarget != previewedPath else { return }
         previewPanel.reloadData()
         placePreview()
         settlePreview()
@@ -1105,6 +1116,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         quickLook.dataSource = nil
         quickLook.delegate = nil
         previewedPath = nil
+        previewPathOverride = nil
+        previewContent.clear()
         let wasRequested = previewRequested
         previewRequested = false
         // Closing the preview (Esc or Space in its own panel, or its close
@@ -1116,12 +1129,27 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
-    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { selectedHit == nil ? 0 : 1 }
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { previewTarget == nil ? 0 : 1 }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        // A file that is gone or unreadable gets Quick Look's own notice.
-        previewedPath = selectedHit?.path
-        return selectedHit.map { NSURL(fileURLWithPath: $0.path) }
+        guard let path = previewTarget else { return nil }
+        previewedPath = path
+        switch previewContent.plan(for: path) {
+        case .standIn(let url)?:
+            return PreviewItem(url: url, title: (path as NSString).lastPathComponent)
+        case .original?:
+            return NSURL(fileURLWithPath: path)
+        case nil:
+            // Until the file has been looked at, Quick Look shows it as it
+            // would anyway (its own view, or its notice for a file that is
+            // gone or unreadable); a text stand-in replaces that once ready.
+            previewContent.prepare(path) { [weak self] plan in
+                guard let self, plan != .original, let previewPanel = self.previewPanel,
+                      self.previewTarget == path else { return }
+                previewPanel.reloadData()
+            }
+            return NSURL(fileURLWithPath: path)
+        }
     }
 
     /// While Quick Look holds key status, the keys that steer the list still do.
@@ -1148,6 +1176,17 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         guard table.visibleRect.intersects(rect) else { return .zero }
         return self.panel.convertToScreen(table.convert(rect, to: nil))
     }
+
+    /// Test hook: previews `path` as if its row were selected, until the
+    /// selection moves.
+    func previewPathForTesting(_ path: String) {
+        guard isVisible else { return }
+        previewPathOverride = path
+        if let previewPanel { previewPanel.reloadData(); placePreview(); settlePreview() } else { showPreview() }
+    }
+
+    /// Removes stand-ins a previous run left behind.
+    func clearPreviewLeftovers() { previewContent.clear() }
 
     /// Test hook: moves the selection the way the arrow keys do.
     func moveSelectionForTesting(by delta: Int) { moveSelection(by: delta) }

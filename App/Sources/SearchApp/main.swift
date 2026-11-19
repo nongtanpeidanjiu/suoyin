@@ -53,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.panel.refresh() }
         }
         service.start()
+        panel.clearPreviewLeftovers()
 
         // Offer the authorization guide once, on the first launch without access.
         if !DiskAccess.isGranted, !UserDefaults.standard.bool(forKey: "accessGuideShown"),
@@ -71,6 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.preview"),
                                                             object: nil, queue: .main) { [weak self] _ in
             self?.panel.togglePreview()
+        }
+        // Previews a given file (object: its path), e.g. test samples the
+        // index has not picked up yet.
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.previewPath"),
+                                                            object: nil, queue: .main) { [weak self] note in
+            guard let path = note.object as? String else { return }
+            self?.panel.previewPathForTesting(path)
         }
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.select"),
                                                             object: nil, queue: .main) { [weak self] note in

@@ -45,11 +45,36 @@ enum IndexPhase {
     case degraded(reason: String)
 }
 
+/// Why a location could not be read.
+enum AccessReason: CaseIterable {
+    /// Inside a privacy-protected folder; full disk access should open it.
+    case needsFullDiskAccess
+    /// Ordinary file permissions or an ACL; full disk access does not change them.
+    case filePermissions
+    case unknown
+}
+
+/// A location the core could not read. In the summarised list `count` is the
+/// number of raw locations the entry stands for; raw entries count 1.
+struct InaccessiblePlace: Equatable {
+    var path: String
+    var count: Int
+    var reason: AccessReason
+}
+
 struct IndexStatus {
     var phase: IndexPhase
     var indexedCount: Int
-    var inaccessiblePaths: [String]
+    /// Every location that could not be read, system folders included.
+    var rawInaccessiblePlaces: [InaccessiblePlace] = []
+    /// The same locations merged under common folders, per reason, for reading.
+    var inaccessiblePlaces: [InaccessiblePlace] = []
+    /// Other applications' data folders left unread until full disk access is
+    /// granted, so that indexing never raises the system's access prompt.
+    var pendingFullDiskAccessPaths: [String] = []
     var indexBytesOnDisk: Int64
+
+    var inaccessibleCount: Int { rawInaccessiblePlaces.count }
 }
 
 protocol SearchService: AnyObject {

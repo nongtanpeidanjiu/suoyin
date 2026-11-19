@@ -64,7 +64,19 @@ final class CoreSearchService: SearchService {
         case .failed(let reason): phase = .degraded(reason: reason)
         }
         return IndexStatus(phase: phase, indexedCount: status.indexedCount,
-                           inaccessiblePaths: status.inaccessiblePaths,
+                           rawInaccessiblePlaces: status.rawInaccessibleLocations.map(convert),
+                           inaccessiblePlaces: status.inaccessibleLocations.map(convert),
+                           pendingFullDiskAccessPaths: status.pendingFullDiskAccessPaths,
                            indexBytesOnDisk: status.indexBytesOnDisk)
+    }
+
+    private static func convert(_ location: InaccessibleLocation) -> InaccessiblePlace {
+        let reason: AccessReason
+        switch location.reason {
+        case .likelyNeedsFullDiskAccess: reason = .needsFullDiskAccess
+        case .filePermissions: reason = .filePermissions
+        case .unknown: reason = .unknown
+        }
+        return InaccessiblePlace(path: location.path, count: location.count, reason: reason)
     }
 }

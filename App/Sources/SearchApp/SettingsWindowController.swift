@@ -369,11 +369,13 @@ private final class ScopePane: SettingsPane {
     private let accessIcon = NSImageView()
     private let accessLabel = NSTextField(labelWithString: "")
     private let accessButton = NSButton(title: "前往授权…", target: nil, action: nil)
-    private let places = NSStackView()
-    private let placesList = PlacesList()
-    private let placesEmpty = NSTextField(labelWithString: "没有无法访问的位置")
     private let placesCount = NSTextField(labelWithString: "")
-    private var shownPaths: [String]?
+    private let placesOutline = InaccessibleOutline()
+    private var placesNote: NSTextField!
+    private var pendingRow: NSGridRow!
+    private let pendingList = PlacesList()
+    private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace])?
+    private var pendingPaths: [String] = []
 
     init(service: SearchService, onShowAccessGuide: @escaping () -> Void) {
         self.service = service
@@ -397,13 +399,22 @@ private final class ScopePane: SettingsPane {
         addRow("完整磁盘访问：", access, gap: 14)
         addRow(nil, note("未授权时，邮件、信息等受系统保护的位置搜不到。"))
 
+        placesNote = note("搜索范围是整台电脑。上面列出的位置读不到，其中的文件不会出现在搜索结果中。点按三角形可以查看每一项包含的具体位置。")
+        let places = NSStackView(views: [placesCount, placesOutline, placesNote])
         places.orientation = .vertical
         places.alignment = .leading
         places.spacing = 6
-        placesCount.textColor = .secondaryLabelColor
-        places.setViews([placesEmpty, placesCount, placesList,
-                         note("这些位置里的文件不会出现在结果中。授予完整磁盘访问权限后，大多可以恢复。")], in: .top)
-        addRow("无法访问的位置：", places, gap: 14).yPlacement = .top
+        addRow("无法访问的位置：", places, gap: 14)
+
+        let pending = NSStackView(views: [
+            note("为了不触发系统的权限弹窗，未授权时软件不会读取其他应用的数据文件夹；授权后自动补上。"),
+            pendingList,
+        ])
+        pending.orientation = .vertical
+        pending.alignment = .leading
+        pending.spacing = 6
+        pendingRow = addRow("等待授权的位置：", pending, gap: 14)
+        pendingRow.isHidden = true
     }
 
     override func reload() {
@@ -419,16 +430,32 @@ private final class ScopePane: SettingsPane {
                                    accessibilityDescription: nil)
         accessIcon.contentTintColor = granted ? .systemGreen : .tertiaryLabelColor
         accessButton.isHidden = granted
+        showPending()
     }
 
     func update(_ status: IndexStatus) {
-        let paths = status.inaccessiblePaths
-        guard paths != shownPaths else { return }
-        shownPaths = paths
-        placesEmpty.isHidden = !paths.isEmpty
-        for view in places.arrangedSubviews where view !== placesEmpty { view.isHidden = paths.isEmpty }
-        placesCount.stringValue = "共 \(NumberFormatter.localizedString(from: NSNumber(value: paths.count), number: .decimal)) 个位置"
-        placesList.paths = paths
+        if status.pendingFullDiskAccessPaths != pendingPaths {
+            pendingPaths = status.pendingFullDiskAccessPaths
+            pendingList.paths = pendingPaths
+            showPending()
+        }
+        guard shown?.raw != status.rawInaccessiblePlaces || shown?.merged != status.inaccessiblePlaces else { return }
+        let wasEmpty = shown.map { $0.raw.isEmpty && $0.merged.isEmpty } ?? true
+        shown = (status.rawInaccessiblePlaces, status.inaccessiblePlaces)
+        let total = status.inaccessibleCount
+        placesCount.stringValue = total == 0 ? "没有无法访问的位置" : "共 \(formatted(total)) 个位置读不到"
+        placesOutline.show(raw: status.rawInaccessiblePlaces, merged: status.inaccessiblePlaces)
+        let isEmpty = status.rawInaccessiblePlaces.isEmpty && status.inaccessiblePlaces.isEmpty
+        placesOutline.isHidden = isEmpty
+        placesNote.isHidden = isEmpty
+        if isEmpty != wasEmpty { onSizeChange?() }
+    }
+
+    /// The pending folders matter only until access is granted.
+    private func showPending() {
+        let hidden = pendingPaths.isEmpty || DiskAccess.isGranted
+        guard pendingRow.isHidden != hidden else { return }
+        pendingRow.isHidden = hidden
         onSizeChange?()
     }
 
@@ -437,6 +464,10 @@ private final class ScopePane: SettingsPane {
     }
 
     @objc private func showGuide() { onShowAccessGuide() }
+}
+
+private func formatted(_ number: Int) -> String {
+    NumberFormatter.localizedString(from: NSNumber(value: number), number: .decimal)
 }
 
 // MARK: Index
@@ -485,10 +516,19 @@ private final class IndexPane: SettingsPane {
     }
 }
 
-/// A short bordered list of folders, scrolling when there are many.
+/// A short bordered list of folders, as tall as its rows up to a limit and
+/// scrolling beyond it.
 private final class PlacesList: NSScrollView, NSTableViewDataSource, NSTableViewDelegate {
-    var paths: [String] = [] { didSet { table.reloadData() } }
+    private static let rowHeight: CGFloat = 20
+    private static let maxRows = 5
+    var paths: [String] = [] {
+        didSet {
+            height.constant = Self.rowHeight * CGFloat(min(max(paths.count, 1), Self.maxRows)) + 2
+            table.reloadData()
+        }
+    }
     private let table = NSTableView()
+    private var height: NSLayoutConstraint!
 
     init() {
         super.init(frame: .zero)
@@ -496,22 +536,20 @@ private final class PlacesList: NSScrollView, NSTableViewDataSource, NSTableView
         column.resizingMask = .autoresizingMask
         table.addTableColumn(column)
         table.headerView = nil
-        table.rowHeight = 20
+        table.rowHeight = Self.rowHeight
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = true
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         table.dataSource = self
         table.delegate = self
-        table.setAccessibilityLabel("无法访问的位置")
+        table.setAccessibilityLabel("等待授权的位置")
         documentView = table
         borderType = .bezelBorder
         hasVerticalScroller = true
         autohidesScrollers = true
         translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: SettingsPane.noteWidth + 40),
-            heightAnchor.constraint(equalToConstant: 20 * 6 + 2),
-        ])
+        height = heightAnchor.constraint(equalToConstant: Self.rowHeight + 2)
+        NSLayoutConstraint.activate([widthAnchor.constraint(equalToConstant: InaccessibleOutline.width), height])
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -519,35 +557,358 @@ private final class PlacesList: NSScrollView, NSTableViewDataSource, NSTableView
     func numberOfRows(in tableView: NSTableView) -> Int { paths.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = NSUserInterfaceItemIdentifier("place")
-        let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? NSTableCellView ?? {
-            let cell = NSTableCellView()
-            cell.identifier = identifier
+        let cell = PlaceCell.make(in: tableView, kind: .place)
+        cell.show(path: paths[row], title: (paths[row] as NSString).abbreviatingWithTildeInPath, count: nil)
+        return cell
+    }
+}
+
+/// One line in the access lists: an optional folder symbol, the path cut in
+/// the middle when long, and an optional count that always stays visible.
+private final class PlaceCell: NSTableCellView {
+    enum Kind: String { case place, detail }
+
+    private let countLabel = NSTextField(labelWithString: "")
+
+    static func make(in tableView: NSTableView, kind: Kind) -> PlaceCell {
+        let identifier = NSUserInterfaceItemIdentifier("place-" + kind.rawValue)
+        if let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? PlaceCell { return cell }
+        let cell = PlaceCell(kind: kind)
+        cell.identifier = identifier
+        return cell
+    }
+
+    private init(kind: Kind) {
+        super.init(frame: .zero)
+        let label = NSTextField(labelWithString: "")
+        label.lineBreakMode = .byTruncatingMiddle
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = kind == .place ? .labelColor : .secondaryLabelColor
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        countLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        countLabel.textColor = .secondaryLabelColor
+        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        countLabel.setContentHuggingPriority(.required, for: .horizontal)
+        var views: [NSView] = [label, countLabel]
+        if kind == .place {
             let icon = NSImageView(image: NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage())
             icon.contentTintColor = .secondaryLabelColor
             icon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
-            let label = NSTextField(labelWithString: "")
-            label.lineBreakMode = .byTruncatingMiddle
-            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            for view in [icon, label] {
-                view.translatesAutoresizingMaskIntoConstraints = false
-                cell.addSubview(view)
+            icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+            views.insert(icon, at: 0)
+        }
+        let row = NSStackView(views: views)
+        row.spacing = 4
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        textField = label
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func show(path: String, title: String, count: Int?) {
+        textField?.stringValue = title
+        countLabel.stringValue = count.map { "（含 \(formatted($0)) 个位置）" } ?? ""
+        countLabel.isHidden = count == nil
+        toolTip = path
+    }
+}
+
+/// The unreadable locations grouped by reason. Each group lists the merged
+/// entries, and each merged entry opens onto the locations it stands for.
+private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    static let width: CGFloat = 360
+    private static let rowHeight: CGFloat = 20
+
+    final class Node: NSObject {
+        enum Kind {
+            case group(AccessReason, count: Int)
+            case place(InaccessiblePlace)
+            case detail(InaccessiblePlace, parent: String)
+        }
+        let key: String
+        let kind: Kind
+        var children: [Node] = []
+
+        init(key: String, kind: Kind) {
+            self.key = key
+            self.kind = kind
+        }
+
+        override func isEqual(_ object: Any?) -> Bool { (object as? Node)?.key == key }
+        override var hash: Int { key.hashValue }
+    }
+
+    private let outline = NSOutlineView()
+    private var groups: [Node] = []
+
+    init() {
+        super.init(frame: .zero)
+        let column = NSTableColumn(identifier: .init("place"))
+        column.resizingMask = .autoresizingMask
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+        outline.headerView = nil
+        outline.style = .plain
+        outline.rowHeight = Self.rowHeight
+        outline.indentationPerLevel = 14
+        outline.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        outline.dataSource = self
+        outline.delegate = self
+        outline.setAccessibilityLabel("无法访问的位置")
+        documentView = outline
+        borderType = .bezelBorder
+        hasVerticalScroller = true
+        autohidesScrollers = true
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: Self.width),
+            heightAnchor.constraint(equalToConstant: 260),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Keeps the single column exactly as wide as the visible area, so long
+    /// paths are cut in the middle and the explanations wrap inside it.
+    override func tile() {
+        super.tile()
+        let before = outline.tableColumns.first?.width
+        outline.sizeLastColumnToFit()
+        if outline.tableColumns.first?.width != before {
+            outline.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<outline.numberOfRows))
+        }
+    }
+
+    /// Replaces the contents, keeping what was open, what was selected and
+    /// where the list was scrolled to.
+    func show(raw: [InaccessiblePlace], merged: [InaccessiblePlace]) {
+        let previous = Set(groups.map(\.key))
+        var expanded = Set<String>()
+        func collect(_ nodes: [Node]) {
+            for node in nodes where outline.isItemExpanded(node) {
+                expanded.insert(node.key)
+                collect(node.children)
             }
-            NSLayoutConstraint.activate([
-                icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-                icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                icon.widthAnchor.constraint(equalToConstant: 16),
-                label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 4),
-                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            ])
-            cell.textField = label
+        }
+        collect(groups)
+        let selected = (outline.item(atRow: outline.selectedRow) as? Node)?.key
+        let origin = contentView.bounds.origin
+
+        groups = Self.tree(raw: raw, merged: merged)
+        outline.reloadData()
+        func restore(_ nodes: [Node]) {
+            for node in nodes {
+                let isGroup = if case .group = node.kind { true } else { false }
+                // A group seen for the first time starts open.
+                if expanded.contains(node.key) || (isGroup && !previous.contains(node.key)) {
+                    outline.expandItem(node)
+                    restore(node.children)
+                }
+            }
+        }
+        restore(groups)
+        if let selected, let node = find(selected, in: groups) {
+            let row = outline.row(forItem: node)
+            if row >= 0 { outline.selectRowIndexes([row], byExtendingSelection: false) }
+        } else {
+            outline.deselectAll(nil)
+        }
+        outline.layoutSubtreeIfNeeded()
+        let limit = max(0, outline.frame.height - contentView.bounds.height)
+        contentView.scroll(to: NSPoint(x: 0, y: min(origin.y, limit)))
+        reflectScrolledClipView(contentView)
+    }
+
+    private func find(_ key: String, in nodes: [Node]) -> Node? {
+        for node in nodes {
+            if node.key == key { return node }
+            if let found = find(key, in: node.children) { return found }
+        }
+        return nil
+    }
+
+    /// Groups the merged entries by reason and files every raw location under
+    /// the merged entry that covers it. A raw location no entry covers is
+    /// still listed, as an entry of its own.
+    private static func tree(raw: [InaccessiblePlace], merged: [InaccessiblePlace]) -> [Node] {
+        AccessReason.allCases.compactMap { reason in
+            let entries = merged.filter { $0.reason == reason }
+            var details: [String: [InaccessiblePlace]] = [:]
+            var loose: [InaccessiblePlace] = []
+            let covering = Set(entries.map(\.path))
+            for place in raw where place.reason == reason {
+                var path = place.path
+                while !covering.contains(path), path != "/", !path.isEmpty {
+                    path = (path as NSString).deletingLastPathComponent
+                }
+                if covering.contains(path) { details[path, default: []].append(place) } else { loose.append(place) }
+            }
+            let places = (entries + loose).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            guard !places.isEmpty else { return nil }
+            let groupKey = "\(reason)"
+            let group = Node(key: groupKey, kind: .group(reason, count: places.reduce(0) { $0 + $1.count }))
+            group.children = places.map { place in
+                let node = Node(key: groupKey + "\u{0}" + place.path, kind: .place(place))
+                let inside = details[place.path] ?? []
+                // A single location that is the entry itself needs no detail.
+                if !(inside.count == 1 && inside[0].path == place.path) {
+                    node.children = inside.map {
+                        Node(key: node.key + "\u{0}" + $0.path, kind: .detail($0, parent: place.path))
+                    }
+                }
+                return node
+            }
+            return group
+        }
+    }
+
+    private static func title(_ reason: AccessReason) -> String {
+        switch reason {
+        case .needsFullDiskAccess: "授权后可读"
+        case .filePermissions: "系统权限限制"
+        case .unknown: "原因不明"
+        }
+    }
+
+    private static func explanation(_ reason: AccessReason) -> String {
+        switch reason {
+        case .needsFullDiskAccess: "授予完整磁盘访问权限后就能读到。"
+        case .filePermissions: "这些位置只有系统或其他用户能读，授权后也读不到；这是 macOS 的保护，不是软件故障。"
+        case .unknown: "暂时无法判断原因。"
+        }
+    }
+
+    // MARK: Data
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        (item as? Node)?.children.count ?? groups.count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        (item as? Node)?.children[index] ?? groups[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        !((item as? Node)?.children.isEmpty ?? true)
+    }
+
+    // MARK: Appearance
+
+    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
+        guard let node = item as? Node, case .group(let reason, _) = node.kind else { return Self.rowHeight }
+        let probe = GroupCell.measuring
+        probe.show(reason: reason, title: "", explanation: Self.explanation(reason))
+        let width = (outline.tableColumns.first?.width ?? Self.width) - 24
+        return probe.height(forWidth: max(width, 120))
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let node = item as? Node else { return nil }
+        switch node.kind {
+        case .group(let reason, let count):
+            let identifier = NSUserInterfaceItemIdentifier("group")
+            let cell = outlineView.makeView(withIdentifier: identifier, owner: nil) as? GroupCell ?? {
+                let cell = GroupCell()
+                cell.identifier = identifier
+                return cell
+            }()
+            cell.show(reason: reason, title: "\(Self.title(reason)) · \(formatted(count)) 个位置",
+                      explanation: Self.explanation(reason))
             return cell
-        }()
-        let path = paths[row]
-        cell.textField?.stringValue = (path as NSString).abbreviatingWithTildeInPath
-        cell.toolTip = path
-        return cell
+        case .place(let place):
+            let cell = PlaceCell.make(in: outlineView, kind: .place)
+            cell.show(path: place.path, title: (place.path as NSString).abbreviatingWithTildeInPath,
+                      count: place.count > 1 ? place.count : nil)
+            return cell
+        case .detail(let place, let parent):
+            let cell = PlaceCell.make(in: outlineView, kind: .detail)
+            let title: String
+            if place.path == parent {
+                title = "此位置本身"
+            } else if parent == "/" {
+                title = String(place.path.dropFirst())
+            } else {
+                title = String(place.path.dropFirst(parent.count + 1))
+            }
+            cell.show(path: place.path, title: title, count: nil)
+            return cell
+        }
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        if let node = item as? Node, case .group = node.kind { return false }
+        return true
+    }
+}
+
+/// A group heading: a symbol, the bold name with its count, and one line of
+/// explanation under it.
+private final class GroupCell: NSTableCellView {
+    static let measuring = GroupCell()
+
+    private let icon = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let explanationLabel = NSTextField(wrappingLabelWithString: "")
+    private var widthConstraint: NSLayoutConstraint?
+
+    init() {
+        super.init(frame: .zero)
+        icon.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        explanationLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        explanationLabel.textColor = .secondaryLabelColor
+        explanationLabel.isSelectable = false
+        let heading = NSStackView(views: [icon, titleLabel])
+        heading.spacing = 4
+        let stack = NSStackView(views: [heading, explanationLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+        ])
+        textField = titleLabel
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func show(reason: AccessReason, title: String, explanation: String) {
+        let symbol: String
+        let tint: NSColor
+        switch reason {
+        case .needsFullDiskAccess: (symbol, tint) = ("key", .systemBlue)
+        case .filePermissions: (symbol, tint) = ("lock", .secondaryLabelColor)
+        case .unknown: (symbol, tint) = ("questionmark.circle", .secondaryLabelColor)
+        }
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.contentTintColor = tint
+        titleLabel.stringValue = title
+        explanationLabel.stringValue = explanation
+        setAccessibilityLabel("\(title)。\(explanation)")
+    }
+
+    override func layout() {
+        explanationLabel.preferredMaxLayoutWidth = max(bounds.width - 6, 0)
+        super.layout()
+    }
+
+    /// The row height that shows the whole explanation at this width.
+    func height(forWidth width: CGFloat) -> CGFloat {
+        explanationLabel.preferredMaxLayoutWidth = width - 6
+        let text = explanationLabel.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width - 6, height: 1000))
+        let lineHeight = ceil(NSFont.systemFont(ofSize: NSFont.smallSystemFontSize).boundingRectForFont.height)
+        return 6 + max(lineHeight, 15) + 2 + ceil(text?.height ?? lineHeight) + 8
     }
 }

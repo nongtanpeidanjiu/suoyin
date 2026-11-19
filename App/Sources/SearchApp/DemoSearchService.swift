@@ -12,7 +12,7 @@ final class DemoSearchService: SearchService {
 
     private let lock = NSLock()
     private var entries: [Entry] = []
-    private var current = IndexStatus(phase: .starting, indexedCount: 0, inaccessiblePaths: [], indexBytesOnDisk: 0)
+    private var current = IndexStatus(phase: .starting, indexedCount: 0, indexBytesOnDisk: 0)
 
     var onStatusChange: ((IndexStatus) -> Void)?
     var onIndexChange: (() -> Void)?
@@ -60,13 +60,40 @@ final class DemoSearchService: SearchService {
     }
 
     private func publish(_ loaded: [Entry], phase: IndexPhase) {
-        let snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, inaccessiblePaths: [], indexBytesOnDisk: 0)
+        var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)
+        if case .ready = phase { Self.addSampleAccessState(to: &snapshot) }
         lock.withLock {
             entries = loaded
             current = snapshot
         }
         onStatusChange?(snapshot)
         onIndexChange?()
+    }
+
+    /// Made-up but typical access results, so the settings list can be
+    /// looked at without the real core. Nothing here is read from disk.
+    private static func addSampleAccessState(to status: inout IndexStatus) {
+        let home = NSHomeDirectory()
+        var raw: [InaccessiblePlace] = []
+        func add(_ reason: AccessReason, _ paths: [String]) {
+            raw += paths.map { InaccessiblePlace(path: $0, count: 1, reason: reason) }
+        }
+        add(.needsFullDiskAccess, ["\(home)/Library/Mail", "\(home)/Library/Messages", "\(home)/Library/Safari"])
+        add(.filePermissions, (1...24).map { "/private/var/db/sample/item\($0)" }
+            + ["/Library/Application Support/com.apple.TCC", "/private/var/audit"])
+        add(.unknown, (1...12).map { "/System/Library/Sample/Protected\($0)" } + ["/private/var/folders/zz"])
+        raw.sort { $0.path < $1.path }
+        // Merged the way the core does it: siblings under their shared parent.
+        let merged = Dictionary(grouping: raw) { place -> String in
+            let parent = (place.path as NSString).deletingLastPathComponent
+            return raw.filter { ($0.path as NSString).deletingLastPathComponent == parent && $0.reason == place.reason }
+                .count > 1 ? parent : place.path
+        }
+        status.rawInaccessiblePlaces = raw
+        status.inaccessiblePlaces = merged.map { path, places in
+            InaccessiblePlace(path: path, count: places.count, reason: places[0].reason)
+        }.sorted { $0.path < $1.path }
+        status.pendingFullDiskAccessPaths = ["\(home)/Library/Containers", "\(home)/Library/Group Containers"]
     }
 
     func search(_ request: SearchRequest) -> SearchResponse {

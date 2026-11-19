@@ -72,7 +72,7 @@ extension NSAppearance {
 /// The floating search panel. At rest it is a single glass capsule; typing
 /// lets the same piece of glass grow downward to hold a filter row and the
 /// results. The design follows the current system search.
-final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSMenuDelegate,
+final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
                                    NSTableViewDataSource, NSTableViewDelegate {
     private enum Layout {
         static let width: CGFloat = 640
@@ -94,7 +94,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var pathChip: ChipButton!
     private let countLabel = NSTextField(labelWithString: "")
     private let scroll = NSScrollView()
-    private let table = NSTableView()
+    private let table = ResultTable()
     private let selectionPill = TintView()
     private let emptyLabel = NSTextField(labelWithString: "没有找到匹配的文件")
 
@@ -242,8 +242,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(openSelection)
-        table.menu = makeRowMenu()
-        table.menu?.delegate = self
+        table.rowMenu = makeRowMenu()
         table.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
         installCopyShortcut()
         installOutsideDismissal()
@@ -602,9 +601,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
+    /// Every action works on the selected row. A right click selects the row
+    /// under the pointer first, so its menu acts on that row, and the keys
+    /// used afterwards act on whatever is selected then.
     private var selectedHit: SearchHit? {
-        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
-        return hits.indices.contains(row) ? hits[row] : nil
+        hits.indices.contains(table.selectedRow) ? hits[table.selectedRow] : nil
     }
 
     @objc private func openSelection() {
@@ -617,14 +618,6 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         guard let hit = selectedHit else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: hit.path)])
         hide()
-    }
-
-    /// A right click acts on the row under the pointer, not the previously selected one.
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        let row = table.clickedRow
-        if hits.indices.contains(row), row != table.selectedRow {
-            table.selectRowIndexes([row], byExtendingSelection: false)
-        }
     }
 
     /// Lets a result row be dragged into other applications as a file.
@@ -710,4 +703,23 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
         return true
     }
+}
+
+/// The results table. A right click moves the ordinary selection, and with it
+/// the soft highlight, to the row under the pointer before the menu opens,
+/// instead of the system's blue outline around a separately tracked row.
+private final class ResultTable: NSTableView {
+    var rowMenu: NSMenu?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        guard row >= 0, let rowMenu else { return nil }
+        if row != selectedRow { selectRowIndexes([row], byExtendingSelection: false) }
+        return rowMenu
+    }
+
+    // The table draws its outline around the clicked row from these two;
+    // leaving them out keeps the menu free of it.
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {}
+    override func didCloseMenu(_ menu: NSMenu, with event: NSEvent?) {}
 }

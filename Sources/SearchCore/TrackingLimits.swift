@@ -111,9 +111,16 @@ struct BaseWriteBudget {
     }
 }
 
+struct FileUpdate: OptionSet {
+    let rawValue: UInt8
+    static let structural = Self(rawValue: 1 << 0)
+    static let renamed = Self(rawValue: 1 << 1)
+}
+
 struct DirectoryUpdate {
     var recursive: Bool?
-    var files: [String: Bool] = [:]
+    var maySkipAfterParent = false
+    var files: [String: FileUpdate] = [:]
     var metadata = false
     var pending: [Int: UInt64] = [:]
     var structural = false
@@ -122,10 +129,23 @@ struct DirectoryUpdate {
         pending[volume] = min(pending[volume] ?? .max, event)
     }
 
+    mutating func requestReconciliation(recursive: Bool, maySkipAfterParent: Bool) {
+        if recursive {
+            self.maySkipAfterParent = self.recursive == true
+                ? self.maySkipAfterParent && maySkipAfterParent : maySkipAfterParent
+        }
+        self.recursive = self.recursive == true || recursive
+        files.removeAll()
+    }
+
     mutating func merge(_ other: DirectoryUpdate) {
-        if let recursive = other.recursive { self.recursive = self.recursive == true || recursive }
-        if recursive == nil { files.merge(other.files) { $0 || $1 }; metadata = metadata || other.metadata }
-        else { files.removeAll() }
+        if let recursive = other.recursive {
+            requestReconciliation(recursive: recursive, maySkipAfterParent: other.maySkipAfterParent)
+        }
+        if recursive == nil {
+            files.merge(other.files) { $0.union($1) }
+            metadata = metadata || other.metadata
+        }
         structural = structural || other.structural
         for (volume, event) in other.pending { add(event: event, volume: volume) }
     }

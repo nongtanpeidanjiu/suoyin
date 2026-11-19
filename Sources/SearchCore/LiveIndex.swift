@@ -95,12 +95,29 @@ struct DirectoryLinks {
 struct LiveIndex {
     var base: SearchIndex
     private static let partitionCount = 16
-    private var overlays = [SearchIndex](repeating: SearchIndex(), count: partitionCount)
+    private static let overlayRebuildThreshold = 64
+
+    private struct OverlayPartition {
+        var full = SearchIndex()
+        var delta = SearchIndex()
+        var rowIDs: [String: UInt32] = [:]
+        var pendingGroups: [String: Set<String>] = [:]
+        var pendingCount = 0
+        var fullCount = 0
+        var deltaCount = 0
+    }
+
+    private var overlays = [OverlayPartition](repeating: OverlayPartition(), count: partitionCount)
     private var changedChildren: [String: Set<String>] = [:]
+    // Links between parents of overlay rows, including intermediate directories
+    // that have no row of their own in either the overlay or the base.
+    private var overlayBranches: [String: Set<String>] = [:]
+    private var partitionParents = [Set<String>](repeating: [], count: partitionCount)
+    private var modifiedPaths = [Set<String>](repeating: [], count: partitionCount)
     private var dirtyPartitions: Set<Int> = []
     private var baseEntryCount = 0
-    private var overlayEntryCounts = [Int](repeating: 0, count: partitionCount)
     private(set) var rowRevision: UInt64 = 0
+    private(set) var journalChanges = JournalChanges()
     var state: TrackingState
     private var directories: [String: UInt32] = [:]
     private let links: DirectoryLinks?
@@ -123,8 +140,13 @@ struct LiveIndex {
         links = linkChildren ? DirectoryLinks(base) : nil
         for path in state.changes.keys {
             let parent = parentPath(path)
+            if changedChildren[parent] == nil {
+                let shard = Self.partition(parent)
+                partitionParents[shard].insert(parent)
+                dirtyPartitions.insert(shard)
+                addOverlayParent(parent)
+            }
             changedChildren[parent, default: []].insert(path)
-            dirtyPartitions.insert(Self.partition(parent))
         }
         prepareDelta()
     }
@@ -169,6 +191,25 @@ struct LiveIndex {
         return Int(hash) & (partitionCount - 1)
     }
 
+    private mutating func addOverlayParent(_ path: String) {
+        var child = path
+        while child != "/" {
+            let parent = parentPath(child)
+            guard overlayBranches[parent, default: []].insert(child).inserted else { break }
+            child = parent
+        }
+    }
+
+    private mutating func removeOverlayParent(_ path: String) {
+        var child = path
+        while child != "/", changedChildren[child] == nil, overlayBranches[child] == nil {
+            let parent = parentPath(child)
+            overlayBranches[parent]?.remove(child)
+            if overlayBranches[parent]?.isEmpty == true { overlayBranches.removeValue(forKey: parent) }
+            child = parent
+        }
+    }
+
     private mutating func change(_ value: TrackedEntry?, at path: String) {
         let previous = state.changes[path]
         guard previous != value else { return }
@@ -179,38 +220,75 @@ struct LiveIndex {
         }
         rowRevision &+= 1
         let parent = parentPath(path)
+        let shard = Self.partition(parent)
         state.changes[path] = value
+        journalChanges.paths.insert(path)
         if value == nil {
             changedChildren[parent]?.remove(path)
-            if changedChildren[parent]?.isEmpty == true { changedChildren.removeValue(forKey: parent) }
+            if changedChildren[parent]?.isEmpty == true {
+                changedChildren.removeValue(forKey: parent)
+                partitionParents[shard].remove(parent)
+                removeOverlayParent(parent)
+            }
         } else {
+            if changedChildren[parent] == nil {
+                partitionParents[shard].insert(parent)
+                addOverlayParent(parent)
+            }
             changedChildren[parent, default: []].insert(path)
         }
-        dirtyPartitions.insert(Self.partition(parent))
+        modifiedPaths[shard].insert(path)
+        dirtyPartitions.insert(shard)
     }
 
     mutating func prepareDelta() {
-        guard !dirtyPartitions.isEmpty else { return }
-        var groups: [Int: [String]] = [:]
-        for parent in changedChildren.keys {
-            let shard = Self.partition(parent)
-            if dirtyPartitions.contains(shard) { groups[shard, default: []].append(parent) }
-        }
         for shard in dirtyPartitions {
-            var index = SearchIndex()
-            for parent in (groups[shard] ?? []).sorted() {
-                let id = index.append(parent, attribute: Kind.anchor)
-                for path in changedChildren[parent]!.sorted() {
-                    let item = state.changes[path]!
-                    index.append(leafName(path), parent: id, size: item.size,
-                                 modified: item.modified, attribute: item.attribute)
+            var partition = overlays[shard]
+            let modified = modifiedPaths[shard]
+            for path in modified {
+                if partition.pendingGroups[parentPath(path), default: []].insert(path).inserted {
+                    partition.pendingCount += 1
                 }
             }
-            index.prepare()
-            overlayEntryCounts[shard] = index.visibleEntryCount
-            overlays[shard] = index
+            if modified.isEmpty || partition.full.records.isEmpty || partition.pendingCount >= Self.overlayRebuildThreshold {
+                let (index, rows) = searchableOverlay(parents: partitionParents[shard].sorted(), groups: changedChildren, recordIDs: true)
+                partition = OverlayPartition(full: index, rowIDs: rows, fullCount: index.visibleEntryCount)
+            } else {
+                // The published view owns the old mask. Update a copy and
+                // keep its existing sort, type and name tables shared.
+                for path in modified {
+                    guard let row = partition.rowIDs[path], !partition.full.isSuppressed(Int(row)) else { continue }
+                    partition.full.setSuppressed(Int(row), true)
+                    if partition.full.visible(partition.full.attributes[Int(row)], true) { partition.fullCount -= 1 }
+                }
+                let groups = partition.pendingGroups
+                let (delta, _) = searchableOverlay(parents: groups.keys.sorted(), groups: groups, recordIDs: false)
+                partition.delta = delta
+                partition.deltaCount = delta.visibleEntryCount
+            }
+            overlays[shard] = partition
+            modifiedPaths[shard].removeAll(keepingCapacity: true)
         }
         dirtyPartitions.removeAll()
+    }
+
+    private func searchableOverlay(parents: [String], groups: [String: Set<String>], recordIDs: Bool)
+        -> (SearchIndex, [String: UInt32]) {
+        var index = SearchIndex()
+        var rows: [String: UInt32] = [:]
+        for parent in parents {
+            var anchor: UInt32?
+            for path in groups[parent]!.sorted() {
+                guard let item = state.changes[path] else { continue }
+                let id = anchor ?? index.append(parent, attribute: Kind.anchor)
+                anchor = id
+                let row = index.append(leafName(path), parent: id, size: item.size,
+                                       modified: item.modified, attribute: item.attribute)
+                if recordIDs { rows[path] = row }
+            }
+        }
+        index.prepare()
+        return (index, rows)
     }
 
     func archive() -> SearchIndex {
@@ -231,6 +309,10 @@ struct LiveIndex {
     func journalImage(at positions: [String: UInt64]) -> JournalImage {
         JournalImage(rows: state.changes, masks: base.suppressed, coverage: state.restricted,
                      positions: positions)
+    }
+
+    mutating func markJournalSaved() {
+        journalChanges = JournalChanges()
     }
 
     /// Rebuild row IDs without expanding every base row into a path string.
@@ -426,7 +508,7 @@ struct LiveIndex {
         }
     }
 
-    mutating func refreshFile(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
+    mutating func refreshFile(_ path: String, renamed: Bool = false, observation: (UInt8) -> EntryObservation) -> Bool {
         guard !isRestricted(path) else { return false }
         let parent = parentPath(path)
         let folder = entry(at: parent)
@@ -439,8 +521,25 @@ struct LiveIndex {
         case .unverified: return false
         }
         guard former?.directory != true, value?.directory != true else { return false }
+        if renamed, former == nil, value != nil, hasIndexedCaseVariant(of: path, in: parent) { return false }
         if value != former { set(value, path: path, original: baseID(at: path)) }
         return true
+    }
+
+    private mutating func hasIndexedCaseVariant(of path: String, in parent: String) -> Bool {
+        let leaf = leafName(path)
+        func matches(_ other: String) -> Bool {
+            other != leaf && other.compare(leaf, options: .caseInsensitive) == .orderedSame
+        }
+        if changedChildren[parent]?.contains(where: { matches(leafName($0)) }) == true { return true }
+        guard let links, let directory = directoryID(parent) else { return false }
+        var found = false
+        links.forEachChild(directory) { row in
+            if !found, base.attributes[Int(row)] & Kind.excluded == 0, !base.isSuppressed(Int(row)) {
+                found = matches(base.name(row))
+            }
+        }
+        return found
     }
 
     mutating func refreshDirectory(_ path: String, observation: (UInt8) -> EntryObservation) -> Bool {
@@ -476,6 +575,7 @@ struct LiveIndex {
     private mutating func suppressBase(_ id: Int, _ suppress: Bool, provider: String?) {
         guard base.isSuppressed(id) != suppress else { return }
         base.setSuppressed(id, suppress)
+        journalChanges.maskBytes.insert(Int(id) >> 3)
         if base.visible(base.attributes[id], true) {
             baseEntryCount += suppress ? -1 : 1
             if let provider { cloudEntryCounts[provider, default: 0] += suppress ? -1 : 1 }
@@ -503,8 +603,14 @@ struct LiveIndex {
                 }
             }
         }
-        let removed = state.changes.keys.filter { (includingRoot || $0 != path) && inside($0, path) }
-        for location in removed { change(nil, at: location) }
+        if includingRoot { change(nil, at: path) }
+        var parents = [path]
+        while let parent = parents.popLast() {
+            if let branches = overlayBranches[parent] { parents.append(contentsOf: branches) }
+            for location in changedChildren[parent] ?? [] where location != path {
+                change(nil, at: location)
+            }
+        }
     }
 
     mutating func clearCloudPending(at path: String) {
@@ -657,8 +763,9 @@ struct LiveIndex {
     }
 
     func readView() -> LiveSearchView {
-        LiveSearchView(base: base, overlays: state.changes.isEmpty ? [] : overlays,
-                       entryCount: baseEntryCount + overlayEntryCounts.reduce(0, +))
+        let views = state.changes.isEmpty ? [] : overlays.flatMap { [$0.full, $0.delta] }
+        let count = baseEntryCount + overlays.reduce(0) { $0 + $1.fullCount + $1.deltaCount }
+        return LiveSearchView(base: base, overlays: views, entryCount: count)
     }
 
     func memoryBreakdown() -> [String: Int] {
@@ -668,8 +775,9 @@ struct LiveIndex {
         result["overlayChildPathPayload"] = changedChildren.reduce(0) { sum, group in
             sum + group.key.utf8.count + group.value.reduce(0) { $0 + $1.utf8.count }
         }
-        result["overlaySearchTables"] = overlays.reduce(0) { sum, shard in
-            sum + shard.storageBreakdown().values.reduce(0, +)
+        result["overlaySearchTables"] = overlays.reduce(0) { sum, partition in
+            sum + partition.full.storageBreakdown().values.reduce(0, +) +
+                partition.delta.storageBreakdown().values.reduce(0, +)
         }
         return result
     }
@@ -697,7 +805,7 @@ struct LiveSearchView {
         var top = base.search(query, mode: mode, column: column, direction: direction,
                               showAll: showAll, kind: kind, limit: capacity)
         for (part, overlay) in overlays.enumerated() where !overlay.records.isEmpty {
-            let mask = UInt32(1 << 31) | (UInt32(part) << 27)
+            let mask = UInt32(1 << 31) | (UInt32(part) << 26)
             let changed = overlay.search(query, mode: mode, column: column, direction: direction,
                                          showAll: showAll, kind: kind, limit: capacity).map { item in
                 SearchRow(id: item.id | mask, name: item.name, path: item.path,
@@ -740,7 +848,14 @@ func compareAcross(_ lhs: SearchRow, _ rhs: SearchRow, column: SearchColumn) -> 
     let raw = bytes(Array(lhs.name.utf8), Array(rhs.name.utf8))
     if raw != 0 { return raw }
     let volume = compare(lhs.volumeID ?? "", rhs.volumeID ?? "")
-    return volume != 0 ? volume : compare(lhs.id, rhs.id)
+    if volume != 0 { return volume }
+    // Within a partition, row IDs follow the order of the original paths.
+    // Preserve that tie-break when a row moves between its two search views.
+    if lhs.id >> 27 == rhs.id >> 27 && (lhs.id ^ rhs.id) & (1 << 26) != 0 && lhs.id & (1 << 31) != 0 {
+        let parent = compare(parentPath(lhs.path), parentPath(rhs.path))
+        if parent != 0 { return parent }
+    }
+    return compare(lhs.id, rhs.id)
 }
 
 extension SearchIndex {

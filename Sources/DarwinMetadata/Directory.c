@@ -287,6 +287,25 @@ int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
     return list(path, device, device, false, true, callback, denied, context, counts);
 }
 
+bool dm_matches_disk_name(const char *path) {
+    struct attrlist attrs = {.bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = ATTR_CMN_NAME};
+    struct { uint32_t length; attrreference_t name; char storage[PATH_MAX]; } result;
+    int status;
+    do { status = getattrlist(path, &attrs, &result, sizeof(result), FSOPT_NOFOLLOW); }
+    while (status < 0 && errno == EINTR);
+    if (status < 0 || result.length < sizeof(result.length) + sizeof(result.name) ||
+        result.length > sizeof(result)) return false;
+    const char *ref = (const char *)&result + sizeof(result.length);
+    size_t available = result.length - sizeof(result.length);
+    int offset = result.name.attr_dataoffset;
+    size_t length = result.name.attr_length;
+    if (offset < (int)sizeof(result.name) || (size_t)offset > available ||
+        length == 0 || length > available - (size_t)offset) return false;
+    const char *expected = strrchr(path, '/');
+    expected = expected ? expected + 1 : path;
+    return strlen(expected) + 1 == length && memcmp(expected, ref + offset, length) == 0;
+}
+
 bool dm_volume_uuid(const char *path, char output[37]) {
     struct attrlist attributes = {
         .bitmapcount = ATTR_BIT_MAP_COUNT,

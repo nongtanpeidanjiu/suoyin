@@ -37,32 +37,47 @@ struct JournalFrame {
     }
 }
 
+struct JournalChanges {
+    var paths: Set<String> = []
+    var maskBytes: Set<Int> = []
+}
+
 struct JournalImage {
     let rows: [String: TrackedEntry]
     let masks: [UInt8]
     let coverage: Set<String>
     let positions: [String: UInt64]
 
-    func delta(after old: JournalImage) -> JournalFrame? {
+    func delta(after old: JournalImage, changes: JournalChanges? = nil) -> JournalFrame? {
         var edits: [JournalFrame.RowEdit] = []
-        for (path, row) in rows where old.rows[path] != row {
-            edits.append(.init(path: path, value: row))
-        }
-        for path in old.rows.keys where rows[path] == nil {
-            edits.append(.init(path: path, value: nil))
+        if let changes {
+            for path in changes.paths {
+                let row = rows[path]
+                if row != old.rows[path] { edits.append(.init(path: path, value: row)) }
+            }
+        } else {
+            for (path, row) in rows where old.rows[path] != row {
+                edits.append(.init(path: path, value: row))
+            }
+            for path in old.rows.keys where rows[path] == nil {
+                edits.append(.init(path: path, value: nil))
+            }
         }
         var bits: [(UInt32, Bool)] = []
-        if masks != old.masks {
-            for byte in 0..<max(masks.count, old.masks.count) {
-                let current = byte < masks.count ? masks[byte] : 0
-                let previous = byte < old.masks.count ? old.masks[byte] : 0
-                var changed = current ^ previous
-                while changed != 0 {
-                    let bit = changed.trailingZeroBitCount
-                    bits.append((UInt32(byte * 8 + bit), current & (1 << bit) != 0))
-                    changed &= changed - 1
-                }
+        func compareMaskByte(_ byte: Int) {
+            let current = byte < masks.count ? masks[byte] : 0
+            let previous = byte < old.masks.count ? old.masks[byte] : 0
+            var changed = current ^ previous
+            while changed != 0 {
+                let bit = changed.trailingZeroBitCount
+                bits.append((UInt32(byte * 8 + bit), current & (1 << bit) != 0))
+                changed &= changed - 1
             }
+        }
+        if let changes {
+            for byte in changes.maskBytes.sorted() { compareMaskByte(byte) }
+        } else if masks != old.masks {
+            for byte in 0..<max(masks.count, old.masks.count) { compareMaskByte(byte) }
         }
         let scopes = coverage.symmetricDifference(old.coverage)
         guard !edits.isEmpty || !bits.isEmpty || !scopes.isEmpty || positions != old.positions else {

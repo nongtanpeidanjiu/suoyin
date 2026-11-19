@@ -789,7 +789,8 @@ extension WalkScope {
 
     // Cloud observation must check unavailable ancestors before accessing a leaf.
     // Reconcile those paths using the guarded directory reader.
-    func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false) -> EntryObservation {
+    func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false,
+                      verifyName: Bool = false) -> EntryObservation {
         guard clouds.provider(containing: path) == nil else { return .unverified }
         onAccess?(path)
         var info = stat()
@@ -797,6 +798,8 @@ extension WalkScope {
             return errno == ENOENT ? .missing : .unverified
         }
         guard info.st_dev == primaryDevice || info.st_dev == dataDevice else { return .unverified }
+        // On case-insensitive volumes lstat can succeed at the old spelling.
+        if verifyName && !dm_matches_disk_name(path) { return .unverified }
         let type = info.st_mode & S_IFMT
         if verifyAccess, type == S_IFDIR {
             // An explicit directory event can report an ACL or mode change

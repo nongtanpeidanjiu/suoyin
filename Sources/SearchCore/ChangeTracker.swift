@@ -171,6 +171,7 @@ public final class ChangeTracker {
     private static let compactionBytes = 32 * 1024 * 1024
     private var compactionToken: UInt64 = 0
     private var duringCompaction: [String: Bool]?
+    private var structuralDuringCompaction = Set<String>()
     private var applyTrace: [ApplyInterval]?
     private var lastAllocatorRelief: UInt64 = 0
 
@@ -787,15 +788,18 @@ public final class ChangeTracker {
         let exclusions = activeExclusions
 
         func mark(_ path: String, event: VolumeEvent, volume: Int, recursive: Bool? = nil,
-                  file: String? = nil, metadata: Bool = false) {
+                  file: String? = nil, metadata: Bool = false, maySkipAfterParent: Bool = false) {
             var item = work.removeValue(forKey: path) ?? DirectoryUpdate()
             item.add(event: event.id, volume: volume)
             item.structural = item.structural || event.structural
             if let recursive {
-                item.recursive = item.recursive == true || recursive
-                item.files.removeAll()
+                item.requestReconciliation(recursive: recursive, maySkipAfterParent: maySkipAfterParent)
             } else if item.recursive == nil {
-                if let file { item.files[file] = item.files[file] == true || event.structural }
+                if let file {
+                    var flags: FileUpdate = event.structural ? .structural : []
+                    if event.renamed { flags.insert(.renamed) }
+                    item.files[file, default: []].formUnion(flags)
+                }
                 item.metadata = item.metadata || metadata
             }
             work[path] = item
@@ -839,7 +843,7 @@ public final class ChangeTracker {
                 } else if event.isDirectory || path == root {
                     if event.structural && path != root {
                         mark(parentPath(path), event: event, volume: volume, recursive: false)
-                        mark(path, event: event, volume: volume, recursive: true)
+                        mark(path, event: event, volume: volume, recursive: true, maySkipAfterParent: true)
                     } else {
                         mark(path, event: event, volume: volume, metadata: true)
                     }
@@ -913,13 +917,15 @@ public final class ChangeTracker {
         }
         for (volume, id) in high { deliveredHigh[volume] = max(deliveredHigh[volume] ?? 0, id) }
         let ready = directories.take(at: now, force: immediate)
-        var files = Dictionary(uniqueKeysWithValues: fileContents.take(at: now, force: immediate).map { ($0, false) })
+        var files = Dictionary(uniqueKeysWithValues: fileContents.take(at: now, force: immediate).map { ($0, FileUpdate()) })
         var work: [String: Bool] = [:]
         var metadata = Set<String>()
+        var structuralDirectories = Set<String>()
         for (path, item) in ready {
             work[path] = item.recursive
+            if item.maySkipAfterParent { structuralDirectories.insert(path) }
             if item.metadata { metadata.insert(path) }
-            files.merge(item.files) { $0 || $1 }
+            files.merge(item.files) { $0.union($1) }
         }
         let directoriesToVerify = metadata
         if (!work.isEmpty || !files.isEmpty || !metadata.isEmpty), var updated = current {
@@ -931,14 +937,17 @@ public final class ChangeTracker {
                 var work = work
                 var direct: UInt64 = 0
                 var directDirectories: UInt64 = 0
-                for (path, structural) in files {
+                for (path, flags) in files {
                     if deferredContainerPaths.contains(where: { inside(path, $0) }) { continue }
                     let parent = parentPath(path)
                     fileContents.observed(path, at: now)
                     if work[parent] != nil { continue }
-                    if updated.refreshFile(path, observation: { scope.observeEntry(path, inherited: $0) }) {
+                    let renamed = flags.contains(.renamed)
+                    if updated.refreshFile(path, renamed: renamed, observation: {
+                        scope.observeEntry(path, inherited: $0, verifyName: renamed)
+                    }) {
                         direct += 1
-                        if structural { metadata.insert(parent) }
+                        if flags.contains(.structural) { metadata.insert(parent) }
                     } else {
                         let target = observationAncestor(parent, in: &updated)
                         if work[target] == nil { work[target] = false }
@@ -955,11 +964,11 @@ public final class ChangeTracker {
                         if work[target] == nil { work[target] = false }
                     }
                 }
-                try reconcile(work, in: &updated)
+                try reconcile(work, in: &updated, structuralDirectories: structuralDirectories)
                 updated.prepareDelta()
                 acknowledgeReadyEvents()
                 publish(updated, changed: true, engineRowsChanged: updated.rowRevision != before)
-                recordDuringCompaction(work)
+                recordDuringCompaction(work, structuralDirectories: structuralDirectories)
                 if duringCompaction != nil {
                     for path in files.keys {
                         let parent = parentPath(path)
@@ -1024,12 +1033,14 @@ public final class ChangeTracker {
     }
 
     private func reconcile(_ initial: [String: Bool], in index: inout LiveIndex,
-                           verifyingAccess: Bool = false) throws {
+                           verifyingAccess: Bool = false, structuralDirectories: Set<String> = []) throws {
         let exclusions = activeExclusions
         var work = initial
         var visited: Set<String> = []
         var ordered = work.keys.sorted { $0.count == $1.count ? $0 < $1 : $0.count < $1.count }
         var queued = Set(ordered)
+        let structuralChildren = Dictionary(grouping: structuralDirectories, by: parentPath)
+        var coveredByParent: [String: Bool] = [:]
         var position = 0
         var observedDirectories: UInt64 = 0
         var recursive: UInt64 = 0
@@ -1039,6 +1050,12 @@ public final class ChangeTracker {
             position += 1
             guard inside(folder, root), !exclusions.contains(where: { inside(folder, $0) }),
                   visited.insert(folder).inserted, !index.isRestricted(folder, includingSelf: false) else { continue }
+            if let includingRoot = coveredByParent[folder] {
+                index.removeSubtree(folder, includingRoot: includingRoot)
+                index.state.clearDenials(in: folder)
+                if scope.clouds.provider(containing: folder) != nil { cloud?.discard(at: folder) }
+                continue
+            }
             let inherited = index.entry(at: folder)?.attribute ?? 0
             observedDirectories += 1
             let inCloud = scope.clouds.provider(containing: folder) != nil
@@ -1066,7 +1083,15 @@ public final class ChangeTracker {
                     if inherited & Kind.pending != 0 { index.clearCloudPending(at: folder); cloud?.discardOnly(folder) }
                 }
             }
-            if case let .readable(_, contents, _) = observed {
+            if case let .readable(_, contents, denied) = observed {
+                // The exact names in this listing settle a removed directory, an
+                // obsolete spelling, or a path now occupied by a non-directory.
+                for child in structuralChildren[folder] ?? [] {
+                    let name = leafName(child)
+                    if denied[name] == nil, contents[name]?.directory != true {
+                        coveredByParent[child] = contents[name] == nil
+                    }
+                }
                 enqueueCloudChildren(of: folder, contents: contents, in: &index)
             }
             if work[folder] == true, case let .readable(_, contents, _) = observed {
@@ -1272,6 +1297,7 @@ public final class ChangeTracker {
     private func rebuild(_ affected: Set<Int>, initial: Bool, reason: String) throws {
         compactionToken += 1
         duringCompaction = nil
+        structuralDuringCompaction.removeAll()
         lock.withLock {
             status.recovery = reason
             status.compacting = false
@@ -1494,6 +1520,7 @@ public final class ChangeTracker {
 
     private func didSave(_ image: JournalImage) {
         durableImage = image
+        current?.markJournalSaved()
         let retained = external == nil ? nil : current?.readView().entryCount
         lock.withLock {
             status.durableEvents = image.positions
@@ -1570,7 +1597,9 @@ public final class ChangeTracker {
             return
         }
         let image = current.journalImage(at: durablePositions(checkpoints()))
-        if let frame = image.delta(after: durableImage) { _ = try appendJournal(frame) }
+        if let frame = image.delta(after: durableImage, changes: current.journalChanges) {
+            _ = try appendJournal(frame)
+        }
         didSave(image)
         scheduleCompaction()
     }
@@ -1580,9 +1609,13 @@ public final class ChangeTracker {
         for volume in mounts?.searchable() ?? [] { try volume.tracker.save() }
     }
 
-    private func recordDuringCompaction(_ work: [String: Bool]) {
+    private func recordDuringCompaction(_ work: [String: Bool], structuralDirectories: Set<String> = []) {
         guard duringCompaction != nil else { return }
         for (path, recursive) in work {
+            if recursive {
+                if !structuralDirectories.contains(path) { structuralDuringCompaction.remove(path) }
+                else if duringCompaction?[path] != true { structuralDuringCompaction.insert(path) }
+            }
             if recursive || duringCompaction?[path] == nil {
                 duringCompaction?[path] = recursive
             }
@@ -1598,6 +1631,7 @@ public final class ChangeTracker {
         let token = compactionToken
         let started = DispatchTime.now().uptimeNanoseconds
         duringCompaction = [:]
+        structuralDuringCompaction.removeAll()
         compactionNeedsRetry = false
         lock.withLock { status.compacting = true }
         compactor.async { [weak self] in
@@ -1606,6 +1640,8 @@ public final class ChangeTracker {
             self.update.async {
                 guard !self.closed, self.compactionToken == token, let work = self.duringCompaction else { return }
                 self.duringCompaction = nil
+                let structuralDirectories = self.structuralDuringCompaction
+                self.structuralDuringCompaction.removeAll()
                 if self.compactionNeedsRetry || self.recoveryUnresolved || !self.lock.withLock({ self.invalidations.isEmpty }) {
                     self.lock.withLock { self.status.compacting = false }
                     // Schedule after this closure releases its candidate base.
@@ -1617,7 +1653,7 @@ public final class ChangeTracker {
                 }
                 do {
                     var replacement = LiveIndex(base: base, root: self.root)
-                    try self.reconcile(work, in: &replacement)
+                    try self.reconcile(work, in: &replacement, structuralDirectories: structuralDirectories)
                     replacement.prepareDelta()
                     guard self.reserveAutomaticWrite() else {
                         self.lock.withLock { self.status.compacting = false }

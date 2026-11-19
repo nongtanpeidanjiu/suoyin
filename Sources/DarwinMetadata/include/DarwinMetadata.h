@@ -32,6 +32,7 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
 int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
                   DMDeniedEntryCallback denied, void *context, DMCounts *counts);
 int dm_directory_stamp(const char *path, int32_t device, DMDirectoryStamp *stamp);
+bool dm_matches_disk_name(const char *path);
 int dm_media_kind(uint32_t service);
 bool dm_volume_uuid(const char *path, char output[37]);
 uint64_t dm_resident_bytes(void);

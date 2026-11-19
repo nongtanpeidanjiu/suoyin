@@ -110,6 +110,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var topEdge: CGFloat = 0
     private var lastDismissal = Date.distantPast
     private(set) var isVisible = false
+    /// Asked to open the settings window (Command-comma in the panel).
+    var onOpenSettings: (() -> Void)?
 
     init(service: SearchService) {
         self.service = service
@@ -122,6 +124,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         buildWindow()
         buildContent()
         prewarm()
+        NotificationCenter.default.addObserver(forName: Preferences.searchOptionsChanged, object: nil,
+                                               queue: .main) { [weak self] _ in self?.refresh() }
     }
 
     /// Puts the window on screen once, fully transparent, so the first real
@@ -501,7 +505,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         generation += 1
         let token = generation
         let text = field.stringValue
-        let request = SearchRequest(text: text, scope: searchesPath ? .path : .name)
+        let request = SearchRequest(text: text, scope: searchesPath ? .path : .name,
+                                    includeSystemFiles: Preferences.includeSystemFiles)
         let service = self.service
         queryQueue.async { [weak self] in
             let response = service.search(request)
@@ -539,6 +544,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         case .scanning(let indexed):
             let done = NumberFormatter.localizedString(from: NSNumber(value: indexed), number: .decimal)
             text = "正在建立索引，已收录 \(done) 个"
+        case .recovering: text += " · 正在更新索引"
         case .supplementing(let volume): text += " · 正在补充 \(volume)"
         case .degraded(let reason): text += " · \(reason)"
         case .ready: break
@@ -641,12 +647,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
-    /// Command-C copies the selected file's path unless text is selected in the field.
+    /// Command-C copies the selected file's path unless text is selected in
+    /// the field; Command-comma opens the settings.
     private func installCopyShortcut() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.isVisible, event.window === self.panel,
-                  event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-                  event.charactersIgnoringModifiers == "c",
+                  event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command else { return event }
+            if event.charactersIgnoringModifiers == "," {
+                self.hide()
+                self.onOpenSettings?()
+                return nil
+            }
+            guard event.charactersIgnoringModifiers == "c",
                   (self.field.currentEditor()?.selectedRange.length ?? 0) == 0,
                   self.selectedHit != nil else { return event }
             self.copyPath()

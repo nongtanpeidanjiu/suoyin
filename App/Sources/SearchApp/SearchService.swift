@@ -38,6 +38,9 @@ enum IndexPhase {
     case starting
     case scanning(indexed: Int)
     case ready
+    /// Checking the index against the disk, after a requested rebuild or
+    /// after missed file events. Searching keeps working meanwhile.
+    case recovering
     case supplementing(volumeName: String)
     case degraded(reason: String)
 }

@@ -8,13 +8,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
     private var panel: SearchPanelController!
     private var statusItem: NSStatusItem!
-    private var hotKey: HotKey?
+    private var hotKey: HotKey!
     private lazy var accessGuide = AccessGuideController { [weak self] in self?.service.recheckAccess() }
+    private lazy var settings = SettingsWindowController(
+        service: service, hotKey: hotKey,
+        onShortcutChange: { [weak self] in self?.updateToolTip() },
+        onShowAccessGuide: { [weak self] in self?.accessGuide.show() })
     private var spinner: Timer?
     private var angle: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installMainMenu()
         panel = SearchPanelController(service: service)
+        panel.onOpenSettings = { [weak self] in self?.openSettings() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
@@ -23,16 +29,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.setAccessibilityLabel("文件搜索")
-            button.toolTip = "文件搜索（⌥⇧空格）"
         }
 
-        hotKey = HotKey.defaultShortcut { [weak self] in self?.panel.toggle(anchor: nil) }
+        hotKey = HotKey { [weak self] in self?.panel.toggle(anchor: nil) }
+        // A saved shortcut that can no longer be registered falls back to the default.
+        if case .failure = hotKey.register(Shortcut.saved) { _ = hotKey.register(.standard) }
+        updateToolTip()
 
         service.onStatusChange = { [weak self] status in
             DispatchQueue.main.async {
                 self?.panel.updateFooter()
                 self?.reflect(status)
                 self?.noteReadiness(status)
+                self?.settings.update(status)
             }
         }
         service.onIndexChange = { [weak self] in
@@ -90,6 +99,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.toggle(anchor: anchor)
     }
 
+    /// Opening the application again (from Finder, Launchpad or the Dock
+    /// icon) shows the settings window, since there is no other window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { openSettings() }
+        return false
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         service.stop()
     }
@@ -116,21 +132,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(withTitle: "授予完整磁盘访问权限…", action: #selector(showAccessGuide), keyEquivalent: "").target = self
             menu.addItem(.separator())
         }
-        menu.addItem(withTitle: "设置…", action: nil, keyEquivalent: ",")
+        menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return menu
     }
 
-    private func statusLine() -> String {
-        let status = service.status
-        let count = NumberFormatter.localizedString(from: NSNumber(value: status.indexedCount), number: .decimal)
-        switch status.phase {
-        case .starting: return "正在准备索引"
-        case .scanning: return "正在建立索引，已收录 \(count) 个"
-        case .ready: return "索引已就绪，共 \(count) 个文件"
-        case .supplementing(let volume): return "正在补充 \(volume) 的文件"
-        case .degraded(let reason): return reason
-        }
+    private func statusLine() -> String { service.status.summary }
+
+    @objc func openSettings() {
+        panel.hide()
+        settings.show()
+    }
+
+    func settingsDidChangeDockIcon() { settings.reassert() }
+
+    private func updateToolTip() {
+        let shortcut = hotKey.shortcut.map { "（\($0.display)）" } ?? ""
+        statusItem.button?.toolTip = "文件搜索\(shortcut)"
+    }
+
+    /// Not shown while the application has no Dock icon, but it still
+    /// provides the standard key equivalents: editing in the search field,
+    /// closing the settings window, opening settings and quitting.
+    private func installMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于文件搜索", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "隐藏", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        let windowItem = NSMenuItem()
+        let window = NSMenu(title: "窗口")
+        window.addItem(withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        window.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = window
+        main.addItem(windowItem)
+        NSApp.mainMenu = main
+        NSApp.windowsMenu = window
     }
 
     @objc private func showAccessGuide() { accessGuide.show() }
@@ -141,7 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func reflect(_ status: IndexStatus) {
         switch status.phase {
-        case .starting, .scanning:
+        case .starting, .scanning, .recovering:
             guard spinner == nil else { return }
             if Motion.reduced {
                 statusItem.button?.image = Glyphs.menuBar(.indexing(angle: 0))
@@ -168,5 +227,6 @@ let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
 // `--regular` gives the preview a Dock icon so that testing tools can see it.
-application.setActivationPolicy(CommandLine.arguments.contains("--regular") ? .regular : .accessory)
+let showsDockIcon = Preferences.showDockIcon || CommandLine.arguments.contains("--regular")
+application.setActivationPolicy(showsDockIcon ? .regular : .accessory)
 application.run()

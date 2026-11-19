@@ -58,7 +58,8 @@ final class CoreSearchService: SearchService {
         switch status.phase {
         case .starting: phase = .starting
         case .scanning(let indexed): phase = .scanning(indexed: indexed)
-        case .ready, .recovering: phase = .ready
+        case .ready: phase = .ready
+        case .recovering: phase = .recovering
         case .supplementing(let name): phase = .supplementing(volumeName: name)
         case .failed(let reason): phase = .degraded(reason: reason)
         }

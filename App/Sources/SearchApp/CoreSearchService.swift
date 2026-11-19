@@ -39,6 +39,7 @@ final class CoreSearchService: SearchService {
                                 column: column,
                                 direction: request.order == .ascending ? .ascending : .descending,
                                 showAll: request.includeSystemFiles,
+                                kind: Self.convert(request.kind),
                                 offset: request.offset, limit: request.limit)
         let result = engine.search(query)
         let hits = result.hits.map {
@@ -60,14 +61,28 @@ final class CoreSearchService: SearchService {
         case .scanning(let indexed): phase = .scanning(indexed: indexed)
         case .ready: phase = .ready
         case .recovering: phase = .recovering
-        case .supplementing(let name): phase = .supplementing(volumeName: name)
+        case .supplementing(let name, let indexed): phase = .supplementing(name: name, indexed: indexed)
         case .failed(let reason): phase = .degraded(reason: reason)
         }
         return IndexStatus(phase: phase, indexedCount: status.indexedCount,
                            rawInaccessiblePlaces: status.rawInaccessibleLocations.map(convert),
                            inaccessiblePlaces: status.inaccessibleLocations.map(convert),
                            pendingFullDiskAccessPaths: status.pendingFullDiskAccessPaths,
+                           inaccessibleVerified: status.inaccessibleLocationsVerified,
                            indexBytesOnDisk: status.indexBytesOnDisk)
+    }
+
+    private static func convert(_ kind: SearchKind) -> EngineKind {
+        switch kind {
+        case .any: return .any
+        case .folder: return .folder
+        case .document: return .document
+        case .image: return .image
+        case .audio: return .audio
+        case .video: return .video
+        case .archive: return .archive
+        case .application: return .application
+        }
     }
 
     private static func convert(_ location: InaccessibleLocation) -> InaccessiblePlace {

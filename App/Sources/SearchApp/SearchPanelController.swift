@@ -41,30 +41,47 @@ private final class TintView: NSView {
 }
 
 /// Capsule filter button, in the manner of the system search's filter row.
+/// With `opensMenu` it carries a small chevron after its title, for a chip
+/// that opens a list of choices rather than switching on its own.
 private final class ChipButton: NSButton {
+    static let font = NSFont.systemFont(ofSize: 12, weight: .medium)
     var isOn = false { didSet { needsDisplay = true; refreshTitle() } }
+    private var opensMenu = false
     override var wantsUpdateLayer: Bool { true }
 
-    convenience init(title: String, target: AnyObject, action: Selector) {
+    convenience init(title: String, target: AnyObject, action: Selector, opensMenu: Bool = false) {
         self.init(frame: .zero)
         self.title = title
         self.target = target
         self.action = action
+        self.opensMenu = opensMenu
         isBordered = false
         wantsLayer = true
         layer?.cornerCurve = .continuous
         layer?.cornerRadius = 12
         refusesFirstResponder = true
+        if opensMenu {
+            imagePosition = .imageTrailing
+            imageHugsTitle = true
+        }
+        setLabel(title)
+    }
+
+    /// Changes the title and fits the capsule around it; the left edge stays.
+    func setLabel(_ text: String) {
+        title = text
         refreshTitle()
-        let width = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)]).width
-        frame.size = NSSize(width: ceil(width) + 22, height: 24)
+        let width = ceil((text as NSString).size(withAttributes: [.font: Self.font]).width)
+        frame.size = NSSize(width: width + (opensMenu ? 34 : 22), height: 24)
     }
 
     private func refreshTitle() {
-        attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: isOn ? NSColor.labelColor : NSColor.secondaryLabelColor,
-        ])
+        let color = isOn ? NSColor.labelColor : NSColor.secondaryLabelColor
+        attributedTitle = NSAttributedString(string: title, attributes: [.font: Self.font, .foregroundColor: color])
+        guard opensMenu else { return }
+        image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 8, weight: .bold))
+        contentTintColor = color
     }
 
     override func updateLayer() {
@@ -93,6 +110,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         static let visibleRows: CGFloat = 7.5
         static let listBottom: CGFloat = 10
         static let emptyRow: CGFloat = 44
+        static let sideInset: CGFloat = 16
+        /// Between the scope chips and the kind chip: two separate choices.
+        static let groupGap: CGFloat = 14
+        static let countGap: CGFloat = 12
+        static let countFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
     }
 
     private let service: SearchService
@@ -102,6 +124,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private let field = NSTextField()
     private var nameChip: ChipButton!
     private var pathChip: ChipButton!
+    private var kindChip: ChipButton!
+    private var kind: SearchKind = .any
     private let countLabel = NSTextField(labelWithString: "")
     private let scroll = NSScrollView()
     private let table = ResultTable()
@@ -240,18 +264,22 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         pathChip.frame.origin = NSPoint(x: nameChip.frame.maxX + 6, y: chipY)
         nameChip.setAccessibilityLabel("按名称搜索")
         pathChip.setAccessibilityLabel("按完整路径搜索")
-        for chip in [nameChip!, pathChip!] {
+        kindChip = ChipButton(title: "类型", target: self, action: #selector(showKindMenu), opensMenu: true)
+        kindChip.frame.origin = NSPoint(x: pathChip.frame.maxX + Layout.groupGap, y: chipY)
+        for chip in [nameChip!, pathChip!, kindChip!] {
             chip.isHidden = true
             content.addSubview(chip)
         }
 
-        countLabel.font = .systemFont(ofSize: 11.5)
+        countLabel.font = Layout.countFont
         countLabel.textColor = .tertiaryLabelColor
         countLabel.alignment = .right
-        countLabel.frame = NSRect(x: width - 20 - 300, y: chipY + 5, width: 300, height: 15)
-        countLabel.autoresizingMask = [.minXMargin]
+        countLabel.lineBreakMode = .byClipping
+        countLabel.cell?.usesSingleLineMode = true
+        countLabel.frame = NSRect(x: 0, y: chipY + 5, width: 0, height: 15)
         countLabel.isHidden = true
         content.addSubview(countLabel)
+        showKind()
 
         let column = NSTableColumn(identifier: .init("result"))
         column.resizingMask = .autoresizingMask
@@ -341,6 +369,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
             NSScreen.screens.first { $0.frame.contains(NSPoint(x: rect.midX, y: rect.midY)) }
         } ?? NSScreen.main ?? NSScreen.screens[0]
         let area = screen.visibleFrame
+        // Every search starts from all kinds, so a kind picked last time can
+        // never hide what the user is looking for now.
+        if kind != .any { kind = .any; showKind() }
         // The field is the source of truth; results from an earlier session may be stale.
         terms = queryTerms(field.stringValue)
         if terms.isEmpty { hits = []; total = 0; table.reloadData() }
@@ -438,6 +469,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private func showExpandedParts() {
         nameChip.isHidden = !hasQuery
         pathChip.isHidden = !hasQuery
+        kindChip.isHidden = !hasQuery
         countLabel.isHidden = !hasQuery
         scroll.isHidden = !hasQuery || hits.isEmpty
         emptyLabel.isHidden = !hasQuery || !hits.isEmpty
@@ -541,12 +573,59 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         runQuery()
     }
 
+    // MARK: Kind filter
+
+    /// The kinds open as a menu under the chip: eight capsules do not fit
+    /// the row, and a menu shows every choice with its key in one place.
+    @objc private func showKindMenu() {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (index, choice) in SearchKind.allCases.enumerated() {
+            let item = NSMenuItem(title: choice.title, action: #selector(chooseKind(_:)), keyEquivalent: "\(index + 1)")
+            item.keyEquivalentModifierMask = .command
+            item.target = self
+            item.tag = index
+            item.state = choice == kind ? .on : .off
+            item.image = NSImage(systemSymbolName: choice.symbol, accessibilityDescription: nil)
+            menu.addItem(item)
+            if choice == .any { menu.addItem(.separator()) }
+        }
+        let below = kindChip.isFlipped ? kindChip.bounds.maxY + 4 : -4
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: below), in: kindChip)
+    }
+
+    @objc private func chooseKind(_ sender: NSMenuItem) {
+        let all = SearchKind.allCases
+        if all.indices.contains(sender.tag) { setKind(all[sender.tag]) }
+    }
+
+    private func setKind(_ choice: SearchKind) {
+        guard choice != kind else { return }
+        kind = choice
+        showKind()
+        runQuery()
+    }
+
+    /// The chip reads “类型” while every kind is shown, and names the kind,
+    /// with the darker fill of a chosen chip, once one is picked.
+    private func showKind() {
+        kindChip.setLabel(kind == .any ? "类型" : kind.title)
+        kindChip.isOn = kind != .any
+        kindChip.setAccessibilityLabel("按类型筛选，当前为\(kind.title)")
+        kindChip.setAccessibilityHelp("打开类型列表；也可以按 Command 加 1 至 8 切换")
+        let left = kindChip.frame.maxX + Layout.countGap
+        countLabel.frame = NSRect(x: left, y: countLabel.frame.minY,
+                                  width: Layout.width - Layout.sideInset - 4 - left, height: countLabel.frame.height)
+        lastStatusKey = nil
+        updateFooter()
+    }
+
     private func runQuery(keepingSelection: Bool = false) {
         generation += 1
         let token = generation
         let text = field.stringValue
         let request = SearchRequest(text: text, scope: searchesPath ? .path : .name,
-                                    includeSystemFiles: Preferences.includeSystemFiles)
+                                    includeSystemFiles: Preferences.includeSystemFiles, kind: kind)
         let service = self.service
         queryQueue.async { [weak self] in
             let response = service.search(request)
@@ -579,24 +658,49 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
+    /// Which sort of status the line shows, so that only a change of sort
+    /// fades; a count that ticks up every half second is set in place.
+    private var lastStatusKey: String?
+
     /// Refreshes the quiet status text at the right of the filter row.
     func updateFooter() {
         let shown = totalIsExact ? total : max(total - 1, 0)
-        let count = NumberFormatter.localizedString(from: NSNumber(value: shown), number: .decimal)
-        var text = totalIsExact ? "\(count) 个结果" : "超过 \(count) 个结果"
+        let count = formattedCount(shown)
+        var lead = totalIsExact ? "\(count) 个结果" : "超过 \(count) 个结果"
+        // A part that may be cut in the middle when the line is too long,
+        // and the rest that must stay whole.
+        var name = ""
+        var tail = ""
+        let key: String
         switch service.status.phase {
-        case .starting: text = "正在准备索引"
+        case .starting:
+            lead = "正在准备索引"
+            key = "starting"
         case .scanning(let indexed):
-            let done = NumberFormatter.localizedString(from: NSNumber(value: indexed), number: .decimal)
-            text = "正在建立索引，已收录 \(done) 个"
-        case .recovering: text += " · 正在更新索引"
-        case .supplementing(let volume): text += " · 正在补充 \(volume)"
-        case .degraded(let reason): text += " · \(reason)"
-        case .ready: break
+            lead = "正在建立索引，已收录 \(formattedCount(indexed)) 个"
+            key = "scanning"
+        case .recovering:
+            lead += " · 正在更新索引"
+            key = "recovering"
+        case .supplementing(let source, let indexed):
+            lead += " · 正在补充 "
+            name = source
+            tail = indexed > 0 ? "，已收录 \(formattedCount(indexed)) 个" : ""
+            key = "supplementing\u{0}" + source
+        case .degraded(let reason):
+            lead += " · "
+            name = reason
+            key = "degraded"
+        case .ready:
+            key = "ready"
         }
-        if service is DemoSearchService { text += " · 演示数据" }
+        if service is DemoSearchService { tail += " · 演示数据" }
+        let text = Self.fit(lead, name, tail, width: countLabel.frame.width)
         guard countLabel.stringValue != text else { return }
-        if countLabel.isHidden || Motion.reduced {
+        let fades = lastStatusKey != nil && lastStatusKey != key
+        lastStatusKey = key
+        if !fades || countLabel.isHidden || Motion.reduced {
+            countLabel.layer?.removeAnimation(forKey: "status")
             countLabel.stringValue = text
             return
         }
@@ -606,6 +710,27 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         countLabel.wantsLayer = true
         countLabel.layer?.add(fade, forKey: "status")
         countLabel.stringValue = text
+    }
+
+    /// Joins the three parts, cutting `name` in the middle until the line
+    /// fits `width`. The other parts carry the counts and are never cut.
+    private static func fit(_ lead: String, _ name: String, _ tail: String, width: CGFloat) -> String {
+        func measure(_ text: String) -> CGFloat {
+            ceil((text as NSString).size(withAttributes: [.font: Layout.countFont]).width)
+        }
+        let whole = lead + name + tail
+        guard !name.isEmpty, width > 0, measure(whole) > width else { return whole }
+        let characters = Array(name)
+        var low = 0, high = characters.count - 1, best = lead + "…" + tail
+        // The longest middle-cut name that still fits.
+        while low <= high {
+            let keep = (low + high) / 2
+            let head = String(characters.prefix((keep + 1) / 2))
+            let end = String(characters.suffix(keep / 2))
+            let candidate = lead + head + "…" + end + tail
+            if measure(candidate) <= width { best = candidate; low = keep + 1 } else { high = keep - 1 }
+        }
+        return best
     }
 
     // MARK: Table
@@ -727,6 +852,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 return nil
             case .quickLook:
                 return event
+            case .kind(let choice):
+                // Only while the filter row is showing, like the chips.
+                guard self.hasQuery else { return event }
+                self.setKind(choice)
+                return nil
             }
         }
     }

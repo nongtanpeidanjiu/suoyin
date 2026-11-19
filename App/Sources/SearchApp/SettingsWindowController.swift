@@ -283,9 +283,11 @@ private final class GeneralPane: SettingsPane {
                     // recorder, to be recorded or refused like any other.
                     self.shortcuts.suspendGlobal()
                     row.failure = nil
-                    self.show(row.messageRow, row.message, text: nil)
+                    // A combination the system keeps for itself never reaches the recorder.
+                    self.show(row.messageRow, row.message, text: Self.recordingHint, warning: false)
                 } else {
                     self.shortcuts.resumeGlobal()
+                    self.reload()
                 }
             }
             row.restore.tag = index
@@ -299,9 +301,8 @@ private final class GeneralPane: SettingsPane {
             (row.messageRow, row.message) = messageRow()
         }
         addRow(nil, note("""
-            点按框后按下新的组合键，按 Esc 取消。组合需包含 ⌃、⌥、⌘ 中的至少一个（F1 至 F12 可以单独使用）；\
-            两个快捷键不能相同，也不能与面板里的固定按键、文本编辑的标准按键或系统已启用的快捷键相同。\
-            其他应用占用的组合无法事先查出：全局快捷键要在登记失败时才知道，有的应用直接截取按键，这种冲突本软件发现不了。
+            点按框后按下新组合，按 Esc 取消。需含 ⌃、⌥、⌘ 之一（F1 至 F12 可单独使用），\
+            不能与另一个快捷键、面板按键或系统快捷键相同。其他应用占用的组合无法事先检测。
             """), gap: 4)
 
         dock.target = self
@@ -309,6 +310,8 @@ private final class GeneralPane: SettingsPane {
         addRow("程序坞：", dock, gap: 14)
         addRow(nil, note("关闭时只在菜单栏显示图标。"))
     }
+
+    private static let recordingHint = "按下后没有反应，说明这组键已被系统占用。"
 
     private static func explanation(_ role: ShortcutRole) -> String {
         switch role {
@@ -322,7 +325,9 @@ private final class GeneralPane: SettingsPane {
         for row in shortcutRows {
             row.recorder.shortcut = shortcuts.current(row.role)
             row.restore.isEnabled = row.recorder.shortcut != row.role.standard
-            if let failure = row.failure {
+            if row.recorder.isRecording {
+                show(row.messageRow, row.message, text: Self.recordingHint, warning: false)
+            } else if let failure = row.failure {
                 show(row.messageRow, row.message, text: failure)
             } else if let notice = shortcuts.notices[row.role] {
                 show(row.messageRow, row.message, text: notice, warning: false)
@@ -418,11 +423,12 @@ private final class ScopePane: SettingsPane {
     private let accessLabel = NSTextField(labelWithString: "")
     private let accessButton = NSButton(title: "前往授权…", target: nil, action: nil)
     private let placesCount = NSTextField(labelWithString: "")
+    private let placesSpinner = NSProgressIndicator()
     private let placesOutline = InaccessibleOutline()
     private var placesNote: NSTextField!
     private var pendingRow: NSGridRow!
     private let pendingList = PlacesList()
-    private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace])?
+    private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace], verified: Bool)?
     private var pendingPaths: [String] = []
 
     init(service: SearchService, onShowAccessGuide: @escaping () -> Void) {
@@ -448,7 +454,14 @@ private final class ScopePane: SettingsPane {
         addRow(nil, note("未授权时，邮件、信息等受系统保护的位置搜不到。"))
 
         placesNote = note("搜索范围是整台电脑。上面列出的位置读不到，其中的文件不会出现在搜索结果中。点按三角形可以查看每一项包含的具体位置。")
-        let places = NSStackView(views: [placesCount, placesOutline, placesNote])
+        placesSpinner.style = .spinning
+        placesSpinner.controlSize = .small
+        placesSpinner.isDisplayedWhenStopped = false
+        placesSpinner.setAccessibilityLabel("正在核对")
+        let heading = NSStackView(views: [placesCount, placesSpinner])
+        heading.spacing = 6
+        heading.alignment = .centerY
+        let places = NSStackView(views: [heading, placesOutline, placesNote])
         places.orientation = .vertical
         places.alignment = .leading
         places.spacing = 6
@@ -487,13 +500,26 @@ private final class ScopePane: SettingsPane {
             pendingList.paths = pendingPaths
             showPending()
         }
-        guard shown?.raw != status.rawInaccessiblePlaces || shown?.merged != status.inaccessiblePlaces else { return }
-        let wasEmpty = shown.map { $0.raw.isEmpty && $0.merged.isEmpty } ?? true
-        shown = (status.rawInaccessiblePlaces, status.inaccessiblePlaces)
+        guard shown?.raw != status.rawInaccessiblePlaces || shown?.merged != status.inaccessiblePlaces
+                || shown?.verified != status.inaccessibleVerified else { return }
+        let wasEmpty = shown.map { $0.verified && $0.raw.isEmpty && $0.merged.isEmpty } ?? true
+        shown = (status.rawInaccessiblePlaces, status.inaccessiblePlaces, status.inaccessibleVerified)
+        // While the core is still checking, its lists are empty or about to
+        // change: show no number at all, and an empty box with a word on
+        // when the list will appear, rather than a count that then jumps.
+        let checking = !status.inaccessibleVerified
         let total = status.inaccessibleCount
-        placesCount.stringValue = total == 0 ? "没有无法访问的位置" : "共 \(formatted(total)) 个位置读不到"
-        placesOutline.show(raw: status.rawInaccessiblePlaces, merged: status.inaccessiblePlaces)
-        let isEmpty = status.rawInaccessiblePlaces.isEmpty && status.inaccessiblePlaces.isEmpty
+        if checking {
+            placesCount.stringValue = "正在核对…"
+            placesSpinner.startAnimation(nil)
+        } else {
+            placesCount.stringValue = total == 0 ? "没有无法访问的位置" : "共 \(formatted(total)) 个位置读不到"
+            placesSpinner.stopAnimation(nil)
+        }
+        placesOutline.show(raw: checking ? [] : status.rawInaccessiblePlaces,
+                           merged: checking ? [] : status.inaccessiblePlaces)
+        placesOutline.placeholder = checking ? "核对完成后显示" : nil
+        let isEmpty = !checking && status.rawInaccessiblePlaces.isEmpty && status.inaccessiblePlaces.isEmpty
         placesOutline.isHidden = isEmpty
         placesNote.isHidden = isEmpty
         if isEmpty != wasEmpty { onSizeChange?() }
@@ -530,7 +556,7 @@ private final class IndexPane: SettingsPane {
     init(service: SearchService) {
         self.service = service
         super.init(identifier: "index", title: "索引", symbol: "internaldrive")
-        for field in [count, size] { field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
+        for field in [state, count, size] { field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
         addRow("状态：", state)
         addRow("已收录文件：", count)
         addRow("占用空间：", size)
@@ -694,6 +720,15 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
 
     private let outline = NSOutlineView()
     private var groups: [Node] = []
+    private let placeholderLabel = NSTextField(labelWithString: "")
+    /// A quiet line in the middle of the empty box, or nil for none.
+    var placeholder: String? {
+        didSet {
+            placeholderLabel.stringValue = placeholder ?? ""
+            placeholderLabel.isHidden = placeholder == nil
+            tile()
+        }
+    }
     /// The width a group heading's cell actually got, reported back by the
     /// cell once laid out. Until then it is estimated from the list width.
     private var groupCellWidth: CGFloat?
@@ -717,6 +752,11 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         hasVerticalScroller = true
         autohidesScrollers = true
         translatesAutoresizingMaskIntoConstraints = false
+        placeholderLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        placeholderLabel.textColor = .tertiaryLabelColor
+        placeholderLabel.isHidden = true
+        placeholderLabel.alignment = .center
+        addSubview(placeholderLabel)
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: Self.width),
             heightAnchor.constraint(equalToConstant: 260),
@@ -729,6 +769,10 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     /// paths are cut in the middle and the explanations wrap inside it.
     override func tile() {
         super.tile()
+        // The clip view is placed on top while tiling; keep the line above it.
+        if subviews.last !== placeholderLabel { addSubview(placeholderLabel, positioned: .above, relativeTo: nil) }
+        let line = ceil(placeholderLabel.intrinsicContentSize.height)
+        placeholderLabel.frame = NSRect(x: 0, y: ((bounds.height - line) / 2).rounded(), width: bounds.width, height: line)
         let before = outline.tableColumns.first?.width
         outline.sizeLastColumnToFit()
         if outline.tableColumns.first?.width != before {

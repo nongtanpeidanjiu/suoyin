@@ -8,6 +8,7 @@ final class DemoSearchService: SearchService {
         let hit: SearchHit
         let foldedName: String
         let foldedPath: String
+        let kind: SearchKind?
     }
 
     private let lock = NSLock()
@@ -51,23 +52,63 @@ final class DemoSearchService: SearchService {
                 nextID += 1
                 loaded.append(Entry(hit: hit,
                                     foldedName: hit.name.precomposedStringWithCanonicalMapping.lowercased(),
-                                    foldedPath: hit.path.precomposedStringWithCanonicalMapping.lowercased()))
+                                    foldedPath: hit.path.precomposedStringWithCanonicalMapping.lowercased(),
+                                    kind: Self.kind(name: hit.name, isDirectory: hit.isDirectory)))
                 if loaded.count % 500 == 0 { publish(loaded, phase: .scanning(indexed: loaded.count)) }
             }
         }
         loaded.sort { $0.foldedName == $1.foldedName ? $0.hit.path < $1.hit.path : $0.foldedName < $1.foldedName }
+        publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: 0))
+        // A made-up attached volume being added, so the progress line and the
+        // "checking" state of the access list can be looked at: the count
+        // grows every half second, as the core reports it, then settles.
+        for step in 1...24 {
+            Thread.sleep(forTimeInterval: 0.5)
+            publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: step * 48_271), contentChanged: false)
+        }
         publish(loaded, phase: .ready)
     }
 
-    private func publish(_ loaded: [Entry], phase: IndexPhase) {
+    private static let sampleVolume = "演示外接盘"
+
+    private func publish(_ loaded: [Entry], phase: IndexPhase, contentChanged: Bool = true) {
         var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)
-        if case .ready = phase { Self.addSampleAccessState(to: &snapshot) }
+        if case .ready = phase { Self.addSampleAccessState(to: &snapshot) } else { snapshot.inaccessibleVerified = false }
         lock.withLock {
             entries = loaded
             current = snapshot
         }
         onStatusChange?(snapshot)
-        onIndexChange?()
+        if contentChanged { onIndexChange?() }
+    }
+
+    /// The same kinds the core recognises, by the directory flag and the last
+    /// extension (docs/里程碑4-门面验收.md). Nil for other files.
+    private static func kind(name: String, isDirectory: Bool) -> SearchKind? {
+        let dot = name.dropFirst().lastIndex(of: ".")
+        let ext = dot.map { name[name.index(after: $0)...].lowercased() } ?? ""
+        if isDirectory { return ext == "app" ? .application : .folder }
+        return extensions.first { $0.value.contains(ext) }?.key
+    }
+
+    private static let extensions: [SearchKind: Set<String>] = [
+        .document: ["csv", "doc", "docm", "docx", "dps", "epub", "et", "key", "md", "numbers", "odp", "ods", "odt",
+                    "pages", "pdf", "ppt", "pptm", "pptx", "rtf", "tsv", "txt", "wps", "xls", "xlsm", "xlsx"],
+        .image: ["3fr", "arw", "avif", "bmp", "cr2", "cr3", "dng", "gif", "heic", "heif", "icns", "ico", "j2k", "jp2",
+                 "jpeg", "jpg", "nef", "nrw", "orf", "pef", "png", "psd", "raf", "raw", "rw2", "srf", "svg", "tif",
+                 "tiff", "webp"],
+        .audio: ["aac", "aif", "aiff", "alac", "flac", "m4a", "mid", "midi", "mp3", "ogg", "opus", "wav", "wma"],
+        .video: ["3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "webm", "wmv"],
+        .archive: ["7z", "bz2", "dmg", "gz", "iso", "rar", "tar", "tbz", "tbz2", "tgz", "txz", "xar", "xz", "zip", "zst"],
+    ]
+
+    private static func matches(_ entry: Entry, _ kind: SearchKind) -> Bool {
+        switch kind {
+        case .any: return true
+        // An application is also a folder, as in the core.
+        case .folder: return entry.hit.isDirectory
+        default: return entry.kind == kind
+        }
     }
 
     /// Made-up but typical access results, so the settings list can be
@@ -104,7 +145,7 @@ final class DemoSearchService: SearchService {
         var total = 0
         for entry in all {
             let haystack = request.scope == .name ? entry.foldedName : entry.foldedPath
-            guard terms.allSatisfy({ haystack.contains($0) }) else { continue }
+            guard Self.matches(entry, request.kind), terms.allSatisfy({ haystack.contains($0) }) else { continue }
             if total >= request.offset && hits.count < request.limit { hits.append(entry.hit) }
             total += 1
         }

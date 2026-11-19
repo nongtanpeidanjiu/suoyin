@@ -31,7 +31,7 @@ extension IndexStatus {
         case .scanning: return "正在建立索引，已收录 \(count) 个"
         case .ready: return "索引已就绪，共 \(count) 个文件"
         case .recovering: return "正在更新索引，共 \(count) 个文件"
-        case .supplementing(let volume): return "正在补充 \(volume) 的文件"
+        case .supplementing(let name, let indexed): return IndexPhase.supplementingLine(name, indexed)
         case .degraded(let reason): return reason
         }
     }
@@ -42,4 +42,17 @@ extension IndexStatus {
         default: return false
         }
     }
+}
+
+extension IndexPhase {
+    /// "正在补充 <名称>，已收录 <数量> 个", written like the first build's
+    /// "正在建立索引，已收录 <数量> 个"; without the count while it is 0.
+    static func supplementingLine(_ name: String, _ indexed: Int) -> String {
+        indexed > 0 ? "正在补充 \(name)，已收录 \(formattedCount(indexed)) 个" : "正在补充 \(name)"
+    }
+}
+
+/// A count with thousands separators, as everywhere in the interface.
+func formattedCount(_ number: Int) -> String {
+    NumberFormatter.localizedString(from: NSNumber(value: number), number: .decimal)
 }

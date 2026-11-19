@@ -7,12 +7,46 @@ enum SearchScope { case name, path }
 enum SortColumn { case name, location, size, modified }
 enum SortOrder { case ascending, descending }
 
+/// What kind of item to look for. The core decides by the directory flag and
+/// the file name extension; see docs/里程碑4-门面验收.md.
+enum SearchKind: CaseIterable {
+    case any, folder, document, image, audio, video, archive, application
+
+    /// The name in the filter menu and, except for `any`, on the filter chip.
+    var title: String {
+        switch self {
+        case .any: return "不限"
+        case .folder: return "文件夹"
+        case .document: return "文稿"
+        case .image: return "图片"
+        case .audio: return "音频"
+        case .video: return "视频"
+        case .archive: return "压缩包"
+        case .application: return "应用程序"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .any: return "square.grid.2x2"
+        case .folder: return "folder"
+        case .document: return "doc.text"
+        case .image: return "photo"
+        case .audio: return "music.note"
+        case .video: return "film"
+        case .archive: return "archivebox"
+        case .application: return "app"
+        }
+    }
+}
+
 struct SearchRequest {
     var text: String
     var scope: SearchScope = .name
     var sort: SortColumn = .name
     var order: SortOrder = .ascending
     var includeSystemFiles = false
+    var kind: SearchKind = .any
     var offset = 0
     var limit = 200
 }
@@ -41,7 +75,9 @@ enum IndexPhase {
     /// Checking the index against the disk, after a requested rebuild or
     /// after missed file events. Searching keeps working meanwhile.
     case recovering
-    case supplementing(volumeName: String)
+    /// Adding an attached volume or a cloud provider; `indexed` counts what
+    /// that source has published so far.
+    case supplementing(name: String, indexed: Int)
     case degraded(reason: String)
 }
 
@@ -72,6 +108,9 @@ struct IndexStatus {
     /// Other applications' data folders left unread until full disk access is
     /// granted, so that indexing never raises the system's access prompt.
     var pendingFullDiskAccessPaths: [String] = []
+    /// False while the core is still checking which locations are unreadable;
+    /// the lists are then empty or about to change and must not be counted.
+    var inaccessibleVerified = true
     var indexBytesOnDisk: Int64
 
     var inaccessibleCount: Int { rawInaccessiblePlaces.count }

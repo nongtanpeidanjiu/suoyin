@@ -15,6 +15,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service: service, shortcuts: shortcuts,
         onShowAccessGuide: { [weak self] in self?.accessGuide.show() })
     private var spinner: Timer?
+    /// The status line of the menu while it is open, kept current as the
+    /// supplementing count rises.
+    private weak var statusMenuItem: NSMenuItem?
     private var angle: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -43,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.reflect(status)
                 self?.noteReadiness(status)
                 self?.settings.update(status)
+                self?.showStatusLine(status)
             }
         }
         service.onIndexChange = { [weak self] in
@@ -135,9 +139,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "打开搜索", action: #selector(openSearch), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        let status = NSMenuItem(title: statusLine(), action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        statusMenuItem = status
+        showStatusLine(service.status)
         menu.addItem(.separator())
         if !DiskAccess.isGranted {
             menu.addItem(withTitle: "授予完整磁盘访问权限…", action: #selector(showAccessGuide), keyEquivalent: "").target = self
@@ -148,7 +154,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    private func statusLine() -> String { service.status.summary }
+    /// Digits of equal width, so a rising count does not make the line shift.
+    private func showStatusLine(_ status: IndexStatus) {
+        guard let item = statusMenuItem else { return }
+        item.attributedTitle = NSAttributedString(string: status.summary, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
+            .foregroundColor: NSColor.disabledControlTextColor,
+        ])
+    }
 
     @objc func openSettings() {
         panel.hide()
@@ -246,4 +259,9 @@ application.delegate = delegate
 // `--regular` gives the preview a Dock icon so that testing tools can see it.
 let showsDockIcon = Preferences.showDockIcon || CommandLine.arguments.contains("--regular")
 application.setActivationPolicy(showsDockIcon ? .regular : .accessory)
+// `--appearance dark` or `light` fixes this application's appearance, so both
+// can be checked in screenshots without changing the system setting.
+if let flag = CommandLine.arguments.firstIndex(of: "--appearance"), CommandLine.arguments.indices.contains(flag + 1) {
+    application.appearance = NSAppearance(named: CommandLine.arguments[flag + 1] == "dark" ? .darkAqua : .aqua)
+}
 application.run()

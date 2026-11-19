@@ -51,8 +51,9 @@ struct FixedKey {
     /// What the panel itself does with the key. Keys without an action are
     /// handled by the search field's text system or the main menu; the
     /// arrows, Return, Tab and Esc reach the panel through the field.
-    enum Action {
+    enum Action: Equatable {
         case reveal, copyPath, settings, quickLook
+        case kind(SearchKind)
     }
 
     let key: Key
@@ -110,6 +111,7 @@ enum PanelKeys {
         FixedKey(.character("c"), cmd, "复制完整路径", .copyPath),
         FixedKey(.character(","), cmd, "设置", .settings),
         FixedKey(.character("y"), cmd, "快速查看（固定的备用键）", .quickLook),
+    ] + kindKeys + [
         // Standard editing and window keys.
         FixedKey(.character("a"), cmd, "全选"),
         FixedKey(.character("x"), cmd, "剪切"),
@@ -148,6 +150,17 @@ enum PanelKeys {
         FixedKey(.character("y"), ctrl, "粘回删除的文字（文本编辑）"),
         FixedKey(.character("t"), ctrl, "交换字符（文本编辑）"),
     ]
+
+    /// Command-1 to Command-8 pick a kind, in the order of the filter menu.
+    /// Matched by the physical number key, so they work on every layout.
+    static let kindDigits = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4,
+                             kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8]
+
+    private static var kindKeys: [FixedKey] {
+        zip(kindDigits, SearchKind.allCases).map { code, kind in
+            FixedKey(.code(code), cmd, "类型筛选：\(kind.title)", .kind(kind))
+        }
+    }
 
     static func entry(matching shortcut: Shortcut,
                       character: (UInt32) -> String? = Shortcut.layoutCharacter) -> FixedKey? {

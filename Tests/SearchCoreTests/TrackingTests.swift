@@ -118,6 +118,59 @@ struct TrackingTests {
         #expect(filePaths(live, query: "report") == ["/fixture/a/report"])
     }
 
+    @Test func incrementalOverlayMatchesRebuiltPagesAndPreservesCapturedViews() throws {
+        let paths = (0..<32).map { "/fixture/group-\($0)" }
+        let partitions = Dictionary(grouping: paths) { path in
+            path.utf8.reduce(UInt32(2_166_136_261)) { ($0 ^ UInt32($1)) &* 16_777_619 } & 15
+        }
+        let pair = try #require(partitions.values.first { $0.count >= 2 }).prefix(2).sorted()
+        let moved = pair[0] + "/item.txt"
+        let retained = pair[1] + "/item.txt"
+        let removed = pair[0] + "/item-removed.txt"
+        let previous = TrackedEntry(size: 9, modified: 8, attribute: Kind.file)
+        var base = SearchIndex()
+        let anchor = base.append("/fixture", attribute: Kind.anchor)
+        for path in pair { base.append(leafName(path), parent: anchor, attribute: Kind.directory) }
+        base.tracking = TrackingState(root: "/fixture", changes: [moved: previous, retained: file, removed: file], restricted: [])
+        base.prepare()
+        var live = LiveIndex(base: base, root: "/fixture")
+        let captured = live.readView()
+
+        func comparePages(_ candidate: LiveIndex) {
+            let rebuilt = LiveIndex(base: candidate.archive(), root: "/fixture").readView()
+            let view = candidate.readView()
+            #expect(view.entryCount == rebuilt.entryCount)
+            for mode in [QueryMode.name, .path] {
+                for column in SearchColumn.allCases {
+                    for direction in SearchDirection.allCases {
+                        for offset in [0, 1, 7] {
+                            func page(_ source: LiveSearchView) -> [String] {
+                                source.search("item", mode: mode, column: column, direction: direction,
+                                              showAll: false, kind: .document, offset: offset, limit: 3)
+                                    .map { "\($0.path) \($0.size) \($0.modified)" }
+                            }
+                            #expect(page(view) == page(rebuilt))
+                        }
+                    }
+                }
+            }
+        }
+
+        #expect(live.refreshFile(moved) { _ in .entry(file) })
+        #expect(live.refreshFile(removed) { _ in .missing })
+        live.prepareDelta()
+        comparePages(live)
+        #expect(live.readView().entryCount == captured.entryCount - 1)
+        #expect(captured.search("item-removed", mode: .name, column: .name, direction: .ascending,
+                                showAll: true, offset: 0, limit: 1).first?.path == removed)
+
+        for i in 0..<135 {
+            #expect(live.refreshFile(pair[0] + "/item-\(i).txt") { _ in .entry(file) })
+        }
+        live.prepareDelta()
+        comparePages(live)
+    }
+
     @Test func cachedRowsFromUnverifiedScopeAreWithheldOnFirstQuery() {
         var cached = LiveIndex(base: fixture(), root: "/fixture")
         let reopened = cached.verifyStartupCoverage(at: ["/fixture/a", "/fixture/b"]) {

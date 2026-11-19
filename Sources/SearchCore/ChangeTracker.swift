@@ -100,7 +100,6 @@ public final class ChangeTracker {
     private var deferredContainerPaths: [String] = []
     private var activeExclusions: [String] { excluded + deferredContainerPaths }
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
-    private let mountedNameQueries = DispatchQueue(label: "index.mounted-name-query", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var cloud: CloudCompletion?
     private let mounts: ExternalVolumes?
@@ -352,6 +351,13 @@ public final class ChangeTracker {
     public func search(_ query: String, mode: QueryMode = .name, column: SearchColumn = .name,
                        direction: SearchDirection = .ascending, showAll: Bool = false,
                        kind: EngineKind = .any, offset: Int = 0, limit: Int = 50) -> [SearchRow] {
+        search(query, mode: mode, column: column, direction: direction, showAll: showAll,
+               kind: kind, offset: offset, limit: limit, parallelVolumes: true)
+    }
+
+    func search(_ query: String, mode: QueryMode, column: SearchColumn,
+                direction: SearchDirection, showAll: Bool, kind: EngineKind,
+                offset: Int, limit: Int, parallelVolumes: Bool) -> [SearchRow] {
         let captured = lock.withLock { view }
         let volumes = mounts?.searchable() ?? []
         if volumes.isEmpty {
@@ -363,36 +369,49 @@ public final class ChangeTracker {
         let attached = volumes.map { volume in
             (volume, volume.tracker.lock.withLock { volume.tracker.view })
         }
-        func searchAttached() -> [[SearchRow]] {
-            attached.map { volume, view in
-                let rows = view?.search(query, mode: mode, column: column, direction: direction,
-                                        showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? []
-                return rows.map {
-                    var row = SearchRow(id: $0.id, name: $0.name, path: $0.path,
-                                        size: $0.size, modified: $0.modified, volumeID: volume.key,
-                                        attribute: $0.attribute)
-                    row.volumeSlot = volume.slot
-                    return row
+        func searchAttached(_ volume: ExternalVolumes.Active, _ view: LiveSearchView?) -> [SearchRow] {
+            let rows = view?.search(query, mode: mode, column: column, direction: direction,
+                                    showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? []
+            return rows.map {
+                var row = SearchRow(id: $0.id, name: $0.name, path: $0.path,
+                                    size: $0.size, modified: $0.modified, volumeID: volume.key,
+                                    attribute: $0.attribute)
+                row.volumeSlot = volume.slot
+                return row
+            }
+        }
+        final class Page { var rows: [SearchRow] = [] }
+        let pages = attached.map { _ in Page() }
+        var started = [DispatchWorkItem?](repeating: nil, count: attached.count)
+        if parallelVolumes && !query.isEmpty {
+            // Launch the larger views first, while preserving the original
+            // group order for the final merge. Reserve source permits before
+            // dispatch so their own word tasks cannot take the next slot.
+            let schedule = attached.indices.sorted { (attached[$0].1?.entryCount ?? 0) > (attached[$1].1?.entryCount ?? 0) }
+            for i in schedule {
+                let (volume, view) = attached[i]
+                guard let view, view.entryCount > 0 else { continue }
+                guard dm_try_query_worker() else { break }
+                let page = pages[i]
+                let work = DispatchWorkItem(flags: .inheritQoS) {
+                    defer { dm_release_query_worker() }
+                    page.rows = searchAttached(volume, view)
+                }
+                started[i] = work
+            }
+            for i in schedule {
+                if let work = started[i] {
+                    DispatchQueue.global(qos: .userInitiated).async(execute: work)
                 }
             }
         }
-        // Search the immutable views in parallel with at most one attached
-        // search per engine. It uses no scanner workers or directory slots.
-        var attachedRows: [[SearchRow]] = []
-        let attachedWork: DispatchWorkItem?
-        if mode == .name, !query.isEmpty, captured != nil,
-           attached.contains(where: { ($0.1?.entryCount ?? 0) > 0 }) {
-            let work = DispatchWorkItem { attachedRows = searchAttached() }
-            mountedNameQueries.async(execute: work)
-            attachedWork = work
-        } else {
-            attachedWork = nil
-        }
         let local = captured?.search(query, mode: mode, column: column, direction: direction,
                                      showAll: showAll, kind: kind, offset: 0, limit: capacity) ?? []
-        if let attachedWork { attachedWork.wait() }
-        else { attachedRows = searchAttached() }
-        let groups = [local] + attachedRows
+        for i in attached.indices where started[i] == nil {
+            pages[i].rows = searchAttached(attached[i].0, attached[i].1)
+        }
+        for work in started { work?.wait() }
+        let groups = [local] + pages.map(\.rows)
         let present = [true] + volumes.map { mounts?.isCurrent($0) == true }
         var heads = [Int](repeating: 0, count: groups.count)
         var result: [SearchRow] = []

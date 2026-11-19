@@ -60,6 +60,7 @@ typedef struct {
     const uint8_t *file_kinds;
     const uint64_t *name_filter;
     size_t row_count, name_bytes, fold_bytes, fold_count;
+    bool has_leaf_root;
 } DMQueryView;
 
 bool dm_has_non_ascii(const uint8_t *name, size_t length);
@@ -68,13 +69,17 @@ enum {
     DM_KIND_AUDIO, DM_KIND_VIDEO, DM_KIND_ARCHIVE, DM_KIND_APPLICATION
 };
 uint8_t dm_file_kind(const char *name, uint8_t attribute);
-void dm_classify_kinds(const DMQueryView *view, uint8_t *kinds, size_t first);
+bool dm_classify_kinds(const DMQueryView *view, uint8_t *kinds, size_t first);
 size_t dm_name_filter_words(size_t bytes);
 void dm_prepare_name_filter(const uint8_t *names, size_t bytes, const DMRecord *rows, size_t row_count,
                             size_t previous_bytes, uint64_t *filter);
 void dm_name_order(const DMQueryView *view, uint32_t *order);
 void dm_extend_name_order(const DMQueryView *view, const uint32_t *prefix, size_t count, uint32_t *order);
 bool dm_column_order(const DMQueryView *view, uint32_t *order, int column);
+// Source and word tasks share three optional workers process-wide. A caller
+// always makes progress itself when no helper is available.
+bool dm_try_query_worker(void);
+void dm_release_query_worker(void);
 size_t dm_query(const DMQueryView *view, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *word_offsets, size_t words,
                 bool path, bool name_ordered, bool descending, bool show_all, uint8_t kind, size_t offset,

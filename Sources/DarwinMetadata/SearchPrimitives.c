@@ -1,9 +1,25 @@
 #include "DarwinMetadata.h"
 #include <arm_neon.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <string.h>
+
+static atomic_uint query_workers;
+
+bool dm_try_query_worker(void) {
+    unsigned used = atomic_load_explicit(&query_workers, memory_order_relaxed);
+    while (used < 3) {
+        if (atomic_compare_exchange_weak_explicit(&query_workers, &used, used + 1,
+                                                  memory_order_relaxed, memory_order_relaxed)) return true;
+    }
+    return false;
+}
+
+void dm_release_query_worker(void) {
+    atomic_fetch_sub_explicit(&query_workers, 1, memory_order_relaxed);
+}
 
 static void *scratch_map(size_t size) {
     void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -79,11 +95,14 @@ uint8_t dm_file_kind(const char *name, uint8_t attribute) {
     return DM_KIND_ANY;
 }
 
-void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds, size_t first) {
+bool dm_classify_kinds(const DMQueryView *v, uint8_t *kinds, size_t first) {
+    bool leaf_root = false;
     for (uint32_t id = (uint32_t)first; id < v->row_count; id++) {
         kinds[id] = (v->attributes[id] & KIND_MASK) == ANCHOR
             ? DM_KIND_ANY : dm_file_kind(original(v, id), v->attributes[id]);
+        if ((v->attributes[id] & 1) && v->rows[id].parent == UINT32_MAX) leaf_root = true;
     }
+    return leaf_root;
 }
 
 static bool matches_kind(const DMQueryView *v, uint32_t id, uint8_t kind) {
@@ -314,6 +333,7 @@ typedef struct {
     uint32_t *sparse;
     size_t count;
     bool failed;
+    bool track_ancestors, matched_ancestor;
 } NameHits;
 
 static void record_name_hit(const DMQueryView *v, NameHits *hits, uint32_t row) {
@@ -327,6 +347,7 @@ static void record_name_hit(const DMQueryView *v, NameHits *hits, uint32_t row) 
     if (hits->bitmap) hits->bitmap[row] = 1;
     else hits->sparse[hits->count] = row;
     hits->count++;
+    if (hits->track_ancestors && !(v->attributes[row] & 1)) hits->matched_ancestor = true;
 }
 
 static uint32_t row_at(const DMQueryView *v, size_t position, bool folded, size_t low, size_t high) {
@@ -524,47 +545,310 @@ static uint32_t advance(const char *pattern, uint32_t length, const uint32_t *fa
     return pattern[state] == byte ? state + 1 : state;
 }
 
-// A slash-bearing word can end in a basename only when its stem ends at
-// the parent slash and its remaining tail is a prefix of the basename.
-static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits,
-                       bool all, uint8_t file_kind, size_t *visible_matches, uint32_t *sole_match) {
-    const char *tail = strrchr(word, '/') + 1;
-    uint32_t stem = (uint32_t)(tail - word);
-    size_t tail_length = strlen(tail);
-    uint32_t *fallback = calloc(stem, sizeof(*fallback));
-    size_t states_bytes = v->row_count * sizeof(uint32_t);
-    uint32_t *states = scratch_map(states_bytes);
-    if (!fallback || !states) { free(fallback); scratch_release(states, states_bytes); return false; }
-    *visible_matches = 0;
+typedef struct {
+    const char *word;
+    uint32_t stem;
+    const uint32_t *fallback;
+    void *states;
+    bool narrow;
+} SlashPattern;
+
+static uint32_t slash_state(const SlashPattern *pattern, uint32_t row) {
+    return pattern->narrow ? ((uint8_t *)pattern->states)[row] : ((uint32_t *)pattern->states)[row];
+}
+
+static uint32_t advance_slash_state(const SlashPattern *pattern, const char *name, uint32_t state) {
+    const char *p = name;
+    for (; *p; p++)
+        state = advance(pattern->word, pattern->stem, pattern->fallback, state, (char)ascii_fold((uint8_t)*p));
+    if (p == name || p[-1] != '/') state = advance(pattern->word, pattern->stem, pattern->fallback, state, '/');
+    return state;
+}
+
+static uint32_t save_slash_state(const SlashPattern *pattern, uint32_t row, const char *name, uint32_t state) {
+    state = advance_slash_state(pattern, name, state);
+    if (pattern->narrow) ((uint8_t *)pattern->states)[row] = (uint8_t)state;
+    else ((uint32_t *)pattern->states)[row] = state;
+    return state;
+}
+
+static void slash_fallback(const char *word, uint32_t stem, uint32_t *fallback) {
+    fallback[0] = 0;
     for (uint32_t i = 1; i < stem; i++)
         fallback[i] = advance(word, stem, fallback, fallback[i - 1], word[i]);
+}
 
-    for (uint32_t i = 0; i < v->row_count; i++) {
+static bool slash_reaches_row(const DMQueryView *v, uint32_t row, const void *context) {
+    const SlashPattern *pattern = context;
+    uint32_t parent = v->rows[row].parent;
+    const char *name = key(v, row);
+    if (parent == UINT32_MAX && folded_contains(name, pattern->word)) return true;
+    uint32_t before = parent == UINT32_MAX ? 0 : slash_state(pattern, parent);
+    return save_slash_state(pattern, row, name, before) == pattern->stem;
+}
+
+// A non-root path match needs a directory whose path reaches the last slash
+// of the pattern. Reject absent branches by visiting only anchors and folders.
+static bool visit_directories(const DMQueryView *v, bool (*visit)(const DMQueryView *, uint32_t, const void *),
+                              const void *context) {
+    uint32_t i = 0;
+    uint8x16_t leaf_bit = vdupq_n_u8(1);
+    uint8x16_t zero = vdupq_n_u8(0);
+    for (; v->row_count - i >= 16; i += 16) {
+        uint8x16_t attrs = vld1q_u8(v->attributes + i);
+        uint64x2_t dirs = vreinterpretq_u64_u8(vceqq_u8(vandq_u8(attrs, leaf_bit), zero));
+        uint64_t first = vgetq_lane_u64(dirs, 0), last = vgetq_lane_u64(dirs, 1);
+        while (first) {
+            unsigned bit = (unsigned)__builtin_ctzll(first);
+            if (visit(v, i + bit / 8, context)) return true;
+            first &= ~(UINT64_C(255) << bit);
+        }
+        while (last) {
+            unsigned bit = (unsigned)__builtin_ctzll(last);
+            if (visit(v, i + 8 + bit / 8, context)) return true;
+            last &= ~(UINT64_C(255) << bit);
+        }
+    }
+    for (; i < v->row_count; i++)
+        if (!(v->attributes[i] & 1) && visit(v, i, context)) return true;
+    return false;
+}
+
+static bool slash_ancestor(const DMQueryView *, const SlashPattern *, const char *, size_t,
+                           uint32_t *, uint32_t, uint32_t *);
+
+typedef struct {
+    const DMQueryView *view;
+    const SlashPattern *pattern;
+    const char *tail;
+    size_t tail_length, begin, end, needed;
+    uint8_t *hits;
+    uint32_t *earlier;
+    uint8_t kind;
+    bool all, complete;
+    size_t count;
+    uint32_t sole;
+} SlashRange;
+
+static void *match_slash_range(void *context) {
+    SlashRange *range = context;
+    const DMQueryView *v = range->view;
+    const SlashPattern *pattern = range->pattern;
+    uint8_t *hits = range->hits;
+    uint32_t last_parent = UINT32_MAX, inherited = 0;
+    bool prior_match = false;
+    for (uint32_t i = (uint32_t)range->begin; i < range->end; i++) {
         uint32_t parent = v->rows[i].parent;
         bool root = parent == UINT32_MAX;
-        uint8_t kind = v->attributes[i] & KIND_MASK;
-        uint32_t inherited = root ? 0 : states[parent];
-        bool prior_match = !root && hits[parent];
-        const char *name = key(v, i);
-        hits[i] = (uint8_t)(prior_match || (root ? folded_contains(name, word) :
-                   inherited == stem && folded_prefix(name, tail, tail_length)));
-        if (hits[i]) {
-            if (visible(v->attributes[i], all) && matches_kind(v, i, file_kind) &&
+        if (parent != last_parent) {
+            last_parent = parent;
+            if (!root && parent < range->begin) {
+                uint32_t value;
+                if (!slash_ancestor(v, pattern, range->tail, range->tail_length, range->earlier, parent, &value))
+                    return NULL;
+                prior_match = value == UINT32_MAX;
+                inherited = prior_match ? 0 : value - 1;
+            } else {
+                prior_match = !root && hits[parent];
+                inherited = root || prior_match ? 0 : slash_state(pattern, parent);
+            }
+        }
+        bool match = prior_match;
+        if (!match && (root || inherited == pattern->stem)) {
+            const char *name = key(v, i);
+            match = root ? folded_contains(name, pattern->word) : folded_prefix(name, range->tail, range->tail_length);
+        }
+        hits[i] = (uint8_t)match;
+        if (match) {
+            if (range->count < range->needed && visible(v->attributes[i], range->all) && matches_kind(v, i, range->kind) &&
                 (!v->suppressed_rows || !(v->suppressed_rows[i >> 3] & (1U << (i & 7))))) {
-                if ((*visible_matches)++ == 0) *sole_match = i;
+                if (range->count++ == 0) range->sole = i;
             }
             continue;
         }
-        if (kind != ANCHOR && kind != DIRECTORY) continue;
-        uint32_t state = inherited;
-        const char *p = name;
-        for (; *p; p++) state = advance(word, stem, fallback, state, (char)ascii_fold((uint8_t)*p));
-        if (p == name || p[-1] != '/') state = advance(word, stem, fallback, state, '/');
-        states[i] = state;
+        if (!(v->attributes[i] & 1)) save_slash_state(pattern, i, key(v, i), inherited);
+    }
+    range->complete = true;
+    return NULL;
+}
+
+// The second range computes out-of-range ancestor states locally. The
+// workers only write rows and states in their own ranges.
+static bool split_slash_range(SlashRange *left) {
+    SlashRange right = *left;
+    right.begin = left->end / 2;
+    size_t bytes = right.begin * sizeof(uint32_t);
+    right.earlier = scratch_map(bytes);
+    if (!right.earlier) return false;
+    pthread_t worker;
+    bool started = pthread_create(&worker, NULL, match_slash_range, &right) == 0;
+    if (started) {
+        left->end = right.begin;
+        match_slash_range(left);
+        pthread_join(worker, NULL);
+    }
+    scratch_release(right.earlier, bytes);
+    if (!right.complete) return false;
+    if (!left->count) left->sole = right.sole;
+    size_t remaining = left->needed - left->count;
+    left->count += right.count < remaining ? right.count : remaining;
+    return true;
+}
+
+// A slash-bearing word can end in a basename only when its stem ends at
+// the parent slash and its remaining tail is a prefix of the basename.
+static bool slash_hits(const DMQueryView *v, const char *word, uint8_t *hits,
+                       bool all, uint8_t file_kind, size_t needed, bool allow_split,
+                       size_t *visible_matches, uint32_t *sole_match) {
+    const char *tail = strrchr(word, '/') + 1;
+    uint32_t stem = (uint32_t)(tail - word);
+    uint32_t *fallback = calloc(stem, sizeof(*fallback));
+    bool narrow = stem <= UINT8_MAX;
+    size_t states_bytes = v->row_count * (narrow ? sizeof(uint8_t) : sizeof(uint32_t));
+    void *states = scratch_map(states_bytes);
+    if (!fallback || !states) { free(fallback); scratch_release(states, states_bytes); return false; }
+    *visible_matches = 0;
+    slash_fallback(word, stem, fallback);
+    SlashPattern pattern = {.word = word, .stem = stem, .fallback = fallback, .states = states, .narrow = narrow};
+    if (v->has_leaf_root || visit_directories(v, slash_reaches_row, &pattern)) {
+        SlashRange range = {.view = v, .pattern = &pattern, .tail = tail, .tail_length = strlen(tail),
+                            .end = v->row_count, .hits = hits, .all = all, .kind = file_kind, .needed = needed};
+        bool split = false;
+        if (allow_split && v->row_count >= 1500000 && dm_try_query_worker()) {
+            split = split_slash_range(&range);
+            dm_release_query_worker();
+        }
+        if (!split) {
+            range.end = v->row_count;
+            range.count = 0;
+            match_slash_range(&range);
+        }
+        *visible_matches = range.count;
+        *sole_match = range.sole;
     }
     free(fallback);
     scratch_release(states, states_bytes);
     return true;
+}
+
+// Memo entries are zero before evaluation, a prefix length plus one, or
+// UINT32_MAX once the directory path contains the full word.
+static bool slash_ancestor(const DMQueryView *v, const SlashPattern *p, const char *tail, size_t tail_length,
+                           uint32_t *memo, uint32_t ancestor, uint32_t *result) {
+    uint32_t chain[64];
+    size_t depth = 0;
+    while (ancestor != UINT32_MAX && memo[ancestor] == 0) {
+        if (depth == sizeof(chain) / sizeof(chain[0])) return false;
+        chain[depth++] = ancestor;
+        ancestor = v->rows[ancestor].parent;
+    }
+    uint32_t inherited = ancestor == UINT32_MAX ? 1 : memo[ancestor];
+    while (depth > 0) {
+        uint32_t directory = chain[--depth];
+        bool root = v->rows[directory].parent == UINT32_MAX;
+        const char *name = key(v, directory);
+        if (inherited == UINT32_MAX ||
+            (root ? folded_contains(name, p->word)
+                  : inherited - 1 == p->stem && folded_prefix(name, tail, tail_length))) {
+            inherited = UINT32_MAX;
+        } else {
+            inherited = advance_slash_state(p, name, inherited - 1) + 1;
+        }
+        memo[directory] = inherited;
+    }
+    *result = inherited;
+    return true;
+}
+
+static bool slash_row_matches(const DMQueryView *v, const SlashPattern *p, const char *tail, size_t tail_length,
+                              uint32_t *memo, uint32_t row, bool *matches) {
+    uint32_t parent = v->rows[row].parent;
+    uint32_t inherited;
+    if (!slash_ancestor(v, p, tail, tail_length, memo, parent, &inherited)) return false;
+    if (inherited == UINT32_MAX) *matches = true;
+    else if (parent == UINT32_MAX) *matches = folded_contains(key(v, row), p->word);
+    else *matches = inherited - 1 == p->stem && folded_prefix(key(v, row), tail, tail_length);
+    return true;
+}
+
+static bool slash_matches_root(const DMQueryView *v, uint32_t row, const void *context) {
+    const SlashPattern *pattern = context;
+    return v->rows[row].parent == UINT32_MAX && folded_contains(key(v, row), pattern->word);
+}
+
+static size_t name_prefix_bound(const DMQueryView *v, const uint32_t *order, const char *prefix, bool after) {
+    size_t left = 0, right = v->row_count;
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        const char *name = key(v, order[mid]), *letter = prefix;
+        int relation = 0;
+        for (; *letter && !relation; letter++, name++)
+            relation = ascii_fold((uint8_t)*name) - (uint8_t)*letter;
+        if (relation < 0 || (!relation && after)) left = mid + 1;
+        else right = mid;
+    }
+    return left;
+}
+
+static bool visible_candidate(const DMQueryView *v, uint32_t row, bool all, uint8_t kind) {
+    return visible(v->attributes[row], all) && matches_kind(v, row, kind) &&
+        (!v->suppressed_rows || !(v->suppressed_rows[row >> 3] & (1U << (row & 7))));
+}
+
+// Dense results often fill the requested page near the start of the selected
+// sort order. Certify that prefix exactly before building a volume-wide match
+// bitmap. Sparse or unusually deep requests fall back to the linear matcher.
+static size_t slash_ordered_prefix(const DMQueryView *v, const uint32_t *order, const char *word,
+                                  const char *tail, bool name_ordered, bool descending, bool all, uint8_t kind,
+                                  size_t offset, size_t limit, uint32_t *results) {
+    enum { MAX_STEM = 255, BUDGET = 2048, FIRST_PROBE = 256 };
+    size_t stem = (size_t)(tail - word);
+    if (stem > MAX_STEM || v->row_count < 50000 || offset > 512 || limit > 512 - offset) return SIZE_MAX;
+    size_t bytes = v->row_count * sizeof(uint32_t);
+    uint32_t *memo = scratch_map(bytes);
+    if (!memo) return SIZE_MAX;
+
+    uint32_t fallback[MAX_STEM];
+    slash_fallback(word, (uint32_t)stem, fallback);
+    SlashPattern pattern = {.word = word, .stem = (uint32_t)stem, .fallback = fallback};
+    size_t skipped = 0, emitted = 0, tail_length = strlen(tail);
+    size_t rank = 0;
+    for (; rank < BUDGET && emitted < limit; rank++) {
+        if (rank == FIRST_PROBE && (skipped + emitted) * (BUDGET / FIRST_PROBE) < offset + limit) break;
+        uint32_t row = order[descending ? v->row_count - rank - 1 : rank];
+        if (!visible_candidate(v, row, all, kind)) continue;
+        bool matches;
+        if (!slash_row_matches(v, &pattern, tail, tail_length, memo, row, &matches)) break;
+        if (!matches) continue;
+        if (skipped < offset) skipped++;
+        else results[emitted++] = row;
+    }
+    if (emitted < limit && !v->has_leaf_root && name_ordered) {
+        // If the tail occurs at the start of only a few names, prove that
+        // no ancestor can introduce any other candidates before taking the page.
+        size_t begin = name_prefix_bound(v, order, tail, false);
+        size_t end = name_prefix_bound(v, order, tail, true);
+        size_t count = end - begin;
+        if (count <= 4096 && !visit_directories(v, slash_matches_root, &pattern)) {
+            skipped = emitted = 0;
+            for (rank = 0; rank < count; rank++) {
+                uint32_t row = order[descending ? end - rank - 1 : begin + rank];
+                bool matches;
+                if (!slash_row_matches(v, &pattern, tail, tail_length, memo, row, &matches) ||
+                    (matches && !(v->attributes[row] & 1))) break;
+                if (!matches || emitted == limit || !visible_candidate(v, row, all, kind)) continue;
+                if (skipped < offset) skipped++;
+                else results[emitted++] = row;
+            }
+            if (rank == count) {
+                scratch_release(memo, bytes);
+                return emitted;
+            }
+            emitted = 0;
+        }
+    }
+    scratch_release(memo, bytes);
+    return emitted == limit ? emitted : SIZE_MAX;
 }
 
 static bool all_words(const char *name, const uint8_t *patterns, const uint32_t *offsets, size_t words) {
@@ -679,6 +963,8 @@ typedef struct {
     bool any;
     bool all;
     uint8_t kind;
+    size_t needed;
+    bool allow_split;
     size_t visible_matches;
     uint32_t sole_match;
 } PathWord;
@@ -687,22 +973,28 @@ static void *path_word(void *argument) {
     PathWord *task = argument;
     const DMQueryView *view = task->view;
     uint8_t *hits = task->hits;
-    memset(hits, 0, view->row_count);
     task->ok = true;
     if (strchr(task->word, '/')) {
-        task->ok = slash_hits(view, task->word, hits, task->all, task->kind,
+        task->ok = slash_hits(view, task->word, hits, task->all, task->kind, task->needed, task->allow_split,
                               &task->visible_matches, &task->sole_match);
         task->any = task->ok && task->visible_matches != 0;
         return NULL;
     }
+    memset(hits, 0, view->row_count);
     task->visible_matches = SIZE_MAX;
-    NameHits names = {.bitmap = hits};
+    NameHits names = {.bitmap = hits, .track_ancestors = true};
     collect_name_hits(view, task->word, &names);
     task->any = names.count != 0;
-    if (task->any) {
+    if (names.matched_ancestor) {
+        uint32_t parent = UINT32_MAX;
+        bool inherited = false;
         for (uint32_t i = 0; i < view->row_count; i++) {
-            uint32_t parent = view->rows[i].parent;
-            if (parent != UINT32_MAX) hits[i] |= hits[parent];
+            uint32_t next = view->rows[i].parent;
+            if (next != parent) {
+                parent = next;
+                inherited = parent != UINT32_MAX && hits[parent];
+            }
+            if (inherited) hits[i] = 1;
         }
     }
     return NULL;
@@ -722,6 +1014,15 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
     if (!path)
         return query_name(v, order, patterns, offsets, words, name_ordered, descending,
                           all, kind, offset, limit, results);
+    if (words == 1) {
+        const char *word = (const char *)patterns + offsets[0];
+        const char *slash = strrchr(word, '/');
+        if (slash) {
+            size_t page = slash_ordered_prefix(v, order, word, slash + 1, name_ordered,
+                                              descending, all, kind, offset, limit, results);
+            if (page != SIZE_MAX) return page;
+        }
+    }
 
     uint8_t *matches = scratch_map(n);
     uint8_t *single = words > 1 ? scratch_map(n) : matches;
@@ -730,15 +1031,29 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         if (single != matches) scratch_release(single, n);
         return SIZE_MAX;
     }
-    PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all, .kind = kind};
+    size_t needed = 1;
+    if (words == 1) {
+        needed = limit > SIZE_MAX - offset ? SIZE_MAX : offset + limit;
+        // Seeing one match must still distinguish a unique result from a full page of one.
+        if (needed < 2) needed = 2;
+    }
+    PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches,
+                      .all = all, .kind = kind, .needed = needed, .allow_split = words == 1};
     bool ok, any;
     size_t next = 1;
-    if (words > 1 && n >= 50000) {
-        PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all, .kind = kind};
+    if (words > 1 && n >= 50000 && dm_try_query_worker()) {
+        PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single,
+                           .all = all, .kind = kind, .needed = 1};
         pthread_t thread;
         bool started = pthread_create(&thread, NULL, path_word, &second) == 0;
+        if (!started) dm_release_query_worker();
         path_word(&first);
-        if (started) pthread_join(thread, NULL); else path_word(&second);
+        if (started) {
+            pthread_join(thread, NULL);
+            dm_release_query_worker();
+        } else {
+            path_word(&second);
+        }
         ok = first.ok && second.ok;
         any = first.any && second.any;
         if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
@@ -755,7 +1070,8 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         if (first.visible_matches == 1 && limit == 1) only_path_hit = first.sole_match;
     }
     for (size_t j = next; j < words && ok && any; j++) {
-        PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all, .kind = kind};
+        PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single,
+                         .all = all, .kind = kind, .needed = 1};
         path_word(&task);
         ok = task.ok;
         any = task.any;

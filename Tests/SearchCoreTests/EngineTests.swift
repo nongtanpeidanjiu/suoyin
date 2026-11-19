@@ -275,6 +275,69 @@ struct EngineTests {
         #expect(manager.catalog().first(where: { $0.id == exfat })?.isIncluded == true)
     }
 
+    @Test func parallelVolumePagesMatchSerialSearch() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        let roots = (0..<5).map { root.appendingPathComponent("fixture-\($0)") }
+        for (i, url) in roots.enumerated() {
+            let branch = url.appendingPathComponent("area/shared")
+            try FileManager.default.createDirectory(at: branch, withIntermediateDirectories: true)
+            for (j, name) in ["shared.txt", "Shared.pdf", ".shared.md", "Cafe\u{301}-shared.txt", "café-shared.txt"].enumerated() {
+                let file = branch.appendingPathComponent(name)
+                try Data(repeating: 0, count: (i + j) % 3).write(to: file)
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(100 + i % 2))],
+                                                       ofItemAtPath: file.path)
+            }
+        }
+        let mounts = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        mounts.setIncludesNew(true)
+        let tracker = try ChangeTracker(root: roots[0].path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                        externalVolumes: mounts)
+        let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+        defer { engine.stop() }
+        engine.start()
+        let device = try WalkScope.device(root.path)
+        mounts.updateMounts(roots.dropFirst().map {
+            ExternalMount(identity: VolumeIdentity(root: $0.path, mount: $0.path, device: device,
+                                                    uuid: UUID().uuidString, log: nil, readOnly: false),
+                          name: "Fixture", fileEvents: false)
+        })
+        try #require(until {
+            let s = engine.status
+            return s.inaccessibleLocationsVerified && s.sources.filter { $0.inaccessibleLocationsVerified }.count == 4
+        })
+        for (mode, text) in [(QueryMode.name, "shared"), (.path, "/area/shared"), (.path, "/area/ café")] {
+            for column in SearchColumn.allCases {
+                for direction in SearchDirection.allCases {
+                    for (showAll, kind) in [(false, EngineKind.any), (true, .document), (true, .folder)] {
+                        for offset in [0, 2, 9, 31] {
+                            let limit = 5
+                            let serial = tracker.search(text, mode: mode, column: column, direction: direction,
+                                                        showAll: showAll, kind: kind, offset: offset, limit: limit + 1,
+                                                        parallelVolumes: false)
+                            let result = engine.search(EngineQuery(text: text, mode: mode, column: column,
+                                                                   direction: direction, showAll: showAll,
+                                                                   kind: kind, offset: offset, limit: limit))
+                            let expected = serial.prefix(limit).map(EngineHit.init)
+                            #expect(result.hits.count == expected.count)
+                            for (actual, reference) in zip(result.hits, expected) {
+                                #expect(actual.id == reference.id && actual.name == reference.name &&
+                                    actual.path == reference.path && actual.volumeID == reference.volumeID &&
+                                    actual.isDirectory == reference.isDirectory && actual.size == reference.size &&
+                                    actual.modified == reference.modified && actual.isCloudPlaceholder == reference.isCloudPlaceholder)
+                            }
+                            #expect(result.total == (serial.isEmpty ? 0 : offset + serial.count))
+                            #expect(result.totalIsExact == (serial.isEmpty ? offset == 0 : serial.count <= limit))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test func kindsComposeWithPagingOrderingAndPublishedEdits() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }

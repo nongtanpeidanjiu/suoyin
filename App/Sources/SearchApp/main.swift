@@ -33,12 +33,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onShowSetupGuide: { [weak self] in self?.setupGuide.show(at: .welcome) },
         onRetry: { [weak self] in self?.retryService() })
     private var spinner: Timer?
+    /// Kept alive so SIGTERM (`kill`, some logout paths) quits the ordinary way.
+    private var terminationSignal: DispatchSourceSignal?
     /// The status line of the menu while it is open, kept current as the
     /// supplementing count rises.
     private weak var statusMenuItem: NSMenuItem?
     private var angle: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // SIGTERM would otherwise end the process at once, skipping
+        // `applicationWillTerminate` and with it the core's final save. Route
+        // it through the normal quit so `service.stop()` runs (bounded to a
+        // few seconds by the core).
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { NSApp.terminate(nil) }
+        source.resume()
+        terminationSignal = source
+
         // The setup guide opens by itself once, on the first launch. The key
         // is the one the earlier single-page access guide set, so whoever saw
         // that one is not asked again. `--show-setup` opens it regardless,

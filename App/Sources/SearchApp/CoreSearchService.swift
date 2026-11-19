@@ -23,6 +23,7 @@ final class CoreSearchService: SearchService {
     private let volumeQueue = DispatchQueue(label: "ui.external-volumes", qos: .userInitiated)
     private let volumeLock = NSLock()
     private var volumes: [ExternalVolume] = []
+    private var unindexed: [UnindexedVolume] = []
     private var includesNew = false
     private var settingsError: ExternalVolumeSettingsError?
     /// Choices sent to the core and not yet reflected in what it reports.
@@ -46,7 +47,12 @@ final class CoreSearchService: SearchService {
             directory = base.appendingPathComponent("dev.local.filesearch", isDirectory: true)
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        engine = try SearchEngine(dataDirectory: directory)
+        do {
+            engine = try SearchEngine(dataDirectory: directory)
+        } catch let failure as EngineFailure {
+            // The interface explains the category in its own words.
+            throw Self.convert(failure)
+        }
         // A separate test directory leaves the user's own choice alone.
         if dataDirectory == nil { Self.moveLegacyChoice(to: engine) }
         readVolumes()
@@ -95,7 +101,8 @@ final class CoreSearchService: SearchService {
                                 direction: request.order == .ascending ? .ascending : .descending,
                                 showAll: request.includeSystemFiles,
                                 kind: Self.convert(request.kind),
-                                offset: request.offset, limit: request.limit)
+                                offset: request.offset, limit: request.limit,
+                                totalCountBudget: request.totalCountBudget)
         let result = engine.search(query)
         let hits = result.hits.map {
             SearchHit(id: $0.id, name: $0.name, path: $0.path, isDirectory: $0.isDirectory, size: $0.size,
@@ -108,6 +115,7 @@ final class CoreSearchService: SearchService {
     var status: IndexStatus { indexStatus(from: engine.status) }
     func recheckAccess() { engine.recheckAccess() }
     func rebuild() { engine.rebuild() }
+    var indexDataDirectoryExclusion: String? { engine.indexDataDirectoryExclusion }
 
     // MARK: Attached volumes
 
@@ -145,6 +153,21 @@ final class CoreSearchService: SearchService {
 
     var externalVolumeSettingsError: ExternalVolumeSettingsError? {
         volumeLock.withLock { forgetError ?? settingsError }
+    }
+
+    var unindexedMountedVolumes: [UnindexedVolume] { volumeLock.withLock { unindexed } }
+
+    /// Asks the core off the main thread (it waits on its volume queue) and
+    /// answers on the main thread; the new state follows through
+    /// `onExternalVolumesChange`.
+    func retryExternalVolume(_ id: String, completion: @escaping (Bool) -> Void) {
+        volumeLock.withLock { forgetError = nil }
+        volumeQueue.async { [weak self] in
+            guard let self else { return }
+            let accepted = self.engine.retryExternalVolume(id)
+            self.readVolumes(notify: true)
+            DispatchQueue.main.async { completion(accepted) }
+        }
     }
 
     /// Leaving a volume out takes its files out of the results as soon as
@@ -218,13 +241,14 @@ final class CoreSearchService: SearchService {
     /// it shows changed.
     private func readVolumes(notify: Bool = false) {
         let list = engine.externalVolumes.map(Self.convert)
+        let others = engine.unindexedMountedVolumes.map(Self.convert)
         let addsNew = engine.includesNewExternalVolumes
         let error = engine.externalVolumeSettingsError.map(Self.convert)
         let changed = volumeLock.withLock { () -> Bool in
             // A volume the core no longer lists is gone: its mark goes too.
             pendingForgets.formIntersection(list.map(\.id))
-            defer { (volumes, includesNew, settingsError) = (list, addsNew, error) }
-            return list != volumes || addsNew != includesNew || error != settingsError
+            defer { (volumes, unindexed, includesNew, settingsError) = (list, others, addsNew, error) }
+            return list != volumes || others != unindexed || addsNew != includesNew || error != settingsError
         }
         if changed && notify { onExternalVolumesChange?() }
     }
@@ -235,13 +259,43 @@ final class CoreSearchService: SearchService {
         case .idle: progress = .idle
         case .restoring: progress = .restoring
         case .scanning: progress = .scanning
+        case .failed: progress = .failed
         }
         return ExternalVolume(id: volume.id, name: volume.name, nameIsPlaceholder: volume.nameIsPlaceholder,
                               isOnline: volume.isOnline, isIncluded: volume.isIncluded, progress: progress,
                               indexedCount: volume.indexedCount, retainedCount: volume.retainedCount,
                               // `detail` carries only the file system now.
                               filesystem: volume.filesystem ?? volume.detail, capacityBytes: volume.capacityBytes,
-                              canForget: volume.canForget)
+                              canForget: volume.canForget, failure: volume.failure.map(Self.convert),
+                              requiresManualInclusion: volume.requiresManualInclusion)
+    }
+
+    private static func convert(_ volume: EngineUnindexedVolume) -> UnindexedVolume {
+        let kind: UnindexedVolume.Kind
+        switch volume.kind {
+        case .diskImage: kind = .diskImage
+        case .network: kind = .network
+        case .local: kind = .local
+        }
+        let reason: UnindexedVolume.Reason
+        switch volume.reason {
+        case .diskImagesDisabled: reason = .diskImagesDisabled
+        case .networkUnsupported: reason = .networkUnsupported
+        case .localVolumeUnsupported: reason = .localVolumeUnsupported
+        }
+        return UnindexedVolume(id: volume.id, name: volume.name, kind: kind, reason: reason)
+    }
+
+    private static func convert(_ failure: EngineFailure) -> IndexFailure {
+        let category: IndexFailure.Category
+        switch failure.category {
+        case .dataDirectoryUnavailable: category = .dataDirectoryUnavailable
+        case .diskRead: category = .diskRead
+        case .indexCorrupt: category = .indexCorrupt
+        case .indexLimitExceeded: category = .indexLimitExceeded
+        case .other: category = .other
+        }
+        return IndexFailure(category: category, underlyingMessage: failure.underlyingMessage)
     }
 
     private static func convert(_ error: EngineVolumeSettingsError) -> ExternalVolumeSettingsError {
@@ -271,7 +325,7 @@ final class CoreSearchService: SearchService {
             let source = status.sources.first { $0.name == name }
             phase = .supplementing(name: source.map(Self.displayName) ?? name, indexed: indexed,
                                    restoring: isRestoring(name, source))
-        case .failed(let reason): phase = .degraded(reason: reason)
+        case .failed(let failure): phase = .failed(Self.convert(failure))
         }
         return IndexStatus(phase: phase, indexedCount: status.indexedCount,
                            rawInaccessiblePlaces: status.rawInaccessibleLocations.map(Self.convert),
@@ -296,7 +350,8 @@ final class CoreSearchService: SearchService {
         IndexSource(id: source.id, name: displayName(source),
                     kind: source.kind == .externalVolume ? .externalVolume : .cloudProvider,
                     indexed: source.indexed, isComplete: source.inaccessibleLocationsVerified,
-                    failure: source.error,
+                    failure: source.failure.map(Self.convert)
+                        ?? source.error.map { IndexFailure(category: .other, underlyingMessage: $0) },
                     rawInaccessiblePlaces: source.rawInaccessibleLocations.map(Self.convert),
                     inaccessiblePlaces: source.inaccessibleLocations.map(Self.convert))
     }

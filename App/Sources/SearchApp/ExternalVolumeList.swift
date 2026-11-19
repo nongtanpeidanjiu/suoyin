@@ -1,6 +1,7 @@
 import AppKit
 
-/// A bordered list of attached volumes, each with a switch that adds it to
+/// A bordered list of volumes besides the startup disk (attached ones and
+/// other partitions of the built-in disk), each with a switch that adds it to
 /// the search, in the settings window and in the setup guide. It is as tall
 /// as its rows up to `maxRows` and scrolls beyond that. Updates change the
 /// rows in place, so rising counts neither flicker nor move the list.
@@ -12,8 +13,10 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
     /// Called with a volume whose indexed data the user asked to delete.
     var onDelete: ((ExternalVolume) -> Void)?
     /// Called with a volume the user asked to take off the list. With
-    /// neither this nor `onDelete` set the menu is hidden.
+    /// none of this, `onDelete` and `onRetry` set the menu is hidden.
     var onForget: ((ExternalVolume) -> Void)?
+    /// Called with a failed volume the user asked to scan again.
+    var onRetry: ((ExternalVolume) -> Void)?
     /// Called after the list changed height.
     var onHeightChange: (() -> Void)?
 
@@ -38,7 +41,7 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         table.dataSource = self
         table.delegate = self
-        table.setAccessibilityLabel("外接磁盘")
+        table.setAccessibilityLabel("其他磁盘")
         let menu = NSMenu()
         menu.delegate = self
         table.menu = menu
@@ -126,6 +129,18 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
     private func fill(_ menu: NSMenu, for volume: ExternalVolume) {
         menu.removeAllItems()
         menu.autoenablesItems = false
+        if onRetry != nil {
+            let retry = NSMenuItem(title: "重试", action: #selector(retryChosen(_:)), keyEquivalent: "")
+            retry.target = self
+            retry.representedObject = volume.id
+            // Like the other items, greyed out where it cannot help.
+            retry.isEnabled = volume.canRetry
+            if !retry.isEnabled {
+                retry.toolTip = volume.progress == .failed ? "磁盘连接并加入搜索后才能重试" : "这块磁盘的扫描没有出错"
+            }
+            menu.addItem(retry)
+            menu.addItem(.separator())
+        }
         let item = NSMenuItem(title: "删除已收录的数据…", action: #selector(deleteChosen(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = volume.id
@@ -167,6 +182,11 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         onDelete?(volume)
     }
 
+    @objc private func retryChosen(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let volume = volumes.first(where: { $0.id == id }) else { return }
+        onRetry?(volume)
+    }
+
     @objc private func forgetChosen(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let volume = volumes.first(where: { $0.id == id }) else { return }
         onForget?(volume)
@@ -174,7 +194,7 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
 
     /// The “…” button shows only where the list has a menu at all. It stays
     /// clickable when every item of a row is greyed out.
-    var showsMenu: Bool { onDelete != nil || onForget != nil }
+    var showsMenu: Bool { onDelete != nil || onForget != nil || onRetry != nil }
 }
 
 /// One volume: symbol, name with its detail, state line, switch and an
@@ -264,6 +284,9 @@ private final class VolumeCell: NSTableCellView {
         detailLabel.stringValue = volume.detail ?? ""
         detailLabel.isHidden = volume.detail == nil
         if stateLabel.stringValue != volume.stateLine { stateLabel.stringValue = volume.stateLine }
+        // An error stands out; why, and what to do, is in the tool tip.
+        stateLabel.textColor = volume.showsFailure ? .systemRed : .secondaryLabelColor
+        stateLabel.toolTip = volume.help
         let state: NSControl.StateValue = volume.isIncluded ? .on : .off
         if toggle.state != state { toggle.state = state }
         toggle.isEnabled = !volume.isRemoving
@@ -271,7 +294,8 @@ private final class VolumeCell: NSTableCellView {
         more.isHidden = !owner.showsMenu
         more.setAccessibilityLabel("“\(volume.title)”的更多操作")
         setAccessibilityLabel("\(volume.title)，\(volume.stateLine)")
-        toolTip = volume.title
+        setAccessibilityHelp(volume.help)
+        toolTip = volume.help.map { "\(volume.title)\n\n\($0)" } ?? volume.title
     }
 
     @objc private func switched() {
@@ -297,7 +321,7 @@ enum ExternalVolumeConfirmation {
         if volume.isOnline {
             text += "删除后不再搜索这块磁盘，它仍留在列表中，显示为“未加入”；以后可以重新加入，届时需要从头扫描。"
         } else {
-            text += "这块磁盘目前未连接，删除后会从列表中移除；以后再插入时会作为新磁盘出现，加入搜索需要从头扫描。"
+            text += "这块磁盘目前未连接，删除后会从列表中移除；以后再接入时会作为新磁盘出现，加入搜索需要从头扫描。"
         }
         alert.informativeText = text
         let delete = alert.addButton(withTitle: "删除")
@@ -310,6 +334,16 @@ enum ExternalVolumeConfirmation {
             if response == .alertFirstButtonReturn { confirmed() }
         }
         if let window { alert.beginSheetModal(for: window, completionHandler: finish) } else { finish(alert.runModal()) }
+    }
+
+    /// Says that a retry was refused: by then the volume was detached, left
+    /// out, no longer failed, or being removed.
+    static func retryRefused(_ volume: ExternalVolume, in window: NSWindow?) {
+        let alert = NSAlert()
+        alert.messageText = "现在无法重试“\(volume.title)”"
+        alert.informativeText = "这块磁盘可能刚被推出、关掉了加入开关、正在移除，或者已经恢复正常。请看列表里它现在的状态；如果仍显示扫描中断，请重新接入磁盘后再试。"
+        alert.addButton(withTitle: "好")
+        if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
     }
 
     /// Asks before taking a detached `volume` off the list together with

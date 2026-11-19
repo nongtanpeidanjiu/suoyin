@@ -172,6 +172,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         static let maxLoaded = 5_000
         /// Rows from the end at which the next page is asked for.
         static let lookahead = 40
+        /// Matches the first query counts at most, to give an exact total.
+        static let countBudget = 500
     }
     /// The height the panel is at or animating towards; `panel.frame` lags during a resize.
     private var targetHeight: CGFloat = 0
@@ -619,6 +621,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         } else if case .waitingForSetup = status.phase {
             emptyLabel.stringValue = IndexPhase.waitingLine
             emptyLabel.toolTip = nil
+        } else if let failure = status.phase.failure {
+            // Not finding it may be the error's doing.
+            emptyLabel.stringValue = "没有找到匹配的文件。\(failure.title)，结果可能不全，详见“设置 › 索引”"
+            emptyLabel.toolTip = failure.text(.index)
         } else {
             emptyLabel.stringValue = "没有找到匹配的文件"
             emptyLabel.toolTip = nil
@@ -795,6 +801,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         if keepingSelection {
             request.limit = min(max(Paging.pageSize, hits.count), Paging.maxLoaded)
         }
+        // Counted further than the page, so that up to this many matches the
+        // line gives the exact number; the next pages do without.
+        request.totalCountBudget = Paging.countBudget
         let service = self.service
         queryQueue.async { [weak self] in
             // Typing queues a query per key; only the newest is worth running.
@@ -857,6 +866,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private func loadMore() {
         guard canLoadMore, var request = lastRequest else { return }
         request.offset = fetchedCount
+        request.totalCountBudget = nil
         request.limit = min(Paging.pageSize, Paging.maxLoaded - hits.count)
         loadingMore = true
         let token = generation
@@ -873,8 +883,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 let fresh = response.hits.filter { self.loadedPaths.insert($0.path).inserted }
                 self.reachedEnd = response.hits.count < request.limit
                     || (response.totalIsExact && offset + response.hits.count >= response.total)
-                self.total = response.total
-                self.totalIsExact = response.totalIsExact
+                // A page without the count budget knows only that one more
+                // follows it; the larger lower bound of the first page stays.
+                if response.totalIsExact {
+                    self.total = response.total
+                    self.totalIsExact = true
+                } else if !self.totalIsExact {
+                    self.total = max(self.total, response.total)
+                }
                 if !fresh.isEmpty {
                     self.hits += fresh
                     self.table.noteNumberOfRowsChanged()
@@ -893,8 +909,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     /// Refreshes the quiet status text at the right of the filter row.
     func updateFooter() {
-        // Not exact means there is at least one more than is loaded.
-        let shown = totalIsExact ? total : hits.count
+        // Not exact: `total` is a lower bound, at least one more than is
+        // known for sure, so “超过” the number below it.
+        let shown = totalIsExact ? total : max(hits.count, total - 1)
         let count = formattedCount(shown)
         var lead = totalIsExact ? "\(count) 个结果" : "超过 \(count) 个结果"
         if hits.count >= Paging.maxLoaded && !(totalIsExact && total <= hits.count) {
@@ -926,10 +943,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 tail = indexed > 0 ? "，已收录 \(formattedCount(indexed)) 个" : ""
             }
             key = (restoring ? "restoring\u{0}" : "supplementing\u{0}") + source
-        case .degraded(let reason):
+        case .failed(let failure):
             lead += " · "
-            name = reason
-            key = "degraded"
+            name = failure.title
+            tail = "，详见设置"
+            key = "failed"
         case .ready:
             key = "ready"
         case .waitingForSetup:
@@ -939,6 +957,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
             lead = "无法启动搜索"
             key = "unavailable"
         }
+        let explanation = service.status.phase.failure?.text(.index)
+        if countLabel.toolTip != explanation { countLabel.toolTip = explanation }
         if service.isDemo { tail += " · 演示数据" }
         let text = Self.fit(lead, name, tail, width: countLabel.frame.width)
         guard countLabel.stringValue != text else { return }

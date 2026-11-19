@@ -146,6 +146,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.panel.moveSelectionForTesting(by: Int(note.object as? String ?? "") ?? 1)
         }
 
+        // `--show-settings [general|scope|index]` opens the settings window
+        // at that pane, for testing tools that cannot press Command-Comma.
+        if TestHooks.flag("--show-settings") {
+            let panes: [String: SettingsWindowController.PaneChoice] = ["general": .general, "scope": .scope, "index": .index]
+            let pane = TestHooks.value(after: "--show-settings").flatMap { panes[$0] } ?? .scope
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.settings.show(pane: pane) }
+        }
+
         if TestHooks.flag("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 self.panel.show(anchor: nil)
@@ -219,6 +227,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if current.phase.isUnavailable {
             menu.addItem(withTitle: "重试", action: #selector(retryService), keyEquivalent: "").target = self
         }
+        if current.phase.failure != nil {
+            menu.addItem(withTitle: "查看原因和解决办法…", action: #selector(showIndexPane), keyEquivalent: "").target = self
+        }
         menu.addItem(.separator())
         // Only when there is something to show.
         if current.inaccessibleVerified && current.inaccessibleCount > 0 {
@@ -236,7 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Digits of equal width, so a rising count does not make the line shift.
     private func showStatusLine(_ status: IndexStatus) {
         guard let item = statusMenuItem else { return }
-        item.attributedTitle = NSAttributedString(string: status.summary, attributes: [
+        item.attributedTitle = NSAttributedString(string: status.menuLine, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
             .foregroundColor: NSColor.disabledControlTextColor,
         ])
@@ -245,6 +256,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openSettings() {
         panel.hide()
         settings.show()
+    }
+
+    @objc private func showIndexPane() {
+        panel.hide()
+        settings.show(pane: .index)
     }
 
     @objc private func showInaccessible() {
@@ -326,7 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             spinner?.invalidate()
             spinner = nil
             statusItem.button?.image = Glyphs.menuBar(.idle)
-        case .degraded, .unavailable:
+        case .failed, .unavailable:
             spinner?.invalidate()
             spinner = nil
             statusItem.button?.image = Glyphs.menuBar(.attention)

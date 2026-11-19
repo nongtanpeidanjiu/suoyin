@@ -133,7 +133,7 @@ final class ResultCellView: NSTableCellView {
         if hit.isCloudPlaceholder {
             badge.image = NSImage(systemSymbolName: "icloud", accessibilityDescription: "在云端，未下载")
         } else if hit.isOnExternalVolume {
-            badge.image = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "在外接盘上")
+            badge.image = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "在其他磁盘上")
         } else {
             badge.image = nil
         }

@@ -49,25 +49,33 @@ final class ServiceHost: SearchService {
         }
     }
 
-    /// “无法启动搜索：<what it means>（原始信息：<the error>）”.
+    /// “无法启动搜索：<what it means><what to do>（原始信息：<the error>）”,
+    /// in the same words as an index that stopped while running.
     static func describe(_ error: Error) -> String {
+        failure(for: error).text(.launch)
+    }
+
+    /// The core's own category, or one read from a file system error raised
+    /// before the core was reached (creating its folder, for instance).
+    static func failure(for error: Error) -> IndexFailure {
+        if let failure = error as? IndexFailure { return failure }
         let error = error as NSError
-        let meaning: String
+        let category: IndexFailure.Category
         switch (error.domain, error.code) {
-        case (NSCocoaErrorDomain, CocoaError.fileWriteOutOfSpace.rawValue):
-            meaning = "磁盘空间不足，没能保存索引数据"
-        case (NSCocoaErrorDomain, CocoaError.fileReadNoPermission.rawValue),
+        case (NSCocoaErrorDomain, CocoaError.fileWriteOutOfSpace.rawValue),
+             (NSCocoaErrorDomain, CocoaError.fileReadNoPermission.rawValue),
              (NSCocoaErrorDomain, CocoaError.fileWriteNoPermission.rawValue),
-             (NSPOSIXErrorDomain, Int(EACCES)), (NSPOSIXErrorDomain, Int(EPERM)):
-            meaning = "没有权限读写索引数据所在的文件夹"
-        case (NSCocoaErrorDomain, CocoaError.fileWriteVolumeReadOnly.rawValue),
-             (NSPOSIXErrorDomain, Int(EROFS)):
-            meaning = "索引数据所在的磁盘是只读的"
+             (NSCocoaErrorDomain, CocoaError.fileWriteVolumeReadOnly.rawValue),
+             (NSPOSIXErrorDomain, Int(ENOSPC)), (NSPOSIXErrorDomain, Int(EACCES)),
+             (NSPOSIXErrorDomain, Int(EPERM)), (NSPOSIXErrorDomain, Int(EROFS)):
+            category = .dataDirectoryUnavailable
+        case (NSPOSIXErrorDomain, Int(EIO)), (NSPOSIXErrorDomain, Int(ENXIO)):
+            category = .diskRead
         default:
-            meaning = "没能打开索引数据"
+            category = .other
         }
-        let raw = "\(error.domain) \(error.code)：\(error.localizedDescription)"
-        return "无法启动搜索：\(meaning)（原始信息：\(raw)）"
+        return IndexFailure(category: category,
+                            underlyingMessage: "\(error.domain) \(error.code)：\(error.localizedDescription)")
     }
 
     /// The status as the interface should see it: the failure, or the wait
@@ -133,12 +141,18 @@ final class ServiceHost: SearchService {
 
     func recheckAccess() { if started { inner?.recheckAccess() } }
     func rebuild() { if started { inner?.rebuild() } }
+    var indexDataDirectoryExclusion: String? { inner?.indexDataDirectoryExclusion }
 
     var includesNewExternalVolumes: Bool {
         get { inner?.includesNewExternalVolumes ?? false }
         set { inner?.includesNewExternalVolumes = newValue }
     }
     var externalVolumes: [ExternalVolume] { inner?.externalVolumes ?? [] }
+    var unindexedMountedVolumes: [UnindexedVolume] { inner?.unindexedMountedVolumes ?? [] }
+    func retryExternalVolume(_ id: String, completion: @escaping (Bool) -> Void) {
+        guard let inner else { completion(false); return }
+        inner.retryExternalVolume(id, completion: completion)
+    }
     func setExternalVolume(_ id: String, included: Bool) { inner?.setExternalVolume(id, included: included) }
     func removeExternalVolumeData(_ id: String) { inner?.removeExternalVolumeData(id) }
     func forgetExternalVolume(_ id: String) { inner?.forgetExternalVolume(id) }

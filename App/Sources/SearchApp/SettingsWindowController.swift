@@ -459,11 +459,18 @@ private final class ScopePane: SettingsPane {
     private let service: SearchService
     private let onShowAccessGuide: () -> Void
     private let systemFiles = NSButton(checkboxWithTitle: "显示系统文件和隐藏文件", target: nil, action: nil)
-    private let newVolumes = NSButton(checkboxWithTitle: "自动把新插入的外接磁盘加入搜索", target: nil, action: nil)
+    private let newVolumes = NSButton(checkboxWithTitle: "自动把新接入的磁盘加入搜索", target: nil, action: nil)
     private let volumeList = ExternalVolumeList(width: InaccessibleOutline.width, maxRows: 3,
-                                                emptyText: "还没有接入过外接磁盘")
+                                                emptyText: "还没有接入过其他磁盘")
     private var volumeErrorRow: NSGridRow!
     private var volumeError: NSTextField!
+    /// Volumes attached now that are not searched: disk images, network volumes.
+    private var unindexedRow: NSGridRow!
+    private let unindexedLines = NSStackView()
+    private var shownUnindexed: [UnindexedVolume] = []
+    /// The one location left out of the search: the index's own folder.
+    private var exclusionRow: NSGridRow!
+    private var exclusionNote: NSTextField!
     private let accessIcon = NSImageView()
     private let accessLabel = NSTextField(labelWithString: "")
     private let accessButton = NSButton(title: "前往授权…", target: nil, action: nil)
@@ -491,9 +498,9 @@ private final class ScopePane: SettingsPane {
 
         newVolumes.target = self
         newVolumes.action = #selector(toggleNewVolumes)
-        addRow("外接磁盘：", newVolumes, gap: 14)
+        addRow("其他磁盘：", newVolumes, gap: 14)
         addRow(nil, note("""
-            关闭时新磁盘不会被扫描，已加入的不受影响。大容量机械硬盘首次扫描可能需要几十分钟，期间仍可正常搜索。
+            启动磁盘以外的磁盘：移动硬盘、U 盘，以及电脑内置硬盘上的其他分区。关闭时新接入的磁盘不会被扫描，已加入的不受影响。大容量机械硬盘首次扫描可能需要几十分钟，期间仍可正常搜索。少数没有稳定标识的磁盘无法被记住，不受这个选项影响，每次接入都要手动加入。
             """))
         volumeList.onToggle = { [weak self] id, included in
             self?.service.setExternalVolume(id, included: included)
@@ -501,10 +508,16 @@ private final class ScopePane: SettingsPane {
         }
         volumeList.onDelete = { [weak self] volume in self?.askToDelete(volume) }
         volumeList.onForget = { [weak self] volume in self?.askToForget(volume) }
+        volumeList.onRetry = { [weak self] volume in self?.retry(volume) }
         volumeList.onHeightChange = { [weak self] in self?.onSizeChange?() }
         addRow(nil, volumeList, gap: 4)
         (volumeErrorRow, volumeError) = messageRow(after: 2)
         volumeError.isSelectable = true
+        unindexedLines.orientation = .vertical
+        unindexedLines.alignment = .leading
+        unindexedLines.spacing = 4
+        unindexedRow = addRow(nil, unindexedLines, gap: 6)
+        unindexedRow.isHidden = true
 
         accessIcon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         accessButton.target = self
@@ -546,6 +559,11 @@ private final class ScopePane: SettingsPane {
         pending.spacing = 6
         pendingRow = addRow("等待授权的位置：", pending, gap: 14)
         pendingRow.isHidden = true
+
+        exclusionNote = note("")
+        exclusionNote.isSelectable = true
+        exclusionRow = addRow("不搜索的位置：", exclusionNote, gap: 14)
+        exclusionRow.isHidden = true
     }
 
     override func reload() {
@@ -555,10 +573,51 @@ private final class ScopePane: SettingsPane {
         updateVolumes()
     }
 
+    /// Said as it is: the index's own folder is the only place not searched,
+    /// so that writing the index does not set off the index again.
+    private func showExclusion() {
+        let path = service.indexDataDirectoryExclusion
+        let text = path.map { "软件自己的索引数据（\($0)）不在搜索范围内，以免写入索引时又触发索引更新。这是唯一主动排除的位置。" }
+        if exclusionNote.stringValue != text ?? "" { exclusionNote.stringValue = text ?? "" }
+        guard exclusionRow.isHidden != (text == nil) else { return }
+        exclusionRow.isHidden = text == nil
+        onSizeChange?()
+    }
+
+    /// “以下磁盘没有纳入搜索：” and a line for each, only while there are any.
+    private func showUnindexed() {
+        let list = service.unindexedMountedVolumes
+        guard list != shownUnindexed else { return }
+        let wasEmpty = shownUnindexed.isEmpty
+        shownUnindexed = list
+        unindexedLines.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        if !list.isEmpty {
+            unindexedLines.addArrangedSubview(note("以下磁盘没有纳入搜索："))
+            for volume in list {
+                let line = note("· \(volume.name)（\(volume.kindTitle)）：\(volume.reasonText)。")
+                line.textColor = .labelColor
+                line.setAccessibilityLabel("\(volume.name)，\(volume.kindTitle)，没有纳入搜索：\(volume.reasonText)")
+                unindexedLines.addArrangedSubview(line)
+            }
+        }
+        unindexedRow.isHidden = list.isEmpty
+        if !(wasEmpty && list.isEmpty) { onSizeChange?() }
+    }
+
+    private func retry(_ volume: ExternalVolume) {
+        service.retryExternalVolume(volume.id) { [weak self] accepted in
+            guard let self else { return }
+            self.updateVolumes()
+            if !accepted { ExternalVolumeConfirmation.retryRefused(volume, in: self.view.window) }
+        }
+    }
+
     /// The attached volumes, refreshed in place as their state changes.
     func updateVolumes() {
         newVolumes.state = service.includesNewExternalVolumes ? .on : .off
         volumeList.show(service.externalVolumes)
+        showUnindexed()
+        showExclusion()
         let error = service.externalVolumeSettingsError?.text
         if volumeError.stringValue != error ?? "" { volumeError.stringValue = error ?? "" }
         if volumeErrorRow.isHidden != (error == nil) {
@@ -727,6 +786,9 @@ private final class IndexPane: SettingsPane {
             state.stringValue = status.summary
             if lines { onSizeChange?() }
         }
+        // An error stands out; the rebuild button below stays usable and is
+        // the way out the text points to.
+        state.textColor = status.phase.failure != nil ? .systemRed : .labelColor
         let unavailable = status.phase.isUnavailable
         if retryRow.isHidden == unavailable {
             retryRow.isHidden = !unavailable
@@ -743,11 +805,11 @@ private final class IndexPane: SettingsPane {
         rebuild.isEnabled = !status.isBusy && status.phase.isSearchable
     }
 
-    /// “其中本机 1,950,000 个，外接磁盘 700,000 个” while attached volumes
+    /// “其中启动磁盘 1,950,000 个，其他磁盘 700,000 个” while other volumes
     /// are searched; nil otherwise.
     private static func countParts(_ status: IndexStatus) -> String? {
         guard let local = status.localIndexedCount, local < status.indexedCount else { return nil }
-        return "其中本机 \(formattedCount(local)) 个，外接磁盘 \(formattedCount(status.indexedCount - local)) 个"
+        return "其中启动磁盘 \(formattedCount(local)) 个，其他磁盘 \(formattedCount(status.indexedCount - local)) 个"
     }
 
     @objc private func confirmRebuild() {
@@ -755,7 +817,7 @@ private final class IndexPane: SettingsPane {
         alert.messageText = "要重建索引吗？"
         var text = "重建通常需要一到几分钟，期间仍可以搜索，完成后结果会完整准确。"
         if service.externalVolumes.contains(where: { $0.isIncluded && $0.isOnline }) {
-            text += "已加入的外接磁盘也会重新核对，大容量机械硬盘可能要几十分钟。"
+            text += "已加入的其他磁盘也会重新核对，大容量机械硬盘可能要几十分钟。"
         }
         alert.informativeText = text
         alert.addButton(withTitle: "重建")
@@ -1082,7 +1144,7 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
             return (symbol, tint, "\(title(reason)) · \(formatted(count)) 个位置", explanation(reason))
         case .source(let source, let count):
             let isCloud = source.kind == .cloudProvider
-            let name = isCloud ? source.name : "外接磁盘 \(source.name)"
+            let name = isCloud ? source.name : "磁盘 \(source.name)"
             return (isCloud ? "icloud" : "externaldrive", .secondaryLabelColor,
                     "\(name) · \(formatted(count)) 个位置", sourceExplanation(source, isCloud: isCloud))
         case .place, .detail:

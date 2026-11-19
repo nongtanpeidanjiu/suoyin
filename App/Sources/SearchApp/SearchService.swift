@@ -51,6 +51,10 @@ struct SearchRequest {
     /// One page; the panel asks for the next page with `offset` as the
     /// list is scrolled towards its end.
     var limit = 200
+    /// Asks the core to count up to this many matches from the first one, so
+    /// that a short list gets an exact total. Only the first page sets it;
+    /// the core takes at most 2,000.
+    var totalCountBudget: Int? = nil
 }
 
 struct SearchHit {
@@ -82,7 +86,9 @@ enum IndexPhase {
     /// attached volume brings back what an earlier run had indexed (already
     /// searchable) rather than reading new folders.
     case supplementing(name: String, indexed: Int, restoring: Bool)
-    case degraded(reason: String)
+    /// The running core stopped with an error. What was indexed can still be
+    /// searched; “立即重建索引” is the way out.
+    case failed(IndexFailure)
     /// First launch: indexing waits until the setup guide's full disk access
     /// step is past, so the system's access prompts never come before the
     /// guide has explained them.
@@ -146,7 +152,7 @@ struct IndexSource: Equatable {
     /// False while it is still being scanned or brought up to date.
     var isComplete: Bool
     /// Set when the source stopped with an error.
-    var failure: String?
+    var failure: IndexFailure?
     /// Locations inside this source that could not be read, raw and merged
     /// the same way as this Mac's; empty until `isComplete`.
     var rawInaccessiblePlaces: [InaccessiblePlace] = []
@@ -156,7 +162,7 @@ struct IndexSource: Equatable {
 /// An attached volume the index knows about, attached now or remembered
 /// from an earlier time.
 struct ExternalVolume: Equatable {
-    enum Progress { case idle, restoring, scanning }
+    enum Progress { case idle, restoring, scanning, failed }
 
     /// Stable across attachments (the volume UUID where there is one).
     var id: String
@@ -185,8 +191,128 @@ struct ExternalVolume: Equatable {
     var canForget = false
     /// Set by the interface while taking it off the list is under way.
     var isRemoving = false
+    /// Why its scan stopped, with `progress == .failed`.
+    var failure: IndexFailure? = nil
+    /// No stable identifier: it cannot be recognised when attached again, so
+    /// it is only listed while attached, is never added by itself, and has to
+    /// be switched on by hand each time.
+    var requiresManualInclusion = false
 
-    var isScanning: Bool { progress != .idle }
+    var isScanning: Bool { progress == .restoring || progress == .scanning }
+    /// Whether “重试” can help: attached, searched and stopped by an error.
+    var canRetry: Bool { progress == .failed && isOnline && isIncluded && !isRemoving }
+}
+
+/// A volume attached now that is not searched and cannot be added: a disk
+/// image, a network volume, or a local one the core cannot index.
+struct UnindexedVolume: Equatable {
+    enum Kind { case diskImage, network, local }
+    enum Reason { case diskImagesDisabled, networkUnsupported, localVolumeUnsupported }
+
+    var id: String
+    var name: String
+    var kind: Kind
+    var reason: Reason
+
+    var kindTitle: String {
+        switch kind {
+        case .diskImage: return "磁盘映像"
+        case .network: return "网络磁盘"
+        case .local: return "本机磁盘"
+        }
+    }
+
+    var reasonText: String {
+        switch reason {
+        case .diskImagesDisabled:
+            return "磁盘映像（.dmg 等）打开后只是临时挂载，为免反复扫描暂不收录"
+        case .networkUnsupported:
+            return "网络磁盘读取慢、内容由别的电脑管理，暂不支持收录"
+        case .localVolumeUnsupported:
+            return "这块磁盘的类型或挂载方式暂不支持收录"
+        }
+    }
+}
+
+/// Why the core stopped, in a few categories the interface explains in
+/// plain words. Used for a core that could not be opened, for one that
+/// stopped while running, and for an attached volume whose scan stopped.
+struct IndexFailure: Error, Equatable {
+    enum Category { case dataDirectoryUnavailable, diskRead, indexCorrupt, indexLimitExceeded, other }
+    /// Where the explanation is shown, which decides what the user is told to click.
+    enum Context {
+        /// The core could not be opened: “重试”.
+        case launch
+        /// The running index stopped: “立即重建索引…” in the settings.
+        case index
+        /// An attached volume's scan stopped: “重试” in its menu.
+        case volume
+    }
+
+    var category: Category
+    /// The core's own words, for diagnosis.
+    var underlyingMessage: String
+
+    /// A few words for narrow places: the panel's status line, the menu.
+    var title: String {
+        switch category {
+        case .dataDirectoryUnavailable: return "索引数据无法保存"
+        case .diskRead: return "读取磁盘出错"
+        case .indexCorrupt: return "索引数据已损坏"
+        case .indexLimitExceeded: return "索引超出容量上限"
+        case .other: return "索引处理出错"
+        }
+    }
+
+    /// What happened, in one sentence.
+    var meaning: String {
+        switch category {
+        case .dataDirectoryUnavailable:
+            return "索引数据没法保存，可能是磁盘空间不足、索引数据文件夹没有写入权限，或者它所在的磁盘是只读的。"
+        case .diskRead:
+            return "读取磁盘时出错，磁盘可能已断开、正在休眠或暂时无法访问。"
+        case .indexCorrupt:
+            return "索引数据已损坏，搜索结果可能不全或不准。"
+        case .indexLimitExceeded:
+            return "要收录的项目超过了这个版本的索引能保存的上限，新的变化暂时没有记下来，已有的索引仍可搜索。"
+        case .other:
+            return "索引处理时出现了意外错误。"
+        }
+    }
+
+    /// What to do about it, in one sentence, pointing at the button that
+    /// helps where the explanation is shown.
+    func remedy(_ context: Context) -> String {
+        let action: String
+        switch context {
+        case .launch: action = "点“重试”"
+        case .index: action = "点下方的“立即重建索引…”"
+        case .volume: action = "在这块磁盘的“更多操作”里点“重试”"
+        }
+        switch category {
+        case .dataDirectoryUnavailable:
+            return "请腾出磁盘空间或检查索引数据文件夹的权限，然后\(action)。"
+        case .diskRead:
+            return "请确认磁盘连接正常、能在访达里打开，然后\(action)。"
+        case .indexCorrupt:
+            return context == .volume ? "请\(action)，会重新扫描这块磁盘。" : "请\(action)，从头建立索引。"
+        case .indexLimitExceeded:
+            switch context {
+            case .launch: return "请\(action)；如果仍然出现，请把括号里的原始信息反馈给开发者。"
+            case .index: return "可以在“设置 › 搜索范围”里关掉不需要搜索的其他磁盘，然后\(action)。"
+            case .volume: return "可以关掉不需要搜索的其他磁盘，然后\(action)。"
+            }
+        case .other:
+            return "请\(action)；如果反复出现，请把括号里的原始信息反馈给开发者。"
+        }
+    }
+
+    /// The whole explanation: meaning, remedy, the core's words in brackets.
+    func text(_ context: Context) -> String {
+        let raw = underlyingMessage.isEmpty ? "" : "（原始信息：\(underlyingMessage)）"
+        let lead = context == .launch ? "无法启动搜索：" : ""
+        return lead + meaning + remedy(context) + raw
+    }
 }
 
 protocol SearchService: AnyObject {
@@ -199,15 +325,28 @@ protocol SearchService: AnyObject {
     var onStatusChange: ((IndexStatus) -> Void)? { get set }
     var onIndexChange: (() -> Void)? { get set }
     func recheckAccess()
+    /// Reads every folder again. Also the way out of `.failed`: the core
+    /// then drops what it cannot continue from and starts afresh.
     func rebuild()
+    /// The core's own index folder, the one place left out of the search;
+    /// nil when it lies outside what is indexed anyway.
+    var indexDataDirectoryExclusion: String? { get }
 
     // Attached volumes.
 
     /// Whether a volume attached for the first time is added to the search
     /// by itself. Volumes already known keep their own choice.
     var includesNewExternalVolumes: Bool { get set }
-    /// Every known attached volume, including ones not attached right now.
+    /// Every known volume besides the startup disk, including ones not
+    /// attached right now and other partitions of the built-in disk.
     var externalVolumes: [ExternalVolume] { get }
+    /// Volumes attached now that are not searched and cannot be added,
+    /// such as disk images and network volumes.
+    var unindexedMountedVolumes: [UnindexedVolume] { get }
+    /// Scans a failed volume again. `completion`, on the main thread, gets
+    /// false when the core refused: the volume is detached, left out, no
+    /// longer failed, or being removed.
+    func retryExternalVolume(_ id: String, completion: @escaping (Bool) -> Void)
     /// Turning a volume off stops its scan and takes its files out of the
     /// results; what was indexed stays until `removeExternalVolumeData`.
     func setExternalVolume(_ id: String, included: Bool)
@@ -249,19 +388,19 @@ struct ExternalVolumeSettingsError: Equatable {
         let meaning: String
         switch category {
         case .readSettings:
-            meaning = "读不到外接磁盘的设置，暂时按默认设置处理；这次运行期间的更改在重新打开软件后会失效。"
+            meaning = "读不到“其他磁盘”的设置，暂时按默认设置处理；这次运行期间的更改在重新打开软件后会失效。"
         case .invalidSettings:
-            meaning = "外接磁盘的设置文件已损坏，已改用默认设置（原文件另存了一份）；请重新选择要加入搜索的磁盘。"
+            meaning = "“其他磁盘”的设置文件已损坏，已改用默认设置（原文件另存了一份）；请重新选择要加入搜索的磁盘。"
         case .backupSettings:
-            meaning = "外接磁盘的设置文件已损坏，且没能另存原文件；暂时按默认设置处理，这次运行期间的更改在重新打开软件后会失效。"
+            meaning = "“其他磁盘”的设置文件已损坏，且没能另存原文件；暂时按默认设置处理，这次运行期间的更改在重新打开软件后会失效。"
         case .writeSettings:
-            meaning = "外接磁盘的设置没能保存，刚才的更改在重新打开软件后可能失效。"
+            meaning = "“其他磁盘”的设置没能保存，刚才的更改在重新打开软件后可能失效。"
         case .inspectIndex:
-            meaning = "读不到部分外接磁盘已收录的数据，这些磁盘暂时无法显示保留的项目数。"
+            meaning = "读不到部分磁盘已收录的数据，这些磁盘暂时无法显示保留的项目数。"
         case .verifyIdentity:
-            meaning = "无法确认一块外接磁盘的身份，暂时没有搜索它；重新插入后会再试。"
+            meaning = "无法确认一块磁盘的身份，暂时没有搜索它；重新接入后会再试。"
         case .removeIndex:
-            meaning = "删除外接磁盘已收录的数据时出错，数据仍然保留，下次打开软件时会再试一次。"
+            meaning = "删除磁盘已收录的数据时出错，数据仍然保留，下次打开软件时会再试一次。"
         case .forgetOnline:
             meaning = "这块磁盘现在已连接，不能从列表中移除；请先推出磁盘再试。"
         case .forgetNotFound:
@@ -275,7 +414,27 @@ struct ExternalVolumeSettingsError: Equatable {
 
 extension ExternalVolume {
     /// The name shown to the user.
-    var title: String { nameIsPlaceholder ? "外接磁盘 \(name)" : name }
+    var title: String { nameIsPlaceholder ? "磁盘 \(name)" : name }
+
+    /// Added to the state line of a volume that cannot be remembered.
+    static let manualInclusionNote = "这块磁盘无法被记住，每次接入需要手动加入"
+
+    /// The longer word on a volume that cannot be remembered, for its tool tip.
+    static let manualInclusionHelp = "这块磁盘没有稳定的标识，软件无法认出下次接入的是不是同一块盘：拔出后它会从列表中消失，再接入时需要重新手动打开开关，“自动把新接入的磁盘加入搜索”对它不起作用。"
+
+    /// More about the row than fits on it: why it failed, why it is not
+    /// remembered. Nil when there is nothing to add.
+    var help: String? {
+        var parts: [String] = []
+        if progress == .failed, isIncluded, isOnline {
+            parts.append(failure?.text(.volume) ?? "这块磁盘的扫描出错，结果可能不全。请在这块磁盘的“更多操作”里点“重试”。")
+        }
+        if requiresManualInclusion { parts.append(Self.manualInclusionHelp) }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    /// Whether the state line reports an error.
+    var showsFailure: Bool { progress == .failed && isOnline && isIncluded && !isRemoving }
 
     /// “exFAT · 1 TB”, or nil when neither is known.
     var detail: String? {
@@ -310,6 +469,11 @@ extension ExternalVolume {
 
     /// The state line under the volume's name.
     var stateLine: String {
+        guard requiresManualInclusion, !isRemoving else { return baseStateLine }
+        return "\(baseStateLine) · \(Self.manualInclusionNote)"
+    }
+
+    private var baseStateLine: String {
         if isRemoving { return "正在移除…" }
         if !isOnline {
             return keptCount.map { "未连接，保留 \(formattedCount($0)) 个已收录项目" } ?? "未连接"
@@ -325,6 +489,9 @@ extension ExternalVolume {
             return keptCount.map { "正在恢复上次收录的 \(formattedCount($0)) 个项目" } ?? "正在恢复上次收录的内容"
         case .scanning:
             return indexedCount > 0 ? "正在扫描，已收录 \(formattedCount(indexedCount)) 个" : "正在扫描"
+        case .failed:
+            // What was indexed before the error can still be searched.
+            return indexedCount > 0 ? "扫描中断，只收录了 \(formattedCount(indexedCount)) 个项目" : "扫描中断，还没有收录项目"
         case .idle:
             if indexedCount > 0 { return "已加入，共 \(formattedCount(indexedCount)) 个项目" }
             // Just attached or just switched on: kept entries are about to be

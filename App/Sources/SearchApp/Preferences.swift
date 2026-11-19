@@ -35,10 +35,17 @@ extension IndexStatus {
         case .recovering: return "正在更新索引，共 \(count) 个项目"
         case .supplementing(let name, let indexed, let restoring):
             return IndexPhase.supplementingLine(name, indexed, restoring: restoring)
-        case .degraded(let reason): return reason
+        case .failed(let failure): return "索引出错：" + failure.text(.index)
         case .waitingForSetup: return IndexPhase.waitingLine
         case .unavailable(let reason): return reason
         }
+    }
+
+    /// The menu's status line: as `summary`, but an index error only by its
+    /// title, the explanation being one click away in the settings.
+    var menuLine: String {
+        if case .failed(let failure) = phase { return "\(failure.title)，结果可能不全" }
+        return summary
     }
 
     var isBusy: Bool {
@@ -63,6 +70,12 @@ extension IndexPhase {
     var isUnavailable: Bool {
         if case .unavailable = self { return true }
         return false
+    }
+
+    /// The running index stopped with an error.
+    var failure: IndexFailure? {
+        if case .failed(let failure) = self { return failure }
+        return nil
     }
 
     /// "正在补充 <名称>，已收录 <数量> 个", written like the first build's

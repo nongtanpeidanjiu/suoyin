@@ -37,8 +37,8 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
 
     // Volumes step.
     private let leaveOut = NSButton(radioButtonWithTitle: "不自动加入，需要时在设置里手动加入", target: nil, action: nil)
-    private let addNew = NSButton(radioButtonWithTitle: "自动加入新插入的外接磁盘", target: nil, action: nil)
-    private let attachedHeading = NSTextField(labelWithString: "当前接入的外接磁盘：")
+    private let addNew = NSButton(radioButtonWithTitle: "自动加入新接入的磁盘", target: nil, action: nil)
+    private let attachedHeading = NSTextField(labelWithString: "当前接入的其他磁盘：")
     private let attachedList = ExternalVolumeList(width: SetupGuideController.bodyWidth, maxRows: 2, emptyText: "")
     private let volumesError = NSTextField(wrappingLabelWithString: "")
 
@@ -254,9 +254,9 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         leaveOut.action = #selector(chooseVolumes(_:))
         addNew.target = self
         addNew.action = #selector(chooseVolumes(_:))
-        let leaveOutNote = smallNote("插入时不扫描，不额外占用磁盘和电量。\n想搜某块磁盘时，在“设置 › 搜索范围”里打开它的开关。",
+        let leaveOutNote = smallNote("接入时不扫描，不额外占用磁盘和电量。\n想搜某块磁盘时，在“设置 › 搜索范围”里打开它的开关。",
                                      width: Self.bodyWidth - 20)
-        let addNewNote = smallNote("插上就能搜到上面的文件。\n大容量机械硬盘首次扫描可能需要几十分钟，期间仍可正常搜索。",
+        let addNewNote = smallNote("接入就能搜到上面的文件。\n大容量机械硬盘首次扫描可能需要几十分钟，期间仍可正常搜索。",
                                    width: Self.bodyWidth - 20)
         func option(_ button: NSButton, _ note: NSTextField) -> NSStackView {
             let stack = NSStackView(views: [button, note])
@@ -287,8 +287,8 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         options.setCustomSpacing(6, after: attachedHeading)
         options.setCustomSpacing(8, after: attachedList)
         options.widthAnchor.constraint(equalToConstant: Self.bodyWidth).isActive = true
-        return page(icon: nil, symbol: "externaldrive", title: "外接磁盘",
-                    body: "插入移动硬盘或 U 盘时，要不要自动把它加入搜索？",
+        return page(icon: nil, symbol: "externaldrive", title: "其他磁盘",
+                    body: "接入移动硬盘、U 盘，或者电脑内置硬盘上有其他分区时，要不要自动把它们加入搜索？",
                     below: [options])
     }
 

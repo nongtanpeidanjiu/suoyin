@@ -27,7 +27,29 @@ final class DemoSearchService: SearchService {
 
     func stop() {}
     func recheckAccess() {}
-    func rebuild() { start() }
+    /// Clears the error of `--demo-index-failure`, as a rebuild does in the core.
+    func rebuild() {
+        lock.withLock { indexFailure = nil }
+        start()
+    }
+
+    /// `--demo-index-failure [category]` ends the made-up indexing with an
+    /// error instead of ready, so the error's wording can be looked at;
+    /// “立即重建索引” clears it.
+    private var indexFailure: IndexFailure? = {
+        guard TestHooks.enabled, CommandLine.arguments.contains("--demo-index-failure") else { return nil }
+        let categories: [String: IndexFailure.Category] = [
+            "dataDirectoryUnavailable": .dataDirectoryUnavailable, "diskRead": .diskRead, "indexCorrupt": .indexCorrupt,
+            "indexLimitExceeded": .indexLimitExceeded, "other": .other,
+        ]
+        let category = TestHooks.value(after: "--demo-index-failure").flatMap { categories[$0] } ?? .indexCorrupt
+        return IndexFailure(category: category, underlyingMessage: "SnapshotError.invalid(\"journal checksum mismatch\")")
+    }()
+
+    /// A made-up path: the demo keeps nothing on disk.
+    var indexDataDirectoryExclusion: String? {
+        NSHomeDirectory() + "/Library/Application Support/dev.local.filesearch"
+    }
 
     // MARK: Attached volumes
 
@@ -53,9 +75,41 @@ final class DemoSearchService: SearchService {
         ExternalVolume(id: "demo-old-camera", name: "演示旧相机卡", isOnline: false, isIncluded: false,
                        indexedCount: 0, retainedCount: 0, filesystem: "msdos", capacityBytes: 31_914_983_424,
                        canForget: true),
+        // Its scan stopped with an error; “重试” in its menu starts it again.
+        ExternalVolume(id: "demo-failed", name: "演示出错的硬盘", isOnline: true, isIncluded: true, progress: .failed,
+                       indexedCount: 8_412, retainedCount: 8_412, filesystem: "exfat", capacityBytes: 4_000_787_030_016,
+                       failure: IndexFailure(category: .diskRead,
+                                             underlyingMessage: "ScanError.metadata(path: \"/Volumes/演示出错的硬盘/照片\", code: 5)")),
+        // No stable identifier: listed only while attached, added by hand.
+        ExternalVolume(id: "demo-no-uuid", name: "演示无标识 U 盘", isOnline: true, isIncluded: false,
+                       indexedCount: 0, retainedCount: 0, filesystem: "msdos", capacityBytes: 15_931_539_456,
+                       requiresManualInclusion: true),
     ]
+
+    /// Attached now and not searched: a disk image and a network share.
+    var unindexedMountedVolumes: [UnindexedVolume] {
+        [
+            UnindexedVolume(id: "demo-dmg", name: "演示安装包", kind: .diskImage, reason: .diskImagesDisabled),
+            UnindexedVolume(id: "demo-nas", name: "演示家庭 NAS", kind: .network, reason: .networkUnsupported),
+        ]
+    }
+
+    /// Accepted for a failed volume that is attached and searched, as in
+    /// the core; it then reads its folders again.
+    func retryExternalVolume(_ id: String, completion: @escaping (Bool) -> Void) {
+        forgetError = nil
+        guard let index = volumes.firstIndex(where: { $0.id == id }), volumes[index].canRetry else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        volumes[index].progress = .scanning
+        volumes[index].failure = nil
+        changedVolumes()
+        DispatchQueue.main.async { completion(true) }
+    }
     /// How many entries each volume being read ends up with.
-    private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-portable": 171_500, "demo-stick": 19_340]
+    private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-portable": 171_500, "demo-stick": 19_340,
+                                              "demo-failed": 92_300]
     /// Half-second steps a restore takes before reading new folders.
     private var restoreSteps: [String: Int] = [:]
     private var scanTimer: Timer?
@@ -102,6 +156,7 @@ final class DemoSearchService: SearchService {
             volume.progress = .idle
             volume.indexedCount = 0
         }
+        volume.failure = nil
         volumes[index] = volume
         changedVolumes()
     }
@@ -160,7 +215,7 @@ final class DemoSearchService: SearchService {
             for index in self.volumes.indices {
                 let id = self.volumes[index].id
                 switch self.volumes[index].progress {
-                case .idle: continue
+                case .idle, .failed: continue
                 case .restoring:
                     self.restoreSteps[id, default: 0] += 1
                     if self.restoreSteps[id, default: 0] >= 20 {
@@ -234,7 +289,7 @@ final class DemoSearchService: SearchService {
             publish(loaded, phase: .supplementing(name: Self.sampleVolume, indexed: step * 48_271, restoring: false),
                     contentChanged: false)
         }
-        publish(loaded, phase: .ready)
+        publish(loaded, phase: lock.withLock { indexFailure }.map { .failed($0) } ?? .ready)
     }
 
     /// 12,000 made-up files, enough to page through: search for “样例”.
@@ -259,7 +314,10 @@ final class DemoSearchService: SearchService {
 
     private func publish(_ loaded: [Entry], phase: IndexPhase, contentChanged: Bool = true) {
         var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)
-        if case .ready = phase { Self.addSampleAccessState(to: &snapshot) } else { snapshot.inaccessibleVerified = false }
+        switch phase {
+        case .ready, .failed: Self.addSampleAccessState(to: &snapshot)
+        default: snapshot.inaccessibleVerified = false
+        }
         lock.withLock {
             entries = loaded
             current = snapshot
@@ -344,26 +402,24 @@ final class DemoSearchService: SearchService {
         ]
     }
 
-    /// Answers like the core: one row past the page is looked for, and the
-    /// total is exact only when the matches end within the page.
+    /// Answers like the core: matches are counted to the end of the page,
+    /// or to the count budget (at most 2,000) when that reaches further, and
+    /// one more is looked for. The total is exact only when the matches end
+    /// before that; otherwise it is that count plus one.
     func search(_ request: SearchRequest) -> SearchResponse {
         let terms = queryTerms(request.text)
         guard !terms.isEmpty, request.limit > 0 else { return SearchResponse(hits: [], total: 0, totalIsExact: true) }
         let all = lock.withLock { entries }
+        let countTo = max(request.offset + request.limit, min(request.totalCountBudget ?? 0, 2_000))
         var hits: [SearchHit] = []
         var seen = 0
         for entry in all {
             let haystack = request.scope == .name ? entry.foldedName : entry.foldedPath
             guard Self.matches(entry, request.kind), terms.allSatisfy({ haystack.contains($0) }) else { continue }
-            if seen >= request.offset {
-                if hits.count == request.limit {
-                    return SearchResponse(hits: hits, total: request.offset + hits.count + 1, totalIsExact: false)
-                }
-                hits.append(entry.hit)
-            }
+            if seen >= request.offset && hits.count < request.limit { hits.append(entry.hit) }
             seen += 1
+            if seen > countTo { return SearchResponse(hits: hits, total: seen, totalIsExact: false) }
         }
-        return SearchResponse(hits: hits, total: hits.isEmpty ? 0 : request.offset + hits.count,
-                              totalIsExact: !hits.isEmpty || request.offset == 0)
+        return SearchResponse(hits: hits, total: seen, totalIsExact: true)
     }
 }

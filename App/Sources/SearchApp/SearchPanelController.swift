@@ -658,6 +658,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
                 self.onOpenSettings?()
                 return nil
             }
+            // The field editor never turns Command-Return into a command, so
+            // catch the key itself (Return and keypad Enter).
+            if event.keyCode == 36 || event.keyCode == 76 {
+                guard self.selectedHit != nil else { return event }
+                self.revealSelection()
+                return nil
+            }
             guard event.charactersIgnoringModifiers == "c",
                   (self.field.currentEditor()?.selectedRange.length ?? 0) == 0,
                   self.selectedHit != nil else { return event }

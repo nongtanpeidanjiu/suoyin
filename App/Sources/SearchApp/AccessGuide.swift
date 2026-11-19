@@ -86,7 +86,7 @@ final class AccessGuideController: NSObject, NSWindowDelegate {
         primary.keyEquivalent = "\r"
         primary.controlSize = .large
         primary.bezelStyle = .rounded
-        let later = NSButton(title: "暂不授权", target: self, action: #selector(closeWindow))
+        let later = NSButton(title: "暂不授权", target: self, action: #selector(decline))
         later.controlSize = .large
         later.bezelStyle = .rounded
         let buttons = NSStackView(views: [later, primary])
@@ -134,6 +134,17 @@ final class AccessGuideController: NSObject, NSWindowDelegate {
 
     @objc private func primaryAction() {
         if DiskAccess.isGranted { closeWindow() } else { DiskAccess.openSystemSettings() }
+    }
+
+    /// Declining is remembered: the guide never opens by itself again, so
+    /// say where the switch lives before closing.
+    @objc private func decline() {
+        guard !DiskAccess.isGranted, let window else { closeWindow(); return }
+        let alert = NSAlert()
+        alert.messageText = "好的，不会再主动询问"
+        alert.informativeText = "以后想开启时：右键点菜单栏的搜索图标，选“设置…”，在“搜索范围”里点“前往授权…”。"
+        alert.addButton(withTitle: "知道了")
+        alert.beginSheetModal(for: window) { [weak self] _ in self?.closeWindow() }
     }
 
     @objc private func closeWindow() { window?.close() }

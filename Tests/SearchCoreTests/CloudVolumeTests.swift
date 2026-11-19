@@ -283,9 +283,12 @@ struct CloudVolumeTests {
         let initial = EnginePhase.supplementing(name: "ExampleProvider", indexed: 4)
         let advanced = EnginePhase.supplementing(name: "ExampleProvider", indexed: 5)
         let sawInitial = until { progress.phases.contains(initial) }
-        #expect(engine.status.inaccessibleLocationsVerified)
-        #expect(engine.status.sources.first?.kind == .cloudProvider)
-        #expect(engine.status.sources.first?.inaccessibleLocationsVerified == false)
+        #expect(until {
+            let status = engine.status
+            return status.phase == initial && status.inaccessibleLocationsVerified &&
+                status.sources.first?.kind == .cloudProvider &&
+                status.sources.first?.inaccessibleLocationsVerified == false
+        })
         release.signal()
         #expect(sawInitial)
         #expect(until { progress.phases.contains(advanced) })

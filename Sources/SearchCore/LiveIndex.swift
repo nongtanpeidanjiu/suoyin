@@ -488,6 +488,15 @@ struct LiveIndex {
         prepareDelta()
     }
 
+    mutating func purgeSubtree(_ path: String) {
+        removeSubtree(path, includingRoot: true)
+        if let id = baseID(at: path) { set(nil, path: path, original: id) }
+        for anchor in links?.anchors.keys.filter({ $0 != path && inside($0, path) }) ?? [] {
+            removeSubtree(anchor, includingRoot: true)
+        }
+        state.restricted = state.restricted.filter { !inside($0, path) }
+    }
+
     /// Return children requiring recursive enumeration because their subtree is new.
     mutating func reconcile(path: String, observed: DirectoryObservation, completingCloud: Bool = false) -> [String] {
         if isRestricted(path, includingSelf: false) { return [] }

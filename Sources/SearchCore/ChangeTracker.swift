@@ -33,6 +33,7 @@ public struct TrackingStatus: Codable {
     public var compacting = false
     public var lastCompactionNanoseconds: UInt64 = 0
     public var coverageRestricted: [String] = []
+    public var awaitingFullDiskAccess = false
     public var overlayRows = 0
     public var baseRecords = 0
     public var applying = false
@@ -82,6 +83,9 @@ public final class ChangeTracker {
     private let path: String
     let ownDirectory: String
     let excluded: [String]
+    private let containerAccess: ContainerAccess?
+    private var deferredContainerPaths: [String] = []
+    private var activeExclusions: [String] { excluded + deferredContainerPaths }
     private let update = DispatchQueue(label: "index.change-writer", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var cloud: CloudCompletion?
@@ -92,7 +96,7 @@ public final class ChangeTracker {
     private var externalCancelled = false
     private var directoryEvents = false
     private var pollTimer: DispatchSourceTimer?
-    private var cloudChangedDuringCompaction = false
+    private var compactionNeedsRetry = false
     private var view: LiveSearchView?
     private var publishedCoverage = Set<String>()
     private var status = TrackingStatus()
@@ -131,6 +135,7 @@ public final class ChangeTracker {
     private var engineObserver: ((EngineChange) -> Void)?
     private var lastCloudProvider: String?
     private var manualRebuild = false
+    private var finishingManualRebuild = false
     private var needsReplay: Set<Int> = []
     private var scanBarriers: [Int: ScanBoundary] = [:]
     private let recoveryTiming: RecoveryTiming
@@ -155,7 +160,8 @@ public final class ChangeTracker {
          wallTime: @escaping () -> TimeInterval, recoveryTiming: RecoveryTiming = RecoveryTiming(),
          cloudRoots: CloudRoots? = nil, cloudTiming: CloudCompletion.Timing = .init(),
          cloudReader: CloudCompletion.Reader? = nil, external: ExternalMount? = nil,
-         externalPersistence: Bool = true, discoverExternal: Bool = true) throws {
+         externalPersistence: Bool = true, discoverExternal: Bool = true,
+         containerAccess: ContainerAccess? = nil, onAccess: ((String) -> Void)? = nil) throws {
         self.wallTime = wallTime
         self.external = external
         self.externalPersistence = externalPersistence
@@ -168,8 +174,9 @@ public final class ChangeTracker {
         self.path = snapshot
         ownDirectory = try Self.canonicalPath(ownData)
         mounts = root == "/" && discoverExternal ? ExternalVolumes(directory: ownDirectory) : nil
-        let walk = try WalkScope(root: root, clouds: cloudRoots)
+        let walk = try WalkScope(root: root, clouds: cloudRoots, onAccess: onAccess)
         scope = walk
+        self.containerAccess = containerAccess ?? (root == "/" ? ContainerAccess(home: NSHomeDirectory()) : nil)
         excluded = Array(walk.privateScratch.filter { !inside(root, $0) }) +
             [ownDirectory].filter { !inside(root, $0) }
         identities = try external.map { [$0.identity] } ??
@@ -219,8 +226,12 @@ public final class ChangeTracker {
         mounts?.engineObserver = observer
     }
 
-    func engineExternalStates() -> [(name: String, status: TrackingStatus)] {
-        (mounts?.searchable() ?? []).map { ($0.mount.name, $0.tracker.snapshotStatus()) }
+    func engineExternalStates() -> [(name: String, root: String, status: TrackingStatus)] {
+        (mounts?.searchable() ?? []).map { ($0.mount.name, $0.mount.identity.mount, $0.tracker.snapshotStatus()) }
+    }
+
+    var engineCoverageRoots: [String] {
+        (scope.wholeDisk ? [NSHomeDirectory()] : [root]) + [scope.clouds.storage, scope.clouds.iCloud].compactMap { $0 }
     }
 
     func engineCloudProvider() -> String? { lock.withLock { lastCloudProvider } }
@@ -342,6 +353,7 @@ public final class ChangeTracker {
     }
 
     private func bootstrap() throws {
+        refreshContainerAccess()
         var loaded: SearchIndex?
         var reason = "missing"
         do {
@@ -416,10 +428,16 @@ public final class ChangeTracker {
             })
             durableImage = validated.journalImage(at: savedPositions)
             lock.withLock { status.durableEvents = savedPositions }
-            let scopes = Set(scope.protectedStartupRoots).union(validated.state.restricted).sorted()
+            let containerRoots = containerAccess?.roots ?? []
+            let exclusions = activeExclusions
+            for folder in deferredContainerPaths { validated.purgeSubtree(folder) }
+            let accessibleContainers = deferredContainerPaths.isEmpty ? containerRoots : []
+            let scopes = Set(scope.protectedStartupRoots + accessibleContainers)
+                .union(validated.state.restricted).sorted()
             reopened = validated.verifyStartupCoverage(at: scopes) { folder in
-                try? scope.observe(folder, inherited: 0, excluding: excluded)
+                try? scope.observe(folder, inherited: 0, excluding: exclusions)
             }
+            reopened += accessibleContainers.filter { validated.entry(at: $0) == nil }.map(parentPath)
             if let cloud {
                 validated.purgeProviderTrash(in: scope.clouds)
                 let pending = validated.pendingCloudDirectories(in: scope.clouds)
@@ -623,6 +641,7 @@ public final class ChangeTracker {
         var crossed = Set<Int>()
         var late: UInt64 = 0
         var maximum: UInt64 = 0
+        let exclusions = activeExclusions
 
         func mark(_ path: String, event: VolumeEvent, volume: Int, recursive: Bool? = nil,
                   file: String? = nil, metadata: Bool = false) {
@@ -655,7 +674,7 @@ public final class ChangeTracker {
                     continue
                 }
                 if scanBarriers[volume]?.covered(by: event, at: path) == true { crossed.insert(volume) }
-                if excluded.contains(where: { inside(path, $0) }) || scope.insideProviderTrash(path) { continue }
+                if exclusions.contains(where: { inside(path, $0) }) || scope.insideProviderTrash(path) { continue }
                 guard inside(path, root) else {
                     if event.recursive && inside(root, path) { mark(root, event: event, volume: volume, recursive: true) }
                     continue
@@ -770,6 +789,7 @@ public final class ChangeTracker {
                 var direct: UInt64 = 0
                 var directDirectories: UInt64 = 0
                 for (path, structural) in files {
+                    if deferredContainerPaths.contains(where: { inside(path, $0) }) { continue }
                     let parent = parentPath(path)
                     fileContents.observed(path, at: now)
                     if work[parent] != nil { continue }
@@ -782,6 +802,7 @@ public final class ChangeTracker {
                     }
                 }
                 for folder in metadata where work[folder] == nil {
+                    if deferredContainerPaths.contains(where: { inside(folder, $0) }) { continue }
                     let verifyAccess = directoriesToVerify.contains(folder)
                     if folder == root && !verifyAccess { continue }
                     if updated.refreshDirectory(folder, observation: { scope.observeEntry(folder, inherited: $0, verifyAccess: verifyAccess) }) {
@@ -860,6 +881,7 @@ public final class ChangeTracker {
     }
 
     private func reconcile(_ initial: [String: Bool], in index: inout LiveIndex) throws {
+        let exclusions = activeExclusions
         var work = initial
         var visited: Set<String> = []
         var ordered = work.keys.sorted { $0.count == $1.count ? $0 < $1 : $0.count < $1.count }
@@ -871,13 +893,13 @@ public final class ChangeTracker {
             if detached { throw CancellationError() }
             let folder = ordered[position]
             position += 1
-            guard inside(folder, root), !excluded.contains(where: { inside(folder, $0) }),
+            guard inside(folder, root), !exclusions.contains(where: { inside(folder, $0) }),
                   visited.insert(folder).inserted else { continue }
             let inherited = index.entry(at: folder)?.attribute ?? 0
             observedDirectories += 1
             let inCloud = scope.clouds.provider(containing: folder) != nil
             let observed: DirectoryObservation
-            do { observed = try scope.observe(folder, inherited: inherited, excluding: excluded) }
+            do { observed = try scope.observe(folder, inherited: inherited, excluding: exclusions) }
             catch where inCloud { observed = .pending(dataless: false) }
             var more = index.reconcile(path: folder, observed: observed)
             if inCloud {
@@ -942,7 +964,7 @@ public final class ChangeTracker {
         }
         revised.prepareDelta()
         publish(revised, changed: true)
-        if duringCompaction != nil { cloudChangedDuringCompaction = true }
+        if duringCompaction != nil { compactionNeedsRetry = true }
         scheduleSave()
         return true
     }
@@ -1015,21 +1037,24 @@ public final class ChangeTracker {
     private func recoverWhenReady() {
         guard !closed, !detached, !paused, !recoveryInProgress, duringCompaction == nil,
               snapshotStatus().error == nil else { return }
-        drain()
+        // A manual scan covers every volume. Retiring the old streams and
+        // scanning replaces their queued work without replaying it first.
+        if !manualRebuild { drain() }
         guard snapshotStatus().error == nil else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         let manual = manualRebuild
         let due = manual ? Set(pendingRecovery.keys) : Set(recoveryDeadlines().filter { $0.value <= now }.keys)
         if !due.isEmpty {
             manualRebuild = false
-            do { try recover(due, reason: manual ? "manual-rebuild" : "history-invalid") }
+            do { try recover(due, reason: manual ? "manual-rebuild" : "history-invalid", manual: manual) }
             catch { fail(error) }
         }
         scheduleRecovery()
     }
 
-    private func recover(_ affected: Set<Int>, reason: String) throws {
+    private func recover(_ affected: Set<Int>, reason: String, manual: Bool = false) throws {
         recoveryInProgress = true
+        finishingManualRebuild = manual
         cloud?.setEnabled(false)
         defer {
             recoveryInProgress = false
@@ -1056,7 +1081,7 @@ public final class ChangeTracker {
             if external != nil || !identities[i].readOnly { try watch(i) }
         }
         let start = DispatchTime.now().uptimeNanoseconds
-        lastRecoveryStart = start
+        if !manual { lastRecoveryStart = start }
         lock.withLock {
             receivingRecovery = true
             status.indexReconciling = true
@@ -1075,7 +1100,9 @@ public final class ChangeTracker {
             status.lastRecoveryNanoseconds = end - start
         }
         drain()
-        for i in affected where pendingRecovery[i] != nil { pendingRecovery[i] = end }
+        if !manual {
+            for i in affected where pendingRecovery[i] != nil { pendingRecovery[i] = end }
+        }
         recoveryInProgress = false
         scheduleRecovery()
         if !pendingRecovery.isEmpty, snapshotStatus().error == nil { note("recovery-pending") }
@@ -1090,6 +1117,7 @@ public final class ChangeTracker {
             status.compacting = false
         }
         note("scan-start")
+        let exclusions = Set(activeExclusions)
         var index: SearchIndex
         if !initial, root == "/", !affected.contains(0), current != nil {
             let sealed = sealedVolume(from: current!.base, excluding: scope.dataVolumeRoots)
@@ -1097,11 +1125,11 @@ public final class ChangeTracker {
             // release its directory lookup structures during enumeration.
             current = nil
             dm_release_allocator_cache()
-            index = try SearchIndex.scanDataVolume(keeping: consume sealed, excluding: Set(excluded))
+            index = try SearchIndex.scanDataVolume(scope: scope, keeping: consume sealed, excluding: exclusions)
         } else {
             var lastPartial: Double = 0
             index = try SearchIndex.scanForTracking(scope: scope, workers: external == nil ? 4 : 1,
-                                                    excluding: Set(excluded), cancelled: { self.detached }) {
+                                                    excluding: exclusions, cancelled: { self.detached }) {
                 mark, partial in
                 if initial && (mark.phase == "partial" || mark.phase == "local_complete" ||
                                mark.phase == "batch" && mark.seconds >= lastPartial + 0.5) {
@@ -1127,9 +1155,25 @@ public final class ChangeTracker {
     private var recoveryUnresolved: Bool { recoveryInProgress || !pendingRecovery.isEmpty }
 
     private func finishReplayIfReady() {
-        guard !closed, !detached, snapshotStatus().error == nil, !paused, inboxEmpty else { return }
+        guard !closed, !detached, snapshotStatus().error == nil, !paused,
+              finishingManualRebuild || inboxEmpty else { return }
         needsReplay = needsReplay.filter { !cursors[$0].historyDelivered }
         guard needsReplay.isEmpty, scanBarriers.isEmpty, !recoveryUnresolved else { return }
+        // A manual rebuild is searchable once its scan and event boundary have
+        // been applied. Ordinary later changes and persistence keep their
+        // existing schedules and safe checkpoint rules.
+        if finishingManualRebuild {
+            let finished = lock.withLock {
+                guard invalidations.isEmpty else { return false }
+                status.indexReconciling = false
+                return true
+            }
+            if finished {
+                finishingManualRebuild = false
+                engineObserver?(.status)
+            }
+            guard inboxEmpty else { return }
+        }
         let reconciling = snapshotStatus().indexReconciling
         if needsBaseWrite || reconciling {
             guard directories.count == 0, fileContents.count == 0 else { return }
@@ -1341,7 +1385,7 @@ public final class ChangeTracker {
         let token = compactionToken
         let started = DispatchTime.now().uptimeNanoseconds
         duringCompaction = [:]
-        cloudChangedDuringCompaction = false
+        compactionNeedsRetry = false
         lock.withLock { status.compacting = true }
         compactor.async { [weak self] in
             let base = original.compacted()
@@ -1349,7 +1393,7 @@ public final class ChangeTracker {
             self.update.async {
                 guard !self.closed, self.compactionToken == token, let work = self.duringCompaction else { return }
                 self.duringCompaction = nil
-                if self.cloudChangedDuringCompaction || self.recoveryUnresolved || !self.lock.withLock({ self.invalidations.isEmpty }) {
+                if self.compactionNeedsRetry || self.recoveryUnresolved || !self.lock.withLock({ self.invalidations.isEmpty }) {
                     self.lock.withLock { self.status.compacting = false }
                     // Schedule after this closure releases its candidate base.
                     self.update.async {
@@ -1407,9 +1451,39 @@ public final class ChangeTracker {
         }
     }
 
+    private func refreshContainerAccess() {
+        guard let containerAccess else { return }
+        let blocked = !containerAccess.hasFullDiskAccess()
+        deferredContainerPaths = blocked ? containerAccess.paths(includeDataAliases: scope.wholeDisk) : []
+        let changed = lock.withLock {
+            let changed = status.awaitingFullDiskAccess != blocked
+            status.awaitingFullDiskAccess = blocked
+            return changed
+        }
+        if changed { engineObserver?(.status) }
+    }
+
+    private func purgeDeferredContainers() {
+        guard !deferredContainerPaths.isEmpty, var index = current else { return }
+        let before = index.rowRevision
+        for folder in deferredContainerPaths { index.purgeSubtree(folder) }
+        index.prepareDelta()
+        if duringCompaction != nil { compactionNeedsRetry = true }
+        publish(index, changed: true, engineRowsChanged: index.rowRevision != before)
+        scheduleSave()
+    }
+
     func recheckEngineAccess() {
         update.async {
+            guard !self.closed, !self.detached else { return }
             do {
+                let wasDeferred = !self.deferredContainerPaths.isEmpty
+                self.refreshContainerAccess()
+                let isDeferred = !self.deferredContainerPaths.isEmpty
+                if !wasDeferred && isDeferred { self.purgeDeferredContainers() }
+                if wasDeferred && !isDeferred, let access = self.containerAccess {
+                    try self.applyCoverage(at: access.roots.map(parentPath))
+                }
                 try self.applyCoverage(at: self.snapshotStatus().coverageRestricted, recursive: true)
                 self.cloud?.retry()
             } catch { self.fail(error) }
@@ -1420,6 +1494,9 @@ public final class ChangeTracker {
     func rebuildForEngine() {
         update.async {
             guard !self.closed, !self.detached, !self.cursors.isEmpty else { return }
+            let wasDeferred = !self.deferredContainerPaths.isEmpty
+            self.refreshContainerAccess()
+            if !wasDeferred { self.purgeDeferredContainers() }
             self.lock.withLock { self.status.error = nil }
             self.manualRebuild = true
             let now = DispatchTime.now().uptimeNanoseconds

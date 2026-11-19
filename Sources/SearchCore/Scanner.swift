@@ -119,9 +119,11 @@ struct WalkScope {
     let homeLibrary: String
     let homeCaches: String
     let wholeDisk: Bool
+    let onAccess: ((String) -> Void)?
 
-    init(root: String, clouds: CloudRoots? = nil) throws {
+    init(root: String, clouds: CloudRoots? = nil, onAccess: ((String) -> Void)? = nil) throws {
         self.root = root
+        self.onAccess = onAccess
         wholeDisk = root == "/"
         primaryDevice = try Self.device(root)
         dataDevice = wholeDisk ? try Self.device(dataRoot) : primaryDevice
@@ -282,8 +284,9 @@ private final class ScanSession {
             let batch = DirectoryBatch()
             var delta = DMCounts()
             let code = readDirectory {
-                dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
-                        collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &delta)
+                scope.onAccess?(job.path)
+                return dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
+                               collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &delta)
             }
             condition.lock()
             counts.denied += delta.denied
@@ -401,9 +404,10 @@ extension SearchIndex {
                  cancelled: cancelled, onProgress: onProgress)
     }
 
-    static func scanDataVolume(keeping sealed: consuming SearchIndex, excluding paths: Set<String>) throws -> SearchIndex {
-        try scan(root: "/", workers: 4, ordinary: false, establishListener: false,
-                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, onProgress: { _, _ in })
+    static func scanDataVolume(scope: WalkScope, keeping sealed: consuming SearchIndex,
+                               excluding paths: Set<String>) throws -> SearchIndex {
+        try scan(root: scope.root, workers: 4, ordinary: false, establishListener: false,
+                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, scope: scope, onProgress: { _, _ in })
     }
 
     private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,
@@ -449,8 +453,7 @@ extension WalkScope {
         return [
             "/Desktop", "/Documents", "/Downloads", "/Library/Mail", "/Library/Messages",
             "/Library/Calendars", "/Library/Safari", "/Library/CloudStorage",
-            "/Library/Mobile Documents", "/Library/Application Support/AddressBook",
-            "/Library/Containers/com.apple.Home"
+            "/Library/Mobile Documents", "/Library/Application Support/AddressBook"
         ].map { home + $0 }
     }
 
@@ -472,6 +475,7 @@ extension WalkScope {
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String],
                  loadCloud: Bool = false) throws -> DirectoryObservation {
         guard !insideProviderTrash(path), !excluded.contains(where: { inside(path, $0) }) else { return .absent }
+        onAccess?(path)
         if let provider = clouds.provider(containing: path) {
             // Avoid walking through an unloaded ancestor to inspect its child.
             var ancestors: [String] = [path]
@@ -556,6 +560,7 @@ extension WalkScope {
     // Reconcile those paths using the guarded directory reader.
     func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false) -> EntryObservation {
         guard clouds.provider(containing: path) == nil else { return .unverified }
+        onAccess?(path)
         var info = stat()
         if Self.metadata(path, &info) != 0 {
             return errno == ENOENT ? .missing : .unverified

@@ -22,6 +22,7 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
     var result: [String: Any] = [
         "indexedCount": status.indexedCount,
         "inaccessiblePaths": status.inaccessiblePaths,
+        "awaitingFullDiskAccess": status.awaitingFullDiskAccess,
         "indexBytesOnDisk": status.indexBytesOnDisk
     ]
     switch status.phase {

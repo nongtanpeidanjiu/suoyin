@@ -60,6 +60,7 @@ public struct TrackingStatus: Codable {
     public var directFilesObserved: UInt64 = 0
     public var directDirectoriesObserved: UInt64 = 0
     public var error: String?
+    public var externalScan: ExternalScanStatistics?
 }
 
 public struct ApplyInterval: Codable {
@@ -82,6 +83,8 @@ struct EngineTrackerState {
     let indexed: Int
     let accessChecked: Bool
     let cloudProgress: (name: String, indexed: Int)?
+    let cloudEntries: [String: Int]
+    let pendingProviders: Set<String>
 }
 
 /// Work and persistence are serialized on one queue. Queries capture a value
@@ -102,10 +105,12 @@ public final class ChangeTracker {
     private let mounts: ExternalVolumes?
     private let external: ExternalMount?
     private let externalPersistence: Bool
+    private let externalScanLog: String?
     var onExternalIdentityChange: (() -> Void)?
     private var externalCancelled = false
     private var directoryEvents = false
     private var pollTimer: DispatchSourceTimer?
+    private var needsVolumePolling = false
     private var compactionNeedsRetry = false
     private var view: LiveSearchView?
     private var publishedCoverage = Set<String>()
@@ -145,6 +150,7 @@ public final class ChangeTracker {
     private var engineObserver: ((EngineChange) -> Void)?
     private var cloudProvider: String?
     private var cloudEntryCounts: [String: Int] = [:]
+    private var pendingProviders = Set<String>()
     private var pendingAccessChecks = 0
     private var accessBootstrapComplete = false
     private var manualRebuild = false
@@ -173,12 +179,14 @@ public final class ChangeTracker {
          wallTime: @escaping () -> TimeInterval, recoveryTiming: RecoveryTiming = RecoveryTiming(),
          cloudRoots: CloudRoots? = nil, cloudTiming: CloudCompletion.Timing = .init(),
          cloudReader: CloudCompletion.Reader? = nil, external: ExternalMount? = nil,
-         externalPersistence: Bool = true, discoverExternal: Bool = true,
+         externalPersistence: Bool = true, discoverExternal: Bool = true, externalScanLog: String? = nil,
+         externalVolumes: ExternalVolumes? = nil,
          containerAccess: ContainerAccess? = nil, onAccess: ((String) -> Void)? = nil,
          accessObservation: ((String) -> DirectoryObservation?)? = nil) throws {
         self.wallTime = wallTime
         self.external = external
         self.externalPersistence = externalPersistence
+        self.externalScanLog = externalScanLog
         directoryEvents = external.map { !$0.fileEvents } ?? false
         status.slowVolume = directoryEvents
         self.recoveryTiming = recoveryTiming
@@ -187,7 +195,7 @@ public final class ChangeTracker {
         self.root = root
         self.path = snapshot
         ownDirectory = try Self.canonicalPath(ownData)
-        mounts = root == "/" && discoverExternal ? ExternalVolumes(directory: ownDirectory) : nil
+        mounts = externalVolumes ?? (root == "/" && discoverExternal ? ExternalVolumes(directory: ownDirectory) : nil)
         let walk = try WalkScope(root: root, clouds: cloudRoots, onAccess: onAccess)
         scope = walk
         self.containerAccess = containerAccess ?? (root == "/" ? ContainerAccess(home: NSHomeDirectory()) : nil)
@@ -207,12 +215,14 @@ public final class ChangeTracker {
             queue.changed = { [weak self, weak queue] value in
                 guard let self, let queue else { return }
                 let provider = queue.selectedProvider
+                let pendingProviders = queue.pendingProviders
                 let changed = self.lock.withLock {
-                    let previous = self.status.cloud
                     let previousProvider = self.cloudProvider
+                    let oldPending = self.pendingProviders
                     self.status.cloud = value
                     self.cloudProvider = provider
-                    return (previous.pending == 0) != (value.pending == 0) || previousProvider != provider
+                    self.pendingProviders = pendingProviders
+                    return previousProvider != provider || oldPending != pendingProviders
                 }
                 if changed { self.engineObserver?(.status) }
             }
@@ -231,7 +241,9 @@ public final class ChangeTracker {
     public func start(onPhase: @escaping (String) -> Void = { _ in }) {
         update.async {
             self.observer = onPhase
-            do { try self.bootstrap() } catch { self.fail(error) }
+            do { try self.bootstrap() }
+            catch is CancellationError where self.detached {}
+            catch { self.fail(error) }
         }
     }
 
@@ -247,15 +259,16 @@ public final class ChangeTracker {
             return EngineTrackerState(status: status, indexed: view?.entryCount ?? 0,
                                       accessChecked: accessBootstrapComplete && status.phase == "caught-up" && !status.indexReconciling &&
                                           status.error == nil && pendingAccessChecks == 0,
-                                      cloudProgress: progress)
+                                      cloudProgress: progress, cloudEntries: cloudEntryCounts,
+                                      pendingProviders: pendingProviders)
         }
     }
 
-    func engineExternalStates() -> (discovered: Bool, volumes: [(name: String, state: EngineTrackerState)]) {
-        guard let mounts else { return (true, []) }
-        let attached = mounts.engineMounts()
-        return (attached.discovered, attached.volumes.map { ($0.mount.name, $0.tracker.engineState()) })
+    func engineExternalStates() -> [(id: String, name: String, state: EngineTrackerState)] {
+        (mounts?.searchable() ?? []).map { ($0.key, $0.mount.name, $0.tracker.engineState()) }
     }
+
+    func cloudProvider(containing path: String) -> String? { scope.clouds.provider(containing: path) }
 
     func recordEngineFailure(_ message: String) {
         lock.withLock {
@@ -283,6 +296,15 @@ public final class ChangeTracker {
         lock.withLock { externalCancelled = true; view = nil }
     }
 
+    func cancelUnfinishedExternalScan() {
+        lock.withLock {
+            if status.phase != "caught-up" {
+                externalCancelled = true
+                view = nil
+            }
+        }
+    }
+
     private var detached: Bool { external != nil && lock.withLock { externalCancelled } }
 
 
@@ -308,6 +330,8 @@ public final class ChangeTracker {
     }
 
     private func fail(_ error: Error) {
+        pollTimer?.cancel()
+        pollTimer = nil
         lock.withLock { status.error = String(describing: error) }
         note("error")
     }
@@ -336,13 +360,25 @@ public final class ChangeTracker {
                 return row
             })
         }
-        let rows = groups.enumerated().flatMap { group, rows in rows.map { (group, $0) } }.sorted { lhs, rhs in
-            let order = compareAcross(lhs.1, rhs.1, column: column)
-            return order == 0 ? lhs.0 < rhs.0 : (direction == .ascending ? order < 0 : order > 0)
-        }
         let present = [true] + volumes.map { mounts?.isCurrent($0) == true }
-        return rows.lazy.filter { present[$0.0] }
-            .dropFirst(offset).prefix(limit).map { $0.1 }
+        var heads = [Int](repeating: 0, count: groups.count)
+        var result: [SearchRow] = []
+        for position in 0..<capacity {
+            var first: Int?
+            for source in groups.indices where present[source] && heads[source] < groups[source].count {
+                if let selected = first {
+                    let order = compareAcross(groups[source][heads[source]], groups[selected][heads[selected]],
+                                              column: column)
+                    if direction == .ascending ? order < 0 : order > 0 { first = source }
+                } else {
+                    first = source
+                }
+            }
+            guard let source = first else { break }
+            if position >= offset { result.append(groups[source][heads[source]]) }
+            heads[source] += 1
+        }
+        return result
     }
 
     private func publish(_ index: LiveIndex, changed: Bool, engineRowsChanged: Bool = true) {
@@ -382,7 +418,7 @@ public final class ChangeTracker {
     private func bootstrap() throws {
         refreshContainerAccess()
         var loaded: SearchIndex?
-        var reason = "missing"
+        var reason = externalScanLog == nil ? "missing" : "directory-scan-log"
         do {
             guard !detached else { return }
             if !externalPersistence {
@@ -551,9 +587,7 @@ public final class ChangeTracker {
             cursors[volume] = newCursor(for: identities[volume])
             sources[volume] = try? open(nil, fileEvents: false)
         }
-        if external != nil, sources[volume] == nil || directoryEvents && identities[volume].log == nil {
-            startVolumePolling()
-        }
+        needsVolumePolling = external != nil && (sources[volume] == nil || directoryEvents && identities[volume].log == nil)
     }
 
     private func startVolumePolling() {
@@ -1178,9 +1212,20 @@ public final class ChangeTracker {
             index = try SearchIndex.scanDataVolume(scope: scope, keeping: consume sealed, excluding: exclusions)
         } else {
             var lastPartial: Double = 0
-            index = try SearchIndex.scanForTracking(scope: scope, workers: external == nil ? 4 : 1,
-                                                    excluding: exclusions, cancelled: { self.detached }) {
+            let scanLog = try initial ? externalScanLog.map(ExternalScanLog.init(path:)) : nil
+            index = try SearchIndex.scanForTracking(scope: scope, workers: external?.scanWorkers ?? 4,
+                                                    excluding: exclusions, cancelled: { self.detached },
+                                                    scanLog: scanLog, profileExternal: external != nil,
+                                                    directoryLengths: external?.filesystem == "exfat") {
                 mark, partial in
+                if let stats = mark.external {
+                    let written = self.lock.withLock {
+                        let changed = self.status.externalScan?.checkpointBytes != stats.checkpointBytes
+                        self.status.externalScan = stats
+                        return changed
+                    }
+                    if written { self.engineObserver?(.disk) }
+                }
                 let localPassFinished = self.external == nil && mark.phase == "local_complete"
                 if initial && (mark.phase == "partial" || localPassFinished ||
                                mark.phase == "batch" && mark.seconds >= lastPartial + 0.5) {
@@ -1246,6 +1291,7 @@ public final class ChangeTracker {
         if caughtUp {
             cloud?.setEnabled(true)
             mounts?.start()
+            if needsVolumePolling { startVolumePolling() }
             releaseTemporaryPages()
             engineObserver?(.status)
             observer?("caught-up")

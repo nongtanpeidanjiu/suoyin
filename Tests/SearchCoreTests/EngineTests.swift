@@ -72,6 +72,71 @@ struct EngineTests {
         #expect(reopened.search(EngineQuery(text: "engine-data", showAll: true)).hits.isEmpty)
     }
 
+    @Test func localDenialsAreVerifiedWhileAnExternalSourceIsStillScanning() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let local = root.appendingPathComponent("local")
+        let external = root.appendingPathComponent("external")
+        let denied = local.appendingPathComponent("blocked")
+        for folder in [data, local, external, denied] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        try Data().write(to: external.appendingPathComponent("external-fixture.txt"))
+        try Data([1]).write(to: local.appendingPathComponent("order-fixture-a"))
+        try Data([1, 2]).write(to: external.appendingPathComponent("order-fixture-b"))
+        try Data([1, 2, 3]).write(to: local.appendingPathComponent("order-fixture-c"))
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let mounts = ExternalVolumes(directory: data.path, discoverAutomatically: false, onAccess: { path in
+            if path == external.path {
+                entered.signal()
+                _ = release.wait(timeout: .now() + .seconds(4))
+            }
+        })
+        let tracker = try ChangeTracker(root: local.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                        externalVolumes: mounts)
+        let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+        defer { engine.stop() }
+        defer { release.signal() }
+        engine.start()
+        try #require(until { engine.status.inaccessibleLocationsVerified })
+        tracker.injectPermissionObservation(denied.path, .denied(EACCES))
+        try #require(until { engine.status.inaccessibleLocationCount == 1 })
+        let identity = try VolumeIdentity(root: external.path)
+        let volume = VolumeIdentity(root: external.path, mount: external.path, device: identity.device,
+                                    uuid: UUID().uuidString, log: nil, readOnly: false)
+        #expect(ExternalMount(identity: volume, name: "Test media", fileEvents: false).scanWorkers == 1)
+        #expect(ExternalMount(identity: volume, name: "Test media", fileEvents: false,
+                              medium: .solidState).scanWorkers == 3)
+        mounts.updateMounts([ExternalMount(identity: volume, name: "Test media", fileEvents: false,
+                                            filesystem: "exfat", medium: .rotational)])
+        try #require(entered.wait(timeout: .now() + .seconds(2)) == .success)
+        try #require(until { engine.status.sources.contains { $0.kind == .externalVolume } })
+        let checking = engine.status
+        #expect(checking.inaccessibleLocationsVerified && checking.inaccessibleLocationCount == 1)
+        #expect(checking.sources.first?.inaccessibleLocationsVerified == false)
+        #expect(checking.sources.first?.indexed == 0)
+        release.signal()
+        try #require(until { engine.status.sources.first?.inaccessibleLocationsVerified == true })
+        let ready = engine.status
+        #expect(ready.sources.first?.indexed == 2)
+        #expect(ready.sources.first?.scan?.workers == 2)
+        #expect(ready.indexedCount == ready.localIndexedCount + 2)
+        #expect(engine.search(EngineQuery(text: "external-fixture")).total == 1)
+        let ordered = ["order-fixture-a", "order-fixture-b", "order-fixture-c"]
+        for column in [SearchColumn.name, .size] {
+            let first = engine.search(EngineQuery(text: "order-fixture", column: column, limit: 2))
+            #expect(first.hits.map(\.name) == Array(ordered.prefix(2)))
+            #expect(first.total == 3 && !first.totalIsExact)
+            let last = engine.search(EngineQuery(text: "order-fixture", column: column, offset: 2, limit: 2))
+            #expect(last.hits.map(\.name) == [ordered[2]] && last.totalIsExact)
+            let reverse = engine.search(EngineQuery(text: "order-fixture", column: column, direction: .descending))
+            #expect(reverse.hits.map(\.name) == Array(ordered.reversed()))
+        }
+    }
+
     @Test func kindsComposeWithPagingOrderingAndPublishedEdits() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -26,6 +26,20 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
     }
     var result: [String: Any] = [
         "indexedCount": status.indexedCount,
+        "localIndexedCount": status.localIndexedCount,
+        "sources": status.sources.map { source -> [String: Any] in
+            var value: [String: Any] = [
+                "id": source.id, "name": source.name, "kind": source.kind.rawValue, "indexed": source.indexed,
+                "inaccessibleLocationsVerified": source.inaccessibleLocationsVerified,
+                "inaccessibleLocations": source.inaccessibleLocations.map(encodeLocation),
+                "rawInaccessibleLocations": source.rawInaccessibleLocations.map(encodeLocation)
+            ]
+            if let error = source.error { value["error"] = error }
+            if let scan = source.scan, let bytes = try? JSONEncoder().encode(scan) {
+                value["scan"] = try? JSONSerialization.jsonObject(with: bytes)
+            }
+            return value
+        },
         "inaccessiblePaths": status.inaccessiblePaths,
         "inaccessibleLocations": status.inaccessibleLocations.map(encodeLocation),
         "rawInaccessibleLocations": status.rawInaccessibleLocations.map(encodeLocation),
@@ -63,6 +77,8 @@ private func encodeHit(_ hit: EngineHit) -> [String: Any] {
 func runEngineCLI(_ args: [String]) throws {
     guard args.count == 2 else { throw CommandError.usage }
     let engine = try SearchEngine(dataDirectory: URL(fileURLWithPath: args[1], isDirectory: true))
+    // Match the preview application's query scheduling during measurements.
+    let queries = DispatchQueue(label: "index.cli-query", qos: .userInteractive)
     func write(_ event: String, _ fields: [String: Any] = [:]) throws {
         var line = fields
         line["event"] = event
@@ -74,6 +90,9 @@ func runEngineCLI(_ args: [String]) throws {
     engine.onStatusChange = { status in
         if case let .failed(error) = status.phase {
             FileHandle.standardError.write(Data((error + "\n").utf8))
+        }
+        for source in status.sources {
+            if let error = source.error { FileHandle.standardError.write(Data((error + "\n").utf8)) }
         }
     }
     engine.start()
@@ -92,9 +111,15 @@ func runEngineCLI(_ args: [String]) throws {
                     return false
                 }
                 let query = command.engineQuery
-                let start = DispatchTime.now().uptimeNanoseconds
-                let result = engine.search(query)
-                let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                var measured: (EngineResult, UInt64)?
+                let work = DispatchWorkItem {
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let result = engine.search(query)
+                    measured = (result, DispatchTime.now().uptimeNanoseconds - start)
+                }
+                queries.async(execute: work)
+                work.wait()
+                guard let (result, elapsed) = measured else { throw CommandError.usage }
                 try write("query", ["hits": result.hits.map(encodeHit), "total": result.total,
                                     "totalIsExact": result.totalIsExact, "nanoseconds": elapsed])
             case "status":

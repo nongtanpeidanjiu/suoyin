@@ -80,9 +80,25 @@ public enum EnginePhase: Sendable, Equatable {
     case failed(String)
 }
 
+public struct EngineSourceStatus: Sendable, Equatable {
+    public enum Kind: String, Sendable { case externalVolume, cloudProvider }
+
+    public let id: String
+    public let name: String
+    public let kind: Kind
+    public let indexed: Int
+    public let inaccessibleLocationsVerified: Bool
+    public let inaccessibleLocations: [InaccessibleLocation]
+    public let rawInaccessibleLocations: [InaccessibleLocation]
+    public let error: String?
+    public let scan: ExternalScanStatistics?
+}
+
 public struct EngineStatus: Sendable {
     public let phase: EnginePhase
     public let indexedCount: Int
+    public let localIndexedCount: Int
+    public let sources: [EngineSourceStatus]
     public let inaccessibleLocations: [InaccessibleLocation]
     public let rawInaccessibleLocations: [InaccessibleLocation]
     public let inaccessibleLocationsVerified: Bool
@@ -118,7 +134,6 @@ public final class SearchEngine: @unchecked Sendable {
     private var statusDeliveryScheduled = false
     private var nextStatusNotification: DispatchTime = .now()
     private let accessDenials = AccessDenials(home: NSHomeDirectory())
-    private var lastCoverage: [String: InaccessibleLocation.Reason] = [:]
     private var reported: EngineStatus
 
     public convenience init(dataDirectory: URL) throws {
@@ -140,7 +155,8 @@ public final class SearchEngine: @unchecked Sendable {
     init(dataDirectory: URL, tracker: ChangeTracker) {
         directory = dataDirectory
         self.tracker = tracker
-        reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessibleLocations: [],
+        reported = EngineStatus(phase: .starting, indexedCount: 0, localIndexedCount: 0,
+                                sources: [], inaccessibleLocations: [],
                                 rawInaccessibleLocations: [], inaccessibleLocationsVerified: false,
                                 pendingFullDiskAccessPaths: [],
                                 indexBytesOnDisk: Self.diskBytes(directory))
@@ -231,24 +247,44 @@ public final class SearchEngine: @unchecked Sendable {
         }
         let localState = tracker.engineState()
         let local = localState.status
-        let attached = tracker.engineExternalStates()
-        let external = attached.volumes
+        let external = tracker.engineExternalStates()
         let count = localState.indexed + external.reduce(0) { $0 + $1.state.indexed }
-        let verified = localState.accessChecked && attached.discovered && external.allSatisfy { $0.state.accessChecked }
-        var coverage: [String: InaccessibleLocation.Reason] = [:]
-        for state in verified ? [local] + external.map(\.state.status) : [] {
-            for path in state.coverageRestricted {
+        let verified = localState.accessChecked
+        func locations(_ state: TrackingStatus, paths: [String]) -> [InaccessibleLocation] {
+            paths.map { path in
                 let reason = accessDenials.reason(at: path, error: state.coverageDenialErrors?[path],
                                                   missingFullDiskAccess: local.awaitingFullDiskAccess)
-                coverage[path] = coverage[path].map { $0 == reason ? reason : .unknown } ?? reason
+                return InaccessibleLocation(path: path, count: 1, reason: reason)
             }
         }
-        let coverageChanged = coverage != lastCoverage
-        let raw = coverageChanged ? coverage.sorted { $0.key < $1.key }.map {
-            InaccessibleLocation(path: $0.key, count: 1, reason: $0.value)
-        } : previous.rawInaccessibleLocations
+        var localPaths: [String] = []
+        var cloudPaths: [String: [String]] = [:]
+        for path in local.coverageRestricted {
+            if let provider = tracker.cloudProvider(containing: path) { cloudPaths[provider, default: []].append(path) }
+            else { localPaths.append(path) }
+        }
+        let raw = verified ? locations(local, paths: localPaths) : []
+        let coverageChanged = raw != previous.rawInaccessibleLocations
         let restrictions = coverageChanged ? AccessDenials.summarize(raw) : previous.inaccessibleLocations
-        lastCoverage = coverage
+        var sources = external.map { volume in
+            let status = volume.state.status
+            let checked = volume.state.accessChecked
+            let raw = checked ? locations(status, paths: status.coverageRestricted) : []
+            return EngineSourceStatus(id: volume.id, name: volume.name, kind: .externalVolume,
+                                      indexed: volume.state.indexed, inaccessibleLocationsVerified: checked,
+                                      inaccessibleLocations: AccessDenials.summarize(raw),
+                                      rawInaccessibleLocations: raw, error: status.error, scan: status.externalScan)
+        }
+        let providers = Set(localState.cloudEntries.keys).union(localState.pendingProviders).union(cloudPaths.keys)
+        for provider in providers.sorted() {
+            let checked = verified && !localState.pendingProviders.contains(provider)
+            let raw = checked ? locations(local, paths: cloudPaths[provider] ?? []) : []
+            sources.append(EngineSourceStatus(id: provider, name: leafName(provider), kind: .cloudProvider,
+                                              indexed: localState.cloudEntries[provider, default: 0],
+                                              inaccessibleLocationsVerified: checked,
+                                              inaccessibleLocations: AccessDenials.summarize(raw),
+                                              rawInaccessibleLocations: raw, error: nil, scan: nil))
+        }
         let bytes = disk ? Self.diskBytes(directory) : previous.indexBytesOnDisk
         let phase: EnginePhase
         if let error = local.error {
@@ -258,7 +294,7 @@ public final class SearchEngine: @unchecked Sendable {
         } else if local.phase == "starting" {
             phase = .starting
         } else if local.phase == "scan-start" || local.phase == "scan-partial" {
-            phase = .scanning(indexed: count)
+            phase = .scanning(indexed: localState.indexed)
         } else if let volume = external.first(where: {
             $0.state.status.phase != "caught-up" && $0.state.status.error == nil
         }) {
@@ -268,7 +304,8 @@ public final class SearchEngine: @unchecked Sendable {
         } else {
             phase = .ready
         }
-        let updated = EngineStatus(phase: phase, indexedCount: count, inaccessibleLocations: restrictions,
+        let updated = EngineStatus(phase: phase, indexedCount: count, localIndexedCount: localState.indexed,
+                                   sources: sources, inaccessibleLocations: restrictions,
                                    rawInaccessibleLocations: raw, inaccessibleLocationsVerified: verified,
                                    pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
                                    indexBytesOnDisk: bytes)
@@ -276,7 +313,7 @@ public final class SearchEngine: @unchecked Sendable {
             reported = updated
             return indexHandler
         }
-        if phase != previous.phase || count != previous.indexedCount ||
+        if phase != previous.phase || count != previous.indexedCount || sources != previous.sources ||
             verified != previous.inaccessibleLocationsVerified ||
             coverageChanged || updated.pendingFullDiskAccessPaths != previous.pendingFullDiskAccessPaths ||
             bytes != previous.indexBytesOnDisk {
@@ -314,7 +351,7 @@ public final class SearchEngine: @unchecked Sendable {
             directory.appendingPathComponent($0)
         }
         return (local + external).reduce(0) { sum, file in
-            guard [".snapshot", ".snapshot.changes", ".snapshot.budget"].contains(where: { file.path.hasSuffix($0) }),
+            guard [".snapshot", ".snapshot.changes", ".snapshot.budget", ".scanlog"].contains(where: { file.path.hasSuffix($0) }),
                   let attributes = try? fm.attributesOfItem(atPath: file.path),
                   attributes[.type] as? FileAttributeType == .typeRegular
             else { return sum }

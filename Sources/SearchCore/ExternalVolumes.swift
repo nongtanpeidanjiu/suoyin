@@ -1,6 +1,8 @@
 import Darwin
 import DiskArbitration
+import DarwinMetadata
 import Foundation
+import IOKit
 
 public struct ExternalVolumeStatus: Codable, Sendable {
     public let id: String
@@ -17,10 +19,26 @@ public struct ExternalVolumeStatus: Codable, Sendable {
 }
 
 struct ExternalMount {
+    enum Medium: Int32 { case unknown, rotational, solidState }
     let identity: VolumeIdentity
     let name: String
     let fileEvents: Bool
     var bsdName: String? = nil
+    var filesystem: String? = nil
+    var medium: Medium = .unknown
+
+    var scanWorkers: Int {
+        switch medium {
+        case .unknown: return 1
+        case .rotational: return 2
+        case .solidState: return 3
+        }
+    }
+
+    var scanLogKey: String? {
+        guard filesystem == "exfat", let volumeID else { return nil }
+        return volumeID + "-exfat.scanlog"
+    }
 
     var volumeID: String? {
         identity.uuid.flatMap { UUID(uuidString: $0)?.uuidString }
@@ -46,12 +64,14 @@ struct ExternalMount {
         let volume = VolumeIdentity(root: identity.root, mount: identity.mount, device: identity.device,
                                     uuid: identity.uuid ?? previous.identity.uuid,
                                     log: identity.log ?? previous.identity.log, readOnly: identity.readOnly)
-        return ExternalMount(identity: volume, name: name, fileEvents: fileEvents, bsdName: bsdName)
+        return ExternalMount(identity: volume, name: name, fileEvents: fileEvents, bsdName: bsdName,
+                             filesystem: filesystem, medium: medium == .unknown ? previous.medium : medium)
     }
 
     func canKeepTracker(for current: Self) -> Bool {
         sameAttachment(as: current) && volumeID == current.volumeID && identity.log == current.identity.log &&
-            identity.readOnly == current.identity.readOnly && fileEvents == current.fileEvents
+            identity.readOnly == current.identity.readOnly && fileEvents == current.fileEvents &&
+            filesystem == current.filesystem && medium == current.medium
     }
 }
 
@@ -69,9 +89,10 @@ final class ExternalVolumes {
     private let retirement = DispatchQueue(label: "index.detached-volumes", qos: .utility)
     private let lock = NSLock()
     private let directory: String
+    private let discoverAutomatically: Bool
+    private let onAccess: ((String) -> Void)?
     private var session: DASession?
     private var active: [String: Active] = [:]
-    private var initialDiscoveryComplete = false
     private var offline: [String: ExternalVolumeStatus] = [:]
     private var retiring: Set<String> = []
     private var lastMounts: [ExternalMount] = []
@@ -84,11 +105,14 @@ final class ExternalVolumes {
     private var nextSlot: UInt32 = 1
     var engineObserver: ((EngineChange) -> Void)?
 
-    init(directory: String) {
+    init(directory: String, discoverAutomatically: Bool = true, onAccess: ((String) -> Void)? = nil) {
         self.directory = joinedPath(directory, "external-volumes")
+        self.discoverAutomatically = discoverAutomatically
+        self.onAccess = onAccess
     }
 
     func start() {
+        guard discoverAutomatically else { return }
         queue.async {
             guard !self.closed, self.session == nil, let session = DASessionCreate(nil) else { return }
             self.session = session
@@ -110,8 +134,6 @@ final class ExternalVolumes {
             }, context)
             DASessionSetDispatchQueue(session, self.queue)
             self.refresh()
-            self.lock.withLock { self.initialDiscoveryComplete = true }
-            self.engineObserver?(.status)
         }
     }
 
@@ -202,16 +224,18 @@ final class ExternalVolumes {
             } ?? false
             let key = hasClone ? UUID().uuidString : volumeID ?? UUID().uuidString
             let cache = hasClone ? nil : mount.cacheKey
+            let scanLog = hasClone ? nil : mount.scanLogKey.map { joinedPath(directory, $0) }
             let base = joinedPath(directory, (cache ?? key) + ".snapshot")
             do {
-                if cache != nil {
+                if cache != nil || scanLog != nil {
                     try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
                                                             attributes: [.posixPermissions: 0o700])
                 }
                 let tracker = try ChangeTracker(root: mount.identity.root, snapshot: base,
                                                 ownData: parentPath(directory),
                                                 wallTime: { Date().timeIntervalSince1970 },
-                                                external: mount, externalPersistence: cache != nil)
+                                                external: mount, externalPersistence: cache != nil,
+                                                externalScanLog: scanLog, onAccess: onAccess)
                 let volume = Active(mount: mount, key: key, slot: nextSlot, tracker: tracker)
                 nextSlot += 1
                 if let engineObserver { tracker.observeEngineChanges(engineObserver) }
@@ -262,10 +286,6 @@ final class ExternalVolumes {
         lock.withLock { active.values.sorted { $0.key < $1.key } }
     }
 
-    func engineMounts() -> (discovered: Bool, volumes: [Active]) {
-        lock.withLock { (initialDiscoveryComplete, active.values.sorted { $0.key < $1.key }) }
-    }
-
     func isCurrent(_ volume: Active) -> Bool {
         lock.withLock { active[volume.mount.identity.mount]?.tracker === volume.tracker }
     }
@@ -304,6 +324,7 @@ final class ExternalVolumes {
                 return values
             }
         }
+        for volume in volumes { volume.tracker.cancelUnfinishedExternalScan() }
         retirement.sync {}
         var failure: Error?
         for volume in volumes {
@@ -336,10 +357,14 @@ final class ExternalVolumes {
             let filesystem = withUnsafeBytes(of: info.f_fstypename) {
                 String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
             }
+            let media = DADiskCopyIOMedia(disk)
+            let medium = ExternalMount.Medium(rawValue: dm_media_kind(media)) ?? .unknown
+            if media != 0 { IOObjectRelease(media) }
             return ExternalMount(identity: identity,
                                  name: description[kDADiskDescriptionVolumeNameKey as String] as? String ?? leafName(path),
                                  fileEvents: ExternalMount.supportsFileEvents(on: filesystem),
-                                 bsdName: DADiskGetBSDName(disk).map { String(cString: $0) })
+                                 bsdName: DADiskGetBSDName(disk).map { String(cString: $0) },
+                                 filesystem: filesystem, medium: medium)
         }
     }
 }

@@ -51,6 +51,32 @@ struct CoreTests {
         }
     }
 
+    @Test func sparseNameSelectionPreservesVisibilityTypesOrderAndOffsets() {
+        var index = SearchIndex()
+        let root = index.append("/", attribute: Kind.anchor)
+        for i in 0..<3_000 { index.append("aaa-\(i).txt", parent: root) }
+        index.append("zz-Cafe\u{301}.txt", parent: root)
+        index.append("zz-Café.txt", parent: root)
+        index.append("zz-Café.pdf", parent: root)
+        index.append("zz-Café.png", parent: root)
+        index.append(".zz-Café.png", parent: root, attribute: Kind.file | Kind.hidden)
+        let suppressed = index.append("zz-Café-removed.txt", parent: root)
+        index.setSuppressed(Int(suppressed), true)
+        index.prepare()
+        for direction in SearchDirection.allCases {
+            for showAll in [false, true] {
+                for kind in [EngineKind.any, .document, .image] {
+                    for offset in [0, 1, 4] {
+                        #expect(index.search("zz café", direction: direction, showAll: showAll, kind: kind,
+                                             offset: offset, limit: 2) ==
+                                index.directSearch("zz café", direction: direction, showAll: showAll, kind: kind,
+                                                   offset: offset, limit: 2))
+                    }
+                }
+            }
+        }
+    }
+
     @Test func normalizationStoresOnlyChangedNonASCIIKeys() {
         var index = SearchIndex()
         let root = index.append("/UPPER", attribute: Kind.anchor)

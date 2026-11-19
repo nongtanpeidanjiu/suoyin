@@ -12,8 +12,17 @@ typedef struct {
 } DMRecord;
 
 typedef struct {
+    uint64_t inode;
+    int64_t modified, changed, created, size;
+} DMDirectoryStamp;
+
+typedef struct {
     uint32_t denied, disappeared, pending, other_mount, fallback;
     int32_t directory_error;
+    bool profile, capture_stamp, stamp_valid, directory_lengths;
+    DMDirectoryStamp stamp;
+    uint64_t open_ns, bulk_ns, readdir_ns, stat_ns;
+    uint64_t bulk_calls, readdir_calls, stat_calls, directory_length_rows;
 } DMCounts;
 
 typedef void (*DMEntryCallback)(void *, const uint8_t *, size_t, int64_t, int64_t, uint32_t, uint32_t);
@@ -22,6 +31,8 @@ int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
             DMEntryCallback callback, DMDeniedEntryCallback denied, void *context, DMCounts *counts);
 int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
                   DMDeniedEntryCallback denied, void *context, DMCounts *counts);
+int dm_directory_stamp(const char *path, int32_t device, DMDirectoryStamp *stamp);
+int dm_media_kind(uint32_t service);
 bool dm_volume_uuid(const char *path, char output[37]);
 uint64_t dm_resident_bytes(void);
 typedef struct {
@@ -61,7 +72,7 @@ void dm_name_order(const DMQueryView *view, uint32_t *order);
 bool dm_column_order(const DMQueryView *view, uint32_t *order, int column);
 size_t dm_query(const DMQueryView *view, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *word_offsets, size_t words,
-                bool path, bool descending, bool show_all, uint8_t kind, size_t offset,
+                bool path, bool name_ordered, bool descending, bool show_all, uint8_t kind, size_t offset,
                 size_t limit, uint32_t *results);
 
 #endif

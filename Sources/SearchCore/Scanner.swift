@@ -28,6 +28,29 @@ public struct ScanMark: Codable, Sendable {
     public let skippedMounts: Int
     public let pending: Int
     public let fallback: Int
+    public let external: ExternalScanStatistics?
+}
+
+public struct ExternalScanStatistics: Codable, Sendable, Equatable {
+    public internal(set) var workers = 1
+    public internal(set) var observedDirectories = 0
+    public internal(set) var restoredDirectories = 0
+    public internal(set) var observedEntries = 0
+    public internal(set) var restoredEntries = 0
+    public internal(set) var slotWaitNanoseconds: UInt64 = 0
+    public internal(set) var listingNanoseconds: UInt64 = 0
+    public internal(set) var openNanoseconds: UInt64 = 0
+    public internal(set) var bulkNanoseconds: UInt64 = 0
+    public internal(set) var readdirNanoseconds: UInt64 = 0
+    public internal(set) var statNanoseconds: UInt64 = 0
+    public internal(set) var restoreNanoseconds: UInt64 = 0
+    public internal(set) var mergeNanoseconds: UInt64 = 0
+    public internal(set) var prepareNanoseconds: UInt64 = 0
+    public internal(set) var checkpointNanoseconds: UInt64 = 0
+    public internal(set) var bulkCalls: UInt64 = 0
+    public internal(set) var statCalls: UInt64 = 0
+    public internal(set) var directoryLengthRows: UInt64 = 0
+    public internal(set) var checkpointBytes = 0
 }
 
 struct ScanJob {
@@ -35,7 +58,7 @@ struct ScanJob {
     let parent: UInt32
 }
 
-private struct Item {
+struct Item {
     let start: Int
     let length: Int
     let size: Int64
@@ -44,7 +67,7 @@ private struct Item {
     let type: UInt32
 }
 
-private final class DirectoryBatch {
+final class DirectoryBatch {
     var names: [UInt8] = []
     var items: [Item] = []
     var denied: [String: Int32] = [:]
@@ -213,11 +236,12 @@ struct WalkScope {
 }
 
 private let directoryReadSlots = DispatchSemaphore(value: 4)
+private let scanWorkerSlots = DispatchSemaphore(value: 4)
 
-private func readDirectory<T>(_ read: () -> T) -> T {
+func readDirectory<T>(_ read: () throws -> T) rethrows -> T {
     directoryReadSlots.wait()
     defer { directoryReadSlots.signal() }
-    return read()
+    return try read()
 }
 
 private final class ScanSession {
@@ -231,6 +255,7 @@ private final class ScanSession {
     var index: SearchIndex
     let retainedDirectories: [String: UInt32]
     var jobs: [ScanJob] = []
+    var cachedJobs: [ScanJob] = []
     var cloudJobs: [ScanJob] = []
     var workersActive = 0
     var error: Error?
@@ -240,11 +265,18 @@ private final class ScanSession {
     var entries = 0
     var local = true
     var nextPublication = 2_048
+    var publishedEntries = 0
+    var lastPublication: UInt64 = 0
+    var externalMetrics: ExternalScanStatistics?
+    let profileExternal: Bool
+    let directoryLengths: Bool
+    let scanLog: ExternalScanLog?
     let publish: (ScanMark, SearchIndex) throws -> Void
     let cancelled: () -> Bool
 
     init(scope: WalkScope, ordinary: Bool, listeners: ListenerSet, excludedPaths: Set<String>, dataOnly: Bool,
-         keeping retained: consuming SearchIndex, cancelled: @escaping () -> Bool, publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
+         keeping retained: consuming SearchIndex, scanLog: ExternalScanLog?, profileExternal: Bool, directoryLengths: Bool,
+         cancelled: @escaping () -> Bool, publish: @escaping (ScanMark, SearchIndex) throws -> Void) {
         self.scope = scope
         self.ordinary = ordinary
         self.excludedPaths = excludedPaths
@@ -252,6 +284,10 @@ private final class ScanSession {
         self.listeners = listeners
         self.publish = publish
         self.cancelled = cancelled
+        self.scanLog = scanLog
+        self.profileExternal = profileExternal
+        self.directoryLengths = directoryLengths
+        externalMetrics = profileExternal ? ExternalScanStatistics() : nil
         var bridgePaths: Set<String> = []
         if retained.recordCount > 0 {
             for target in dataTargets {
@@ -279,63 +315,161 @@ private final class ScanSession {
                         listenerCount: listeners.count, readOnlyVolumes: listeners.readOnlyCount,
                         denied: Int(counts.denied), disappeared: Int(counts.disappeared),
                         skippedMounts: Int(counts.other_mount), pending: pending + Int(counts.pending),
-                        fallback: Int(counts.fallback))
+                        fallback: Int(counts.fallback), external: externalMetrics)
     }
 
     func addRoot(_ path: String) {
         let id = retainedDirectories[path] ?? index.append(path, attribute: Kind.anchor)
-        jobs.append(ScanJob(path: path, parent: id))
+        enqueue(ScanJob(path: path, parent: id))
+    }
+
+    private func relativePath(_ path: String) -> String {
+        path == scope.root ? "" : String(path.dropFirst(scope.root.count + 1))
+    }
+
+    private func enqueue(_ job: ScanJob) {
+        if scanLog?.contains(relativePath(job.path)) == true { cachedJobs.append(job) }
+        else { jobs.append(job) }
     }
 
     func walk() {
+        scanWorkerSlots.wait()
+        defer { scanWorkerSlots.signal() }
         while true {
             condition.lock()
-            while jobs.isEmpty && workersActive > 0 && error == nil { condition.wait() }
+            while cachedJobs.isEmpty && jobs.isEmpty && workersActive > 0 && error == nil { condition.wait() }
             if cancelled(), error == nil { error = CancellationError(); condition.broadcast() }
-            guard error == nil, let job = jobs.popLast() else { condition.unlock(); return }
+            guard error == nil, let job = cachedJobs.popLast() ?? jobs.popLast() else { condition.unlock(); return }
             workersActive += 1
             condition.unlock()
 
-            let batch = DirectoryBatch()
-            var delta = DMCounts()
-            let code = readDirectory {
-                scope.onAccess?(job.path)
-                return dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
-                               collectEntry, collectDenied, Unmanaged.passUnretained(batch).toOpaque(), &delta)
-            }
+            let attempt = Result { try read(job) }
             condition.lock()
-            counts.denied += delta.denied
-            counts.disappeared += delta.disappeared
-            counts.other_mount += delta.other_mount
-            counts.pending += delta.pending
-            counts.fallback += delta.fallback
-            if delta.directory_error != 0 || batch.unidentifiedDenial { restrictions[job.path] = delta.directory_error }
-            if !batch.denied.isEmpty {
-                let isProvider = scope.providerTrashParent(job.path)
-                for (name, error) in batch.denied {
-                    let child = joinedPath(job.path, name)
-                    if !excludedPaths.contains(child), !scope.mirrors.contains(child), !(isProvider && name == ".Trash") {
-                        restrictions[child] = error
-                    }
-                }
-            }
-            if (code != 0 || delta.pending != 0), scope.clouds.provider(containing: job.path) != nil {
-                index.attributes[Int(job.parent)] |= Kind.pending
-                if delta.pending != 0 { index.attributes[Int(job.parent)] |= Kind.dataless }
-                if delta.pending == 0 { pending += 1 }
-            } else if code != 0 {
-                if error == nil { error = ScanError.metadata(path: job.path, error: code) }
-            } else if error == nil {
-                add(batch, job)
-                if local && entries >= nextPublication {
-                    let phase = nextPublication == 2_048 ? "partial" : "batch"
-                    nextPublication = entries + 20_000
-                    do { try publish(mark(phase), withCoverage()) } catch { self.error = error }
-                }
+            switch attempt {
+            case .success(let observation):
+                do { try apply(observation, to: job) } catch { self.error = self.error ?? error }
+            case .failure(let failure):
+                if !(failure is CancellationError) || error == nil { error = failure }
             }
             workersActive -= 1
             condition.broadcast()
             condition.unlock()
+        }
+    }
+
+    private struct Observation {
+        let batch: DirectoryBatch
+        let delta: DMCounts
+        let code: Int32
+        let relative: String
+        let restored: Bool
+        let slotWait: UInt64
+        let listing: UInt64
+        let restoreTime: UInt64
+    }
+
+    private func read(_ job: ScanJob) throws -> Observation {
+        if cancelled() { throw CancellationError() }
+        let relative = scanLog == nil ? "" : relativePath(job.path)
+        let restoreStart = scanLog == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        if let restored = try scanLog?.restored(job.path, relative: relative, device: scope.primaryDevice) {
+            return Observation(batch: restored, delta: DMCounts(), code: 0, relative: relative, restored: true,
+                               slotWait: 0, listing: 0,
+                               restoreTime: DispatchTime.now().uptimeNanoseconds - restoreStart)
+        }
+        let profiled = profileExternal
+        let queued = profiled ? DispatchTime.now().uptimeNanoseconds : 0
+        let batch = DirectoryBatch()
+        var delta = DMCounts()
+        delta.profile = profiled
+        delta.capture_stamp = scanLog != nil
+        delta.directory_lengths = directoryLengths
+        var entered: UInt64 = 0
+        let code = try readDirectory {
+            if cancelled() { throw CancellationError() }
+            entered = profiled ? DispatchTime.now().uptimeNanoseconds : 0
+            scope.onAccess?(job.path)
+            return dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
+                           collectEntry, collectDenied, Unmanaged.passUnretained(batch).toOpaque(), &delta)
+        }
+        if code != 0 && scope.clouds.provider(containing: job.path) == nil {
+            throw ScanError.metadata(path: job.path, error: code)
+        }
+        return Observation(batch: batch, delta: delta, code: code, relative: relative, restored: false,
+                           slotWait: entered - queued,
+                           listing: profiled ? DispatchTime.now().uptimeNanoseconds - entered : 0,
+                           restoreTime: restoreStart == 0 || !profiled ? 0 : queued - restoreStart)
+    }
+
+    private func apply(_ observation: Observation, to job: ScanJob) throws {
+        guard error == nil else { return }
+        let batch = observation.batch
+        let delta = observation.delta
+        if externalMetrics != nil {
+            externalMetrics!.slotWaitNanoseconds += observation.slotWait
+            externalMetrics!.listingNanoseconds += observation.listing
+            externalMetrics!.restoreNanoseconds += observation.restoreTime
+            externalMetrics!.openNanoseconds += delta.open_ns
+            externalMetrics!.bulkNanoseconds += delta.bulk_ns
+            externalMetrics!.readdirNanoseconds += delta.readdir_ns
+            externalMetrics!.statNanoseconds += delta.stat_ns
+            externalMetrics!.bulkCalls += delta.bulk_calls
+            externalMetrics!.statCalls += delta.stat_calls
+            externalMetrics!.directoryLengthRows += delta.directory_length_rows
+        }
+        counts.denied += delta.denied
+        counts.disappeared += delta.disappeared
+        counts.other_mount += delta.other_mount
+        counts.pending += delta.pending
+        counts.fallback += delta.fallback
+        if delta.directory_error != 0 || batch.unidentifiedDenial { restrictions[job.path] = delta.directory_error }
+        if !batch.denied.isEmpty {
+            let isProvider = scope.providerTrashParent(job.path)
+            for (name, error) in batch.denied {
+                let child = joinedPath(job.path, name)
+                if !excludedPaths.contains(child), !scope.mirrors.contains(child), !(isProvider && name == ".Trash") {
+                    restrictions[child] = error
+                }
+            }
+        }
+        if (observation.code != 0 || delta.pending != 0), scope.clouds.provider(containing: job.path) != nil {
+            index.attributes[Int(job.parent)] |= Kind.pending
+            if delta.pending != 0 { index.attributes[Int(job.parent)] |= Kind.dataless }
+            else { pending += 1 }
+            return
+        }
+        let previous = entries
+        let start = externalMetrics == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        add(batch, job)
+        if var metrics = externalMetrics {
+            metrics.mergeNanoseconds += DispatchTime.now().uptimeNanoseconds - start
+            if observation.restored {
+                metrics.restoredDirectories += 1
+                metrics.restoredEntries += entries - previous
+            } else {
+                metrics.observedDirectories += 1
+                metrics.observedEntries += entries - previous
+                if let scanLog, delta.stamp_valid {
+                    let checkpointStart = DispatchTime.now().uptimeNanoseconds
+                    try scanLog.append(batch, relative: observation.relative, stamp: delta.stamp)
+                    metrics.checkpointNanoseconds += DispatchTime.now().uptimeNanoseconds - checkpointStart
+                    metrics.checkpointBytes = scanLog.written
+                }
+            }
+            externalMetrics = metrics
+        }
+        let now = externalMetrics == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        let timedPublication = externalMetrics != nil && entries >= publishedEntries + 1_024 &&
+            now - lastPublication >= 5_000_000_000
+        if local && (entries >= nextPublication || timedPublication) {
+            let phase = publishedEntries == 0 ? "partial" : "batch"
+            publishedEntries = entries
+            nextPublication = entries + max(20_000, externalMetrics == nil ? 0 : entries / 20)
+            lastPublication = now
+            try publish(mark(phase), withCoverage())
+            if externalMetrics != nil {
+                externalMetrics!.prepareNanoseconds += DispatchTime.now().uptimeNanoseconds - now
+            }
         }
     }
 
@@ -384,7 +518,7 @@ private final class ScanSession {
                     pending += 1
                 } else if name.elementsEqual(component.utf8) {
                     let child = ScanJob(path: path, parent: id)
-                    if local && scope.clouds.isScanBoundary(logical) { cloudJobs.append(child) } else { jobs.append(child) }
+                    if local && scope.clouds.isScanBoundary(logical) { cloudJobs.append(child) } else { enqueue(child) }
                 }
             }
         }
@@ -392,12 +526,17 @@ private final class ScanSession {
 
 
     func run(_ workers: Int) throws {
+        if externalMetrics != nil { externalMetrics!.workers = workers; lastPublication = start }
         let group = DispatchGroup()
         for _ in 1..<workers {
             DispatchQueue.global(qos: .userInitiated).async(group: group) { self.walk() }
         }
         walk()
         group.wait()
+        if error == nil || error is CancellationError {
+            try scanLog?.flush()
+            if let scanLog { externalMetrics?.checkpointBytes = scanLog.written }
+        }
         if let error { throw error }
     }
 
@@ -422,11 +561,13 @@ extension SearchIndex {
     }
 
     static func scanForTracking(scope: WalkScope, workers: Int, excluding paths: Set<String>,
-                                cancelled: @escaping () -> Bool,
+                                cancelled: @escaping () -> Bool, scanLog: ExternalScanLog? = nil,
+                                profileExternal: Bool = false, directoryLengths: Bool = false,
                                 onProgress: @escaping (ScanMark, SearchIndex) throws -> Void) throws -> SearchIndex {
         try scan(root: scope.root, workers: workers, ordinary: false, establishListener: false,
                  excludedPaths: paths, dataOnly: false, keeping: SearchIndex(), scope: scope,
-                 cancelled: cancelled, onProgress: onProgress)
+                 cancelled: cancelled, scanLog: scanLog, profileExternal: profileExternal,
+                 directoryLengths: directoryLengths, onProgress: onProgress)
     }
 
     static func scanDataVolume(scope: WalkScope, keeping sealed: consuming SearchIndex,
@@ -438,6 +579,7 @@ extension SearchIndex {
     private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,
                              excludedPaths: Set<String>, dataOnly: Bool, keeping retained: consuming SearchIndex,
                              scope supplied: WalkScope? = nil, cancelled: @escaping () -> Bool = { false },
+                             scanLog: ExternalScanLog? = nil, profileExternal: Bool = false, directoryLengths: Bool = false,
                              onProgress: @escaping (ScanMark, SearchIndex) throws -> Void) throws -> SearchIndex {
         guard (1...4).contains(workers) else { throw ScanError.invalidWorkerCount }
         let root = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
@@ -449,6 +591,7 @@ extension SearchIndex {
         }
         let session = ScanSession(scope: scope, ordinary: ordinary, listeners: listeners,
                                   excludedPaths: excludedPaths, dataOnly: dataOnly, keeping: consume retained,
+                                  scanLog: scanLog, profileExternal: profileExternal, directoryLengths: directoryLengths,
                                   cancelled: cancelled, publish: onProgress)
         try onProgress(session.mark("listener_ready"), session.index)
         session.addRoot(root)

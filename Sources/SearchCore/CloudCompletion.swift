@@ -94,6 +94,8 @@ final class CloudCompletion {
     private var online = true
     private var status = CloudCompletionStatus()
     private(set) var selectedProvider: String?
+    private(set) var pendingProviders = Set<String>()
+    private var providerJobs: [String: Int] = [:]
     var changed: (CloudCompletionStatus) -> Void = { _ in }
     var beforeApply: () -> Void = {}
     var apply: (String, DirectoryObservation) -> Bool = { _, _ in false }
@@ -126,8 +128,11 @@ final class CloudCompletion {
     }
 
     func enqueue(_ path: String, inherited: UInt8) {
-        guard !closed, roots.provider(containing: path) != nil, !roots.isTrash(path) else { return }
-        if jobs[path] == nil { jobs[path] = Job(inherited: inherited) }
+        guard !closed, let provider = roots.provider(containing: path), !roots.isTrash(path) else { return }
+        if jobs[path] == nil {
+            jobs[path] = Job(inherited: inherited)
+            providerJobs[provider, default: 0] += 1
+        }
         advance()
     }
 
@@ -137,6 +142,7 @@ final class CloudCompletion {
         for (path, attributes) in pending where jobs[path] == nil && !roots.isTrash(path) {
             jobs[path] = Job(inherited: attributes)
         }
+        recountProviders()
         advance()
     }
 
@@ -152,12 +158,13 @@ final class CloudCompletion {
     func discard(at path: String) {
         invalidate(at: path)
         jobs = jobs.filter { !inside($0.key, path) }
+        recountProviders()
         advance()
     }
 
     func discardOnly(_ path: String) {
         if call?.path == path { call?.valid = false }
-        jobs.removeValue(forKey: path)
+        removeJob(path)
         advance()
     }
 
@@ -189,6 +196,19 @@ final class CloudCompletion {
         failures.append(now)
         status.totalFailures += 1
         if timeout { status.timedOut += 1 }
+    }
+
+    private func recountProviders() {
+        providerJobs.removeAll(keepingCapacity: true)
+        for path in jobs.keys {
+            if let provider = roots.provider(containing: path) { providerJobs[provider, default: 0] += 1 }
+        }
+    }
+
+    private func removeJob(_ path: String) {
+        guard jobs.removeValue(forKey: path) != nil, let provider = roots.provider(containing: path),
+              let count = providerJobs[provider] else { return }
+        providerJobs[provider] = count == 1 ? nil : count - 1
     }
 
     private func advance() {
@@ -239,7 +259,7 @@ final class CloudCompletion {
             if finished >= deadline {
                 fail(active.path, at: finished, timeout: true)
             } else if let observation = try? result.get(), apply(active.path, observation) {
-                jobs.removeValue(forKey: active.path)
+                removeJob(active.path)
                 if case .readable = observation { status.completed += 1 }
             } else {
                 fail(active.path, at: finished)
@@ -260,7 +280,8 @@ final class CloudCompletion {
         status.inFlight = call != nil
         let activeProvider = call.flatMap { roots.provider(containing: $0.path) }
         status.activeProvider = activeProvider.map(leafName)
-        selectedProvider = jobs.isEmpty ? nil : activeProvider ?? jobs.keys.min().flatMap(roots.provider(containing:))
+        pendingProviders = Set(providerJobs.keys)
+        selectedProvider = pendingProviders.isEmpty ? nil : activeProvider ?? pendingProviders.min()
         changed(status)
     }
 }

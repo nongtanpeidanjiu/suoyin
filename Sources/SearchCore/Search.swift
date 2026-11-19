@@ -198,7 +198,7 @@ extension SearchIndex {
                     offsets.withUnsafeBufferPointer { offsets in
                         ids.withUnsafeMutableBufferPointer { ids in
                             dm_query(&view, order.baseAddress, words.baseAddress, offsets.baseAddress,
-                                     offsets.count, mode == .path, direction == .descending,
+                                     offsets.count, mode == .path, column == .name, direction == .descending,
                                      showAll, kind.code, offset, ids.count, ids.baseAddress)
                         }
                     }

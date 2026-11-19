@@ -440,6 +440,32 @@ static size_t select_order(const DMQueryView *v, const uint32_t *ids, const uint
     return emitted;
 }
 
+enum { MAX_SPARSE_NAME_MATCHES = 4096 };
+
+// For a sparse name-ordered result, collect from the bitmap in memory order
+// and sort just the matches. Walking the full name order would revisit the
+// same bitmap at millions of scattered offsets.
+static size_t select_sparse_names(const DMQueryView *v, const uint8_t *matches, bool descending,
+                                  bool all, uint8_t kind, size_t offset, size_t limit, uint32_t *out) {
+    uint32_t selected[MAX_SPARSE_NAME_MATCHES];
+    size_t count = 0;
+    const uint8_t *end = matches + v->row_count;
+    for (const uint8_t *next = matches; next < end; next++) {
+        next = memchr(next, 1, (size_t)(end - next));
+        if (!next) break;
+        uint32_t id = (uint32_t)(next - matches);
+        if (!visible(v->attributes[id], all) || !matches_kind(v, id, kind) ||
+            (v->suppressed_rows && (v->suppressed_rows[id >> 3] & (1U << (id & 7))))) continue;
+        selected[count++] = id;
+    }
+    if (offset >= count) return 0;
+    qsort_r(selected, count, sizeof(*selected), (void *)v, name_order);
+    size_t emitted = count - offset < limit ? count - offset : limit;
+    for (size_t i = 0; i < emitted; i++)
+        out[i] = selected[descending ? count - 1 - offset - i : offset + i];
+    return emitted;
+}
+
 typedef struct {
     const DMQueryView *view;
     const char *word;
@@ -477,7 +503,7 @@ static void *path_word(void *argument) {
 
 size_t dm_query(const DMQueryView *v, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *offsets, size_t words,
-                bool path, bool descending, bool all, uint8_t kind, size_t offset,
+                bool path, bool name_ordered, bool descending, bool all, uint8_t kind, size_t offset,
                 size_t limit, uint32_t *results) {
     size_t n = v->row_count;
     if (!path || !words) {
@@ -495,6 +521,7 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         return SIZE_MAX;
     }
     bool ok = true, any = true;
+    size_t name_matches = 0;
     uint32_t only_path_hit = UINT32_MAX;
     if (!path) {
         const char *longest = (const char *)patterns + offsets[0];
@@ -502,7 +529,8 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
             const char *word = (const char *)patterns + offsets[i];
             if (strlen(word) > strlen(longest)) longest = word;
         }
-        any = name_hits(v, longest, matches) > 0;
+        name_matches = name_hits(v, longest, matches);
+        any = name_matches != 0;
         if (any && words > 1) {
             for (uint32_t i = 0; i < n; i++)
                 if (matches[i] && !all_words(key(v, i), patterns, offsets, words)) matches[i] = 0;
@@ -543,6 +571,8 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
         // One visible candidate has the same rank for every column and direction.
         results[0] = only_path_hit;
         result = 1;
+    } else if (name_ordered && name_matches != 0 && name_matches <= MAX_SPARSE_NAME_MATCHES) {
+        result = select_sparse_names(v, matches, descending, all, kind, offset, limit, results);
     } else {
         result = !ok ? SIZE_MAX : !any ? 0 :
             select_order(v, order, matches, NULL, NULL, 0, descending, all, kind, offset, limit, n, results);

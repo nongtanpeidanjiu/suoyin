@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "file-search", targets: ["SearchCLI"]),
     ],
     targets: [
-        .target(name: "DarwinMetadata"),
+        .target(name: "DarwinMetadata", linkerSettings: [.linkedFramework("IOKit")]),
         .target(name: "SearchCore", dependencies: ["DarwinMetadata"]),
         .executableTarget(name: "SearchCLI", dependencies: ["SearchCore"]),
         .testTarget(name: "SearchCoreTests", dependencies: ["SearchCore"]),

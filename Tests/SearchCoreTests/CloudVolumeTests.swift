@@ -87,7 +87,7 @@ struct CloudVolumeTests {
         defer { writer.sync { queue.stop() } }
         writer.sync {
             queue.apply = { _, observation in
-                guard case let .readable(_, children) = observation else { return false }
+                guard case let .readable(_, children, _) = observation else { return false }
                 published.append(contentsOf: children.keys)
                 return true
             }

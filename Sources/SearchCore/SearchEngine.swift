@@ -62,8 +62,15 @@ public enum EnginePhase: Sendable, Equatable {
 public struct EngineStatus: Sendable {
     public let phase: EnginePhase
     public let indexedCount: Int
-    public let inaccessiblePaths: [String]
+    public let inaccessibleLocations: [InaccessibleLocation]
+    public let rawInaccessibleLocations: [InaccessibleLocation]
+    public let pendingFullDiskAccessPaths: [String]
     public let indexBytesOnDisk: Int64
+
+    public var inaccessibleLocationCount: Int { rawInaccessibleLocations.count }
+    public var pendingFullDiskAccessCount: Int { pendingFullDiskAccessPaths.count }
+    public var awaitingFullDiskAccess: Bool { !pendingFullDiskAccessPaths.isEmpty }
+    public var inaccessiblePaths: [String] { inaccessibleLocations.map(\.path) }
 }
 
 /// In-process access to the local and attached-volume indexes. One instance
@@ -84,7 +91,8 @@ public final class SearchEngine: @unchecked Sendable {
     private var pendingDisk = false
     private var nextRefresh: DispatchTime = .now()
     private var nextIndexNotification: DispatchTime = .now()
-    private var lastCoverage: [String] = []
+    private let accessDenials = AccessDenials(home: NSHomeDirectory())
+    private var lastCoverage: [String: InaccessibleLocation.Reason] = [:]
     private var reported: EngineStatus
 
     public convenience init(dataDirectory: URL) throws {
@@ -106,7 +114,8 @@ public final class SearchEngine: @unchecked Sendable {
     init(dataDirectory: URL, tracker: ChangeTracker) {
         directory = dataDirectory
         self.tracker = tracker
-        reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessiblePaths: [],
+        reported = EngineStatus(phase: .starting, indexedCount: 0, inaccessibleLocations: [],
+                                rawInaccessibleLocations: [], pendingFullDiskAccessPaths: [],
                                 indexBytesOnDisk: Self.diskBytes(directory))
         tracker.observeEngineChanges { [weak self] in self?.scheduleRefresh(for: $0) }
     }
@@ -196,9 +205,19 @@ public final class SearchEngine: @unchecked Sendable {
         let local = tracker.snapshotStatus()
         let external = tracker.engineExternalStates()
         let count = tracker.indexedEntryCount()
-        let coverage = external.isEmpty ? local.coverageRestricted :
-            local.coverageRestricted + external.flatMap { $0.status.coverageRestricted }
-        let restrictions = coverage == lastCoverage ? previous.inaccessiblePaths : Self.topLevel(coverage)
+        var coverage: [String: InaccessibleLocation.Reason] = [:]
+        for state in [local] + external.map(\.status) {
+            for path in state.coverageRestricted {
+                let reason = accessDenials.reason(at: path, error: state.coverageDenialErrors?[path],
+                                                  missingFullDiskAccess: local.awaitingFullDiskAccess)
+                coverage[path] = coverage[path].map { $0 == reason ? reason : .unknown } ?? reason
+            }
+        }
+        let coverageChanged = coverage != lastCoverage
+        let raw = coverageChanged ? coverage.sorted { $0.key < $1.key }.map {
+            InaccessibleLocation(path: $0.key, count: 1, reason: $0.value)
+        } : previous.rawInaccessibleLocations
+        let restrictions = coverageChanged ? AccessDenials.summarize(raw) : previous.inaccessibleLocations
         lastCoverage = coverage
         let bytes = disk ? Self.diskBytes(directory) : previous.indexBytesOnDisk
         let phase: EnginePhase
@@ -217,13 +236,17 @@ public final class SearchEngine: @unchecked Sendable {
         } else {
             phase = .ready
         }
-        let updated = EngineStatus(phase: phase, indexedCount: count, inaccessiblePaths: restrictions, indexBytesOnDisk: bytes)
+        let updated = EngineStatus(phase: phase, indexedCount: count, inaccessibleLocations: restrictions,
+                                   rawInaccessibleLocations: raw,
+                                   pendingFullDiskAccessPaths: local.pendingFullDiskAccessPaths ?? [],
+                                   indexBytesOnDisk: bytes)
         let (statusCallback, indexCallback) = lock.withLock {
             reported = updated
             return (statusHandler, indexHandler)
         }
         if phase != previous.phase || count != previous.indexedCount ||
-            restrictions != previous.inaccessiblePaths || bytes != previous.indexBytesOnDisk {
+            coverageChanged || updated.pendingFullDiskAccessPaths != previous.pendingFullDiskAccessPaths ||
+            bytes != previous.indexBytesOnDisk {
             statusCallback?(updated)
         }
         if index, let indexCallback {
@@ -236,18 +259,6 @@ public final class SearchEngine: @unchecked Sendable {
             if deliver { indexCallback() }
             else { scheduleRefresh(for: .index) }
         }
-    }
-
-    static func topLevel(_ paths: [String]) -> [String] {
-        let set = Set(paths)
-        return Array(set.sorted().lazy.filter { path in
-            var ancestor = path
-            while ancestor != "/" {
-                ancestor = parentPath(ancestor)
-                if set.contains(ancestor) { return false }
-            }
-            return true
-        }.prefix(200))
     }
 
     private static func diskBytes(_ directory: URL) -> Int64 {

@@ -12,14 +12,16 @@ typedef struct {
 } DMRecord;
 
 typedef struct {
-    uint32_t denied, disappeared, pending, other_mount, fallback, directory_denied;
+    uint32_t denied, disappeared, pending, other_mount, fallback;
+    int32_t directory_error;
 } DMCounts;
 
 typedef void (*DMEntryCallback)(void *, const uint8_t *, size_t, int64_t, int64_t, uint32_t, uint32_t);
+typedef void (*DMDeniedEntryCallback)(void *, const uint8_t *, size_t, int32_t);
 int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
-            DMEntryCallback callback, void *context, DMCounts *counts);
+            DMEntryCallback callback, DMDeniedEntryCallback denied, void *context, DMCounts *counts);
 int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
-                  void *context, DMCounts *counts);
+                  DMDeniedEntryCallback denied, void *context, DMCounts *counts);
 bool dm_volume_uuid(const char *path, char output[37]);
 uint64_t dm_resident_bytes(void);
 typedef struct {

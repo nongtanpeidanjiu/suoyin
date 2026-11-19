@@ -47,6 +47,8 @@ private struct Item {
 private final class DirectoryBatch {
     var names: [UInt8] = []
     var items: [Item] = []
+    var denied: [String: Int32] = [:]
+    var unidentifiedDenial = false
 }
 
 private let collectEntry: DMEntryCallback = { context, name, length, size, modified, flags, type in
@@ -55,6 +57,16 @@ private let collectEntry: DMEntryCallback = { context, name, length, size, modif
     batch.names.append(contentsOf: UnsafeBufferPointer(start: name, count: length))
     batch.items.append(Item(start: start, length: length, size: size,
                             modified: modified, flags: flags, type: type))
+}
+
+private let collectDenied: DMDeniedEntryCallback = { context, name, length, error in
+    let batch = Unmanaged<DirectoryBatch>.fromOpaque(context!).takeUnretainedValue()
+    guard let name, let component = String(bytes: UnsafeBufferPointer(start: name, count: length), encoding: .utf8),
+          !component.isEmpty, component != ".", component != "..", !component.contains("/") else {
+        batch.unidentifiedDenial = true
+        return
+    }
+    batch.denied[component] = error
 }
 
 private final class ListenerSet {
@@ -119,9 +131,11 @@ struct WalkScope {
     let homeLibrary: String
     let homeCaches: String
     let wholeDisk: Bool
+    let onAccess: ((String) -> Void)?
 
-    init(root: String, clouds: CloudRoots? = nil) throws {
+    init(root: String, clouds: CloudRoots? = nil, onAccess: ((String) -> Void)? = nil) throws {
         self.root = root
+        self.onAccess = onAccess
         wholeDisk = root == "/"
         primaryDevice = try Self.device(root)
         dataDevice = wholeDisk ? try Self.device(dataRoot) : primaryDevice
@@ -222,7 +236,7 @@ private final class ScanSession {
     var error: Error?
     var counts = DMCounts()
     var pending = 0
-    var restricted = Set<String>()
+    var restrictions = [String: Int32]()
     var entries = 0
     var local = true
     var nextPublication = 2_048
@@ -282,8 +296,9 @@ private final class ScanSession {
             let batch = DirectoryBatch()
             var delta = DMCounts()
             let code = readDirectory {
-                dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
-                        collectEntry, Unmanaged.passUnretained(batch).toOpaque(), &delta)
+                scope.onAccess?(job.path)
+                return dm_list(job.path, scope.primaryDevice, scope.dataDevice, ordinary,
+                               collectEntry, collectDenied, Unmanaged.passUnretained(batch).toOpaque(), &delta)
             }
             condition.lock()
             counts.denied += delta.denied
@@ -291,7 +306,16 @@ private final class ScanSession {
             counts.other_mount += delta.other_mount
             counts.pending += delta.pending
             counts.fallback += delta.fallback
-            if delta.directory_denied != 0 { restricted.insert(job.path) }
+            if delta.directory_error != 0 || batch.unidentifiedDenial { restrictions[job.path] = delta.directory_error }
+            if !batch.denied.isEmpty {
+                let isProvider = scope.providerTrashParent(job.path)
+                for (name, error) in batch.denied {
+                    let child = joinedPath(job.path, name)
+                    if !excludedPaths.contains(child), !scope.mirrors.contains(child), !(isProvider && name == ".Trash") {
+                        restrictions[child] = error
+                    }
+                }
+            }
             if (code != 0 || delta.pending != 0), scope.clouds.provider(containing: job.path) != nil {
                 index.attributes[Int(job.parent)] |= Kind.pending
                 if delta.pending != 0 { index.attributes[Int(job.parent)] |= Kind.dataless }
@@ -376,8 +400,9 @@ private final class ScanSession {
 
     func withCoverage() -> SearchIndex {
         var result = index
-        if !restricted.isEmpty {
-            result.tracking = TrackingState(root: scope.root, changes: [:], restricted: restricted)
+        if !restrictions.isEmpty {
+            result.tracking = TrackingState(root: scope.root, changes: [:], restricted: Set(restrictions.keys),
+                                            denialErrors: restrictions)
         }
         return result
     }
@@ -401,9 +426,10 @@ extension SearchIndex {
                  cancelled: cancelled, onProgress: onProgress)
     }
 
-    static func scanDataVolume(keeping sealed: consuming SearchIndex, excluding paths: Set<String>) throws -> SearchIndex {
-        try scan(root: "/", workers: 4, ordinary: false, establishListener: false,
-                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, onProgress: { _, _ in })
+    static func scanDataVolume(scope: WalkScope, keeping sealed: consuming SearchIndex,
+                               excluding paths: Set<String>) throws -> SearchIndex {
+        try scan(root: scope.root, workers: 4, ordinary: false, establishListener: false,
+                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, scope: scope, onProgress: { _, _ in })
     }
 
     private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,
@@ -449,8 +475,7 @@ extension WalkScope {
         return [
             "/Desktop", "/Documents", "/Downloads", "/Library/Mail", "/Library/Messages",
             "/Library/Calendars", "/Library/Safari", "/Library/CloudStorage",
-            "/Library/Mobile Documents", "/Library/Application Support/AddressBook",
-            "/Library/Containers/com.apple.Home"
+            "/Library/Mobile Documents", "/Library/Application Support/AddressBook"
         ].map { home + $0 }
     }
 
@@ -472,6 +497,7 @@ extension WalkScope {
     func observe(_ path: String, inherited: UInt8, excluding excluded: [String],
                  loadCloud: Bool = false) throws -> DirectoryObservation {
         guard !insideProviderTrash(path), !excluded.contains(where: { inside(path, $0) }) else { return .absent }
+        onAccess?(path)
         if let provider = clouds.provider(containing: path) {
             // Avoid walking through an unloaded ancestor to inspect its child.
             var ancestors: [String] = [path]
@@ -481,7 +507,7 @@ extension WalkScope {
             for ancestor in ancestors.reversed() {
                 var checked = stat()
                 if Self.metadata(ancestor, &checked) != 0 {
-                    if errno == EACCES || errno == EPERM { return .restricted }
+                    if errno == EACCES || errno == EPERM { return .denied(errno) }
                     if errno == ENOTDIR || errno == ENOENT { return .absent }
                     throw ScanError.metadata(path: ancestor, error: errno)
                 }
@@ -493,7 +519,7 @@ extension WalkScope {
         }
         var own = stat()
         if Self.metadata(path, &own) != 0 {
-            if errno == EACCES || errno == EPERM { return .restricted }
+            if errno == EACCES || errno == EPERM { return .denied(errno) }
             if errno == ENOENT || errno == ENOTDIR || errno == ELOOP { return .absent }
             throw ScanError.metadata(path: path, error: errno)
         }
@@ -504,16 +530,18 @@ extension WalkScope {
         guard own.st_dev == primaryDevice || own.st_dev == dataDevice else { return .absent }
         let error = readDirectory {
             loadCloud
-                ? dm_list_cloud(path, own.st_dev, collectEntry, context, &counts)
-                : dm_list(path, primaryDevice, dataDevice, false, collectEntry, context, &counts)
+                ? dm_list_cloud(path, own.st_dev, collectEntry, collectDenied, context, &counts)
+                : dm_list(path, primaryDevice, dataDevice, false, collectEntry, collectDenied, context, &counts)
         }
         if error != 0 { throw ScanError.metadata(path: path, error: error) }
         if counts.pending != 0, clouds.provider(containing: path) != nil { return .pending(dataless: true) }
-        if counts.denied != 0 || counts.pending != 0 || counts.other_mount != 0 { return .restricted }
+        if counts.directory_error != 0 { return .denied(counts.directory_error) }
+        if batch.unidentifiedDenial { return .restricted }
+        if counts.pending != 0 || counts.other_mount != 0 { return .deferred }
         if loadCloud && counts.disappeared != 0 { return .deferred }
         if counts.disappeared != 0 && Self.metadata(path, &own) != 0 {
             if errno == ENOENT || errno == ENOTDIR { return .absent }
-            if errno == EACCES || errno == EPERM { return .restricted }
+            if errno == EACCES || errno == EPERM { return .denied(errno) }
             throw ScanError.metadata(path: path, error: errno)
         }
         var children: [String: TrackedEntry] = [:]
@@ -549,13 +577,17 @@ extension WalkScope {
         let (total, addOverflow) = seconds.addingReportingOverflow(Int64(own.st_mtimespec.tv_nsec))
         let time = overflow || addOverflow ? (own.st_mtimespec.tv_sec < 0 ? Int64.min : Int64.max) : total
         return .readable(own: TrackedEntry(size: own.st_size, modified: time, attribute: ownFlags),
-                         children: children)
+                         children: children, denied: batch.denied.filter {
+            !excludedChildren.contains($0.key) && !mirroredChildren.contains($0.key) &&
+                !(containsDataRoot && $0.key == dataName) && !(providerTrash && $0.key == ".Trash")
+        })
     }
 
     // Cloud observation must check unavailable ancestors before accessing a leaf.
     // Reconcile those paths using the guarded directory reader.
     func observeEntry(_ path: String, inherited: UInt8, verifyAccess: Bool = false) -> EntryObservation {
         guard clouds.provider(containing: path) == nil else { return .unverified }
+        onAccess?(path)
         var info = stat()
         if Self.metadata(path, &info) != 0 {
             return errno == ENOENT ? .missing : .unverified

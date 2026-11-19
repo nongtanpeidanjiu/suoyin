@@ -21,8 +21,8 @@ struct JournalFrame {
         }
         for row in rows { index.tracking!.changes[row.path] = row.value }
         for (path, restricted) in coverage {
-            if restricted { index.tracking!.restricted.insert(path) }
-            else { index.tracking!.restricted.remove(path) }
+            if restricted { index.tracking!.recordDenial(path, error: nil) }
+            else { index.tracking!.clearDenial(path) }
         }
         for (id, hidden) in masks {
             let offset = Int(id)

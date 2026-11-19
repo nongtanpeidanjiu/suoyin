@@ -1,3 +1,5 @@
+import CoreServices
+import Darwin
 import Foundation
 import Testing
 @testable import SearchCore
@@ -90,6 +92,12 @@ struct EngineTests {
 
         tracker.injectPermissionObservation(folder.path, .restricted)
         try #require(until { events.status?.inaccessiblePaths == [folder.path] })
+        #expect(engine.status.inaccessibleLocationCount == 1)
+        #expect(engine.status.rawInaccessibleLocations == [
+            InaccessibleLocation(path: folder.path, count: 1, reason: .unknown)
+        ])
+        tracker.injectPermissionObservation(folder.path, .denied(EACCES))
+        try #require(until { events.status?.inaccessibleLocations.first?.reason == .filePermissions })
         #expect(engine.search(EngineQuery(text: "known-file")).hits.isEmpty)
         engine.recheckAccess()
         try #require(until { engine.status.inaccessiblePaths.isEmpty })
@@ -103,8 +111,188 @@ struct EngineTests {
         let times = events.indexTimes
         #expect(times.count >= 2)
         #expect(zip(times, times.dropFirst()).allSatisfy { $1 - $0 >= 245_000_000 })
-        #expect(SearchEngine.topLevel(["/a/b", "/a", "/a", "/ab", "/a/c"]) == ["/a", "/ab"])
-        #expect(SearchEngine.topLevel((0...220).map { "/dir-\($0)" }).count == 200)
+    }
+
+    @Test func inaccessibleLocationsPreserveCountsAndReasonsAcrossTheDisk() {
+        let raw: [InaccessibleLocation] = [
+            .init(path: "/Library/Fixture", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Child", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Other", count: 1, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Unknown", count: 1, reason: .unknown),
+            .init(path: "/System/Fixture", count: 1, reason: .unknown),
+            .init(path: "/private/var/Fixture", count: 1, reason: .filePermissions),
+            .init(path: "/Users/fixture/Documents/A", count: 1, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Users/fixture/Documents/B", count: 1, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Volumes/Fixture disk/Folder", count: 1, reason: .filePermissions)
+        ]
+        let grouped = AccessDenials.summarize(raw)
+        #expect(grouped == [
+            .init(path: "/Library", count: 3, reason: .filePermissions),
+            .init(path: "/Library/Fixture/Unknown", count: 1, reason: .unknown),
+            .init(path: "/System/Fixture", count: 1, reason: .unknown),
+            .init(path: "/Users/fixture/Documents", count: 2, reason: .likelyNeedsFullDiskAccess),
+            .init(path: "/Volumes/Fixture disk/Folder", count: 1, reason: .filePermissions),
+            .init(path: "/private/var/Fixture", count: 1, reason: .filePermissions)
+        ])
+        #expect(grouped.reduce(0) { $0 + $1.count } == raw.count)
+        let branches = (0...220).map { InaccessibleLocation(path: "/Library/Branch-\($0)/Leaf", count: 1, reason: .unknown) }
+        #expect(AccessDenials.summarize(branches) == branches.sorted { $0.path < $1.path })
+
+        let observed = AccessDenials(home: "/Users/fixture")
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: true)
+            == .likelyNeedsFullDiskAccess)
+        #expect(observed.reason(at: dataRoot + "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: true)
+            == .likelyNeedsFullDiskAccess)
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EACCES, missingFullDiskAccess: true) == .filePermissions)
+        #expect(observed.reason(at: "/Users/fixture/Documents/A", error: EPERM, missingFullDiskAccess: false) == .unknown)
+        #expect(observed.reason(at: "/System/Fixture", error: EPERM, missingFullDiskAccess: true) == .unknown)
+        #expect(observed.reason(at: "/Users/fixture/Documents2", error: EPERM, missingFullDiskAccess: true) == .unknown)
+        #expect(observed.reason(at: "/Users/fixture/Library/Mail", error: nil, missingFullDiskAccess: true) == .unknown)
+    }
+
+    @Test func aDeniedEntryDoesNotHideItsReadableSiblings() {
+        var base = SearchIndex()
+        let parent = base.append("/fixture", attribute: Kind.anchor)
+        base.append("denied", parent: parent, attribute: Kind.file)
+        base.append("readable", parent: parent, attribute: Kind.file)
+        base.prepare()
+        let folder = TrackedEntry(size: 0, modified: 0, attribute: Kind.directory)
+        let leaf = TrackedEntry(size: 0, modified: 0, attribute: Kind.file)
+        var index = LiveIndex(base: base, root: "/fixture")
+        _ = index.reconcile(path: "/fixture", observed: .readable(own: folder, children: ["readable": leaf],
+                                                                  denied: ["denied": EACCES]))
+        #expect(index.entry(at: "/fixture/denied") == nil)
+        #expect(index.entry(at: "/fixture/readable") != nil)
+        #expect(index.state.restricted == ["/fixture/denied"])
+        #expect(index.state.denialErrors == ["/fixture/denied": EACCES])
+        _ = index.reconcile(path: "/fixture", observed: .readable(own: folder,
+                                                                  children: ["readable": leaf, "denied": leaf]))
+        #expect(index.state.restricted.isEmpty)
+        #expect(index.state.denialErrors?.isEmpty == true)
+        #expect(index.entry(at: "/fixture/denied") != nil)
+    }
+
+    @Test func protectedContainersAreNeverProbedUntilAuthorized() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        let trace = AccessTrace()
+        let access = ContainerAccess(home: root.path, probe: { trace.granted })
+        for (i, path) in access.roots.enumerated() {
+            let child = URL(fileURLWithPath: path).appendingPathComponent("app-data")
+            try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+            try Data().write(to: child.appendingPathComponent("private-fixture-\(i)"))
+        }
+        #expect(access.paths(includeDataAliases: true) == access.roots + access.roots.map { dataRoot + $0 })
+        func start() throws -> (SearchEngine, ChangeTracker) {
+            let tracker = try ChangeTracker(root: root.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                            ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                            containerAccess: access, onAccess: { trace.record($0) })
+            let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+            engine.start()
+            return (engine, tracker)
+        }
+        let query = EngineQuery(text: "private-fixture", showAll: true)
+        let (engine, tracker) = try start()
+        defer { engine.stop() }
+        try #require(until { engine.status.awaitingFullDiskAccess && engine.status.indexBytesOnDisk > 0 })
+        #expect(engine.status.pendingFullDiskAccessPaths == access.roots)
+        #expect(engine.status.pendingFullDiskAccessCount == 2)
+        #expect(engine.status.inaccessibleLocationCount == 0)
+        #expect(trace.paths(under: access.roots).isEmpty)
+        trace.reset()
+        let parent = parentPath(access.roots[0])
+        let changed = UInt32(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagItemIsDir)
+        try tracker.deliverForTesting([
+            VolumeEvent(path: parent, id: 900, flags: changed),
+            VolumeEvent(path: access.roots[0], id: 901, flags: UInt32(kFSEventStreamEventFlagItemIsDir)),
+            VolumeEvent(path: access.roots[1] + "/app-data/private-fixture-1", id: 902, flags: 0)
+        ])
+        tracker.recheckCoverage(at: access.roots)
+        engine.recheckAccess()
+        tracker.synchronize()
+        #expect(trace.paths(under: [parent]).contains(parent))
+        #expect(trace.paths(under: access.roots).isEmpty)
+        engine.rebuild()
+        try #require(until { tracker.snapshotStatus().recovery == "manual-rebuild" &&
+            tracker.snapshotStatus().phase == "caught-up" })
+        #expect(engine.search(query).hits.isEmpty)
+        #expect(engine.status.inaccessiblePaths.isEmpty)
+        #expect(trace.paths(under: access.roots).isEmpty)
+        engine.stop()
+
+        trace.granted = true
+        let (reopened, reopenedTracker) = try start()
+        defer { reopened.stop() }
+        try #require(until { reopened.search(query).total == 2 })
+        #expect(access.roots.allSatisfy { !trace.paths(under: [$0]).isEmpty })
+        try #require(until { reopenedTracker.snapshotStatus().phase == "caught-up" })
+        reopened.stop()
+
+        trace.granted = false
+        trace.reset()
+        let (restricted, restrictedTracker) = try start()
+        defer { restricted.stop() }
+        try #require(until { restricted.status.awaitingFullDiskAccess && restricted.status.phase == .ready })
+        #expect(restricted.search(query).hits.isEmpty)
+        #expect(restricted.status.inaccessiblePaths.isEmpty)
+        #expect(trace.paths(under: access.roots).isEmpty)
+
+        trace.granted = true
+        restricted.recheckAccess()
+        try #require(until { !restricted.status.awaitingFullDiskAccess && restricted.search(query).total == 2 })
+        #expect(restricted.status.pendingFullDiskAccessPaths.isEmpty)
+        #expect(restricted.status.pendingFullDiskAccessCount == 0)
+        trace.granted = false
+        trace.reset()
+        restricted.recheckAccess()
+        restrictedTracker.synchronize()
+        try #require(until { restricted.status.awaitingFullDiskAccess })
+        #expect(restricted.search(query).hits.isEmpty)
+        #expect(trace.paths(under: access.roots).isEmpty)
+    }
+
+    @Test func manualRebuildBypassesLossDelayAndKeepsOldView() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: false)
+        try Data().write(to: root.appendingPathComponent("stable-fixture"))
+        let timing = RecoveryTiming(quietWindow: 30 * ReplayLag.second)
+        let entered = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let trace = AccessTrace()
+        let tracker = try ChangeTracker(root: root.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                        recoveryTiming: timing, onAccess: { path in
+            if path == root.path && trace.granted {
+                entered.signal()
+                _ = resume.wait(timeout: .now() + .seconds(5))
+            }
+        })
+        let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+        engine.start()
+        defer { engine.stop() }
+        defer { resume.signal() }
+        try #require(until { tracker.snapshotStatus().phase == "caught-up" })
+
+        tracker.simulateDroppedHistory()
+        tracker.synchronize()
+        #expect(tracker.snapshotStatus().nextRecoveryAt ?? 0 > Date().timeIntervalSince1970 + 20)
+        trace.granted = true
+        engine.rebuild()
+        try #require(entered.wait(timeout: .now() + .seconds(3)) == .success)
+        try #require(until(seconds: 2) { engine.status.phase == .recovering })
+        #expect(engine.search(EngineQuery(text: "stable-fixture")).total == 1)
+        resume.signal()
+        try #require(until { tracker.snapshotStatus().phase == "caught-up" })
+        #expect(tracker.snapshotStatus().recovery == "manual-rebuild")
+
+        tracker.simulateDroppedHistory()
+        tracker.synchronize()
+        let next = try #require(tracker.snapshotStatus().nextRecoveryAt)
+        #expect(next < Date().timeIntervalSince1970 + 40)
     }
 
     @Test func placeholderAndVolumeFlagsUseIndexedMetadata() throws {
@@ -142,5 +330,22 @@ struct EngineTests {
         var status: EngineStatus? { lock.withLock { lastStatus } }
         func record(_ status: EngineStatus) { lock.withLock { lastStatus = status } }
         func recordIndex() { lock.withLock { times.append(DispatchTime.now().uptimeNanoseconds) } }
+    }
+
+    private final class AccessTrace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var observations: [String] = []
+        private var allowed = false
+
+        var granted: Bool {
+            get { lock.withLock { allowed } }
+            set { lock.withLock { allowed = newValue } }
+        }
+
+        func record(_ path: String) { lock.withLock { observations.append(path) } }
+        func reset() { lock.withLock { observations.removeAll() } }
+        func paths(under roots: [String]) -> [String] {
+            lock.withLock { observations.filter { path in roots.contains { inside(path, $0) } } }
+        }
     }
 }

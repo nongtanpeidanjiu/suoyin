@@ -19,9 +19,18 @@ private struct EngineCommand: Decodable {
 }
 
 private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
+    func encodeLocation(_ location: InaccessibleLocation) -> [String: Any] {
+        ["path": location.path, "count": location.count, "reason": location.reason.rawValue]
+    }
     var result: [String: Any] = [
         "indexedCount": status.indexedCount,
         "inaccessiblePaths": status.inaccessiblePaths,
+        "inaccessibleLocations": status.inaccessibleLocations.map(encodeLocation),
+        "rawInaccessibleLocations": status.rawInaccessibleLocations.map(encodeLocation),
+        "inaccessibleLocationCount": status.inaccessibleLocationCount,
+        "awaitingFullDiskAccess": status.awaitingFullDiskAccess,
+        "pendingFullDiskAccessPaths": status.pendingFullDiskAccessPaths,
+        "pendingFullDiskAccessCount": status.pendingFullDiskAccessCount,
         "indexBytesOnDisk": status.indexBytesOnDisk
     ]
     switch status.phase {

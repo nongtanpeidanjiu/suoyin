@@ -21,9 +21,10 @@ func joinedPath(_ parent: String, _ name: String) -> String {
 }
 
 enum DirectoryObservation {
-    case readable(own: TrackedEntry, children: [String: TrackedEntry])
+    case readable(own: TrackedEntry, children: [String: TrackedEntry], denied: [String: Int32] = [:])
     case absent
     case restricted
+    case denied(Int32)
     case pending(dataless: Bool)
     case deferred
 }
@@ -248,7 +249,8 @@ struct LiveIndex {
                                          modified: row.modified, attribute: row.attribute)
             if row.directory { parents[path] = appended }
         }
-        result.tracking = TrackingState(root: state.root, changes: [:], restricted: state.restricted)
+        result.tracking = TrackingState(root: state.root, changes: [:], restricted: state.restricted,
+                                        denialErrors: state.denialErrors)
         result.prepare()
         return result
     }
@@ -259,11 +261,15 @@ struct LiveIndex {
         var reopened: [String] = []
         for path in paths where inside(path, state.root) {
             switch observe(path) {
-            case .readable:
+            case let .readable(own, children, denied):
                 if state.restricted.contains(path) { reopened.append(path) }
-            case .absent: _ = reconcile(path: path, observed: .absent)
+                if !denied.isEmpty {
+                    reopened += reconcile(path: path, observed: .readable(own: own, children: children, denied: denied))
+                }
+            case .absent: reopened += reconcile(path: path, observed: .absent)
             case .pending(let dataless): _ = reconcile(path: path, observed: .pending(dataless: dataless))
             case .deferred, .restricted, nil: _ = reconcile(path: path, observed: .restricted)
+            case .denied(let error): _ = reconcile(path: path, observed: .denied(error))
             }
         }
         prepareDelta()
@@ -488,6 +494,15 @@ struct LiveIndex {
         prepareDelta()
     }
 
+    mutating func purgeSubtree(_ path: String) {
+        removeSubtree(path, includingRoot: true)
+        if let id = baseID(at: path) { set(nil, path: path, original: id) }
+        for anchor in links?.anchors.keys.filter({ $0 != path && inside($0, path) }) ?? [] {
+            removeSubtree(anchor, includingRoot: true)
+        }
+        state.clearDenials(in: path)
+    }
+
     /// Return children requiring recursive enumeration because their subtree is new.
     mutating func reconcile(path: String, observed: DirectoryObservation, completingCloud: Bool = false) -> [String] {
         if isRestricted(path, includingSelf: false) { return [] }
@@ -505,17 +520,33 @@ struct LiveIndex {
             return []
         case .restricted:
             removeSubtree(path, includingRoot: false)
-            state.restricted.insert(path)
+            state.recordDenial(path, error: nil)
+            return []
+        case .denied(let error):
+            removeSubtree(path, includingRoot: false)
+            state.recordDenial(path, error: error)
             return []
         case .absent:
+            let revisitParent = path != state.root && state.restricted.contains(path)
             removeSubtree(path, includingRoot: true)
             if let id = baseID(at: path) {
                 set(nil, path: path, original: id)
             }
-            state.restricted = state.restricted.filter { !inside($0, path) }
-            return []
-        case let .readable(own, children):
-            let needsRestore = state.restricted.remove(path) != nil
+            state.clearDenials(in: path)
+            // This can be a previously denied regular file whose metadata is
+            // now readable. Its parent can restore the row in either case.
+            return revisitParent ? [parentPath(path)] : []
+        case let .readable(own, children, denied):
+            let needsRestore = state.clearDenial(path)
+            for child in state.restricted.filter({ parentPath($0) == path && $0 != path }) {
+                let name = leafName(child)
+                if denied[name] == nil && children[name]?.directory != true {
+                    state.clearDenials(in: child)
+                }
+            }
+            for (name, error) in denied {
+                state.recordDenial(joinedPath(path, name), error: error)
+            }
             if path != state.root, let existing = entry(at: path) {
                 var flags = (existing.attribute & ~Kind.dataless) | (own.attribute & Kind.dataless)
                 if completingCloud { flags &= ~Kind.pending }
@@ -672,8 +703,11 @@ extension SearchIndex {
         }
         if let tracking {
             let changes = try Dictionary(uniqueKeysWithValues: tracking.changes.map { (try rebase($0.key), $0.value) })
+            let errors = try tracking.denialErrors.map { values in
+                try Dictionary(uniqueKeysWithValues: values.map { (try rebase($0.key), $0.value) })
+            }
             relocated.tracking = TrackingState(root: new, changes: changes,
-                                               restricted: try Set(tracking.restricted.map(rebase)))
+                                               restricted: try Set(tracking.restricted.map(rebase)), denialErrors: errors)
         }
         relocated.volumes = volumes
         relocated.suppressed = suppressed

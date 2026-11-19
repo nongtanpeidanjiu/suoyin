@@ -22,7 +22,13 @@ static int expected_error(int error, DMCounts *counts) {
 }
 
 static int directory_error(int error, DMCounts *counts) {
-    if (error == EACCES || error == EPERM) counts->directory_denied++;
+    if (error == EACCES || error == EPERM) counts->directory_error = error;
+    return expected_error(error, counts);
+}
+
+static int entry_error(int error, const unsigned char *name, size_t length,
+                       DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
+    if (error == EACCES || error == EPERM) denied(context, name, length, error);
     return expected_error(error, counts);
 }
 
@@ -42,17 +48,18 @@ static uint32_t node_type(mode_t mode) {
 }
 
 static int stat_entry(int fd, const char *name, DMEntryCallback callback,
-                      void *context, DMCounts *counts) {
+                      DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
     struct stat st;
     int result;
     do { result = fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW); } while (result < 0 && errno == EINTR);
-    if (result < 0) return expected_error(errno, counts);
+    if (result < 0) return entry_error(errno, (const uint8_t *)name, strlen(name), denied, context, counts);
     callback(context, (const uint8_t *)name, strlen(name), st.st_size,
              timestamp(st.st_mtimespec), st.st_flags, node_type(st.st_mode));
     return 0;
 }
 
-static int ordinary_list(int fd, DMEntryCallback callback, void *context, DMCounts *counts) {
+static int ordinary_list(int fd, DMEntryCallback callback, DMDeniedEntryCallback denied,
+                         void *context, DMCounts *counts) {
     DIR *directory = fdopendir(fd);
     if (!directory) {
         int error = errno;
@@ -66,7 +73,7 @@ static int ordinary_list(int fd, DMEntryCallback callback, void *context, DMCoun
         if (!entry && errno == EINTR) continue;
         if (!entry) { error = directory_error(errno, counts); break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        error = stat_entry(dirfd(directory), entry->d_name, callback, context, counts);
+        error = stat_entry(dirfd(directory), entry->d_name, callback, denied, context, counts);
         if (error) break;
     }
     closedir(directory);
@@ -81,14 +88,17 @@ static bool unpack(const unsigned char **p, const unsigned char *end, void *out,
 }
 
 static int bulk_record(int fd, const unsigned char *record, const unsigned char *end,
-                       DMEntryCallback callback, void *context, DMCounts *counts) {
+                       DMEntryCallback callback, DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
     const unsigned char *cursor = record + sizeof(uint32_t);
     attribute_set_t returned;
     if (!unpack(&cursor, end, &returned, sizeof(returned))) return EPROTO;
     uint32_t row_error = 0;
     if ((returned.commonattr & ATTR_CMN_ERROR) &&
         !unpack(&cursor, end, &row_error, sizeof(row_error))) return EPROTO;
-    if (row_error) return expected_error((int)row_error, counts);
+    if (row_error && (row_error != EACCES && row_error != EPERM))
+        return expected_error((int)row_error, counts);
+    if (row_error && !(returned.commonattr & ATTR_CMN_NAME))
+        return entry_error((int)row_error, NULL, 0, denied, context, counts);
     if (!(returned.commonattr & ATTR_CMN_NAME)) return EPROTO;
 
     const unsigned char *ref = cursor;
@@ -100,17 +110,18 @@ static int bulk_record(int fd, const unsigned char *record, const unsigned char 
     if (name_ref.attr_length > end - name ||
         name[name_ref.attr_length - 1] != 0 ||
         memchr(name, 0, name_ref.attr_length - 1)) return EPROTO;
+    if (row_error) return entry_error((int)row_error, name, name_ref.attr_length - 1, denied, context, counts);
 
     const uint32_t needed = ATTR_CMN_OBJTYPE | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS;
     if ((returned.commonattr & needed) != needed)
-        return stat_entry(fd, (const char *)name, callback, context, counts);
+        return stat_entry(fd, (const char *)name, callback, denied, context, counts);
     uint32_t type, flags;
     struct timespec modified;
     if (!unpack(&cursor, name, &type, sizeof(type)) ||
         !unpack(&cursor, name, &modified, sizeof(modified)) ||
         !unpack(&cursor, name, &flags, sizeof(flags))) return EPROTO;
     if (type != VREG || !(returned.fileattr & ATTR_FILE_DATALENGTH))
-        return stat_entry(fd, (const char *)name, callback, context, counts);
+        return stat_entry(fd, (const char *)name, callback, denied, context, counts);
     int64_t size;
     if (!unpack(&cursor, name, &size, sizeof(size))) return EPROTO;
     callback(context, name, name_ref.attr_length - 1, size, timestamp(modified), flags, type);
@@ -118,7 +129,8 @@ static int bulk_record(int fd, const unsigned char *record, const unsigned char 
 }
 
 static int list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
-                bool load_directory, DMEntryCallback callback, void *context, DMCounts *counts) {
+                bool load_directory, DMEntryCallback callback, DMDeniedEntryCallback denied,
+                void *context, DMCounts *counts) {
     struct stat st;
     int result;
     do { result = lstat(path, &st); } while (result < 0 && errno == EINTR);
@@ -134,7 +146,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
     if (result < 0) { int error = errno; close(fd); return directory_error(error, counts); }
     if (st.st_dev != device_a && st.st_dev != device_b) { close(fd); counts->other_mount++; return 0; }
     if (!load_directory && (st.st_flags & SF_DATALESS)) { close(fd); counts->pending++; return 0; }
-    if (ordinary) return ordinary_list(fd, callback, context, counts);
+    if (ordinary) return ordinary_list(fd, callback, denied, context, counts);
 
     struct attrlist attrs = {
         .bitmapcount = ATTR_BIT_MAP_COUNT,
@@ -153,7 +165,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
             if (!started && (code == ENOTSUP || code == EOPNOTSUPP || code == ENOSYS)) {
                 if (lseek(fd, 0, SEEK_SET) < 0) { error = errno; break; }
                 counts->fallback++;
-                return ordinary_list(fd, callback, context, counts);
+                return ordinary_list(fd, callback, denied, context, counts);
             }
             error = directory_error(code, counts);
             break;
@@ -169,7 +181,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
                 error = EPROTO;
                 break;
             }
-            error = bulk_record(fd, record, record + length, callback, context, counts);
+            error = bulk_record(fd, record, record + length, callback, denied, context, counts);
             if (error) break;
             record += length;
         }
@@ -180,15 +192,15 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
 }
 
 int dm_list(const char *path, int32_t device_a, int32_t device_b, bool ordinary,
-            DMEntryCallback callback, void *context, DMCounts *counts) {
-    return list(path, device_a, device_b, ordinary, false, callback, context, counts);
+            DMEntryCallback callback, DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
+    return list(path, device_a, device_b, ordinary, false, callback, denied, context, counts);
 }
 
 int dm_list_cloud(const char *path, int32_t device, DMEntryCallback callback,
-                  void *context, DMCounts *counts) {
+                  DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
     // Opening the directory may ask the provider for its listing. Regular
     // files are only inspected with getattrlistbulk or fstatat.
-    return list(path, device, device, false, true, callback, context, counts);
+    return list(path, device, device, false, true, callback, denied, context, counts);
 }
 
 bool dm_volume_uuid(const char *path, char output[37]) {

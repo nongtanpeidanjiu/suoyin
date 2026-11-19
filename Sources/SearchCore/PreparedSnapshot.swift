@@ -15,6 +15,28 @@ struct TrackingState: Codable {
     let root: String
     var changes: [String: TrackedEntry]
     var restricted: Set<String>
+    var denialErrors: [String: Int32]? = nil
+
+    mutating func recordDenial(_ path: String, error: Int32?) {
+        restricted.insert(path)
+        if let error {
+            if denialErrors == nil { denialErrors = [:] }
+            denialErrors?[path] = error
+        } else {
+            denialErrors?.removeValue(forKey: path)
+        }
+    }
+
+    @discardableResult
+    mutating func clearDenial(_ path: String) -> Bool {
+        denialErrors?.removeValue(forKey: path)
+        return restricted.remove(path) != nil
+    }
+
+    mutating func clearDenials(in path: String) {
+        restricted = restricted.filter { !inside($0, path) }
+        denialErrors = denialErrors?.filter { !inside($0.key, path) }
+    }
 }
 
 private struct SnapshotMetadata: Codable {

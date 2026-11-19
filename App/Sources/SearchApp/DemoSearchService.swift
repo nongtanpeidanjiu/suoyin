@@ -45,9 +45,13 @@ final class DemoSearchService: SearchService {
         ExternalVolume(id: "demo-stick", name: "演示 U 盘", isOnline: true, isIncluded: false,
                        indexedCount: 0, retainedCount: 12_877, filesystem: "msdos", capacityBytes: 63_864_569_856),
         ExternalVolume(id: "demo-archive", name: "演示归档盘", isOnline: false, isIncluded: true,
-                       indexedCount: 0, retainedCount: 230_118, filesystem: "apfs", capacityBytes: 2_000_398_934_016),
+                       indexedCount: 0, retainedCount: 230_118, filesystem: "apfs", capacityBytes: 2_000_398_934_016,
+                       canForget: true),
         ExternalVolume(id: "3F2A9C41-demo", name: "3F2A9C41", nameIsPlaceholder: true, isOnline: false, isIncluded: true,
-                       indexedCount: 0, retainedCount: nil),
+                       indexedCount: 0, retainedCount: nil, canForget: true),
+        ExternalVolume(id: "demo-old-camera", name: "演示旧相机卡", isOnline: false, isIncluded: false,
+                       indexedCount: 0, retainedCount: 0, filesystem: "msdos", capacityBytes: 31_914_983_424,
+                       canForget: true),
     ]
     /// How many entries each volume being read ends up with.
     private var scanTargets: [String: Int] = ["demo-backup": 386_540, "demo-portable": 171_500, "demo-stick": 19_340]
@@ -59,7 +63,9 @@ final class DemoSearchService: SearchService {
     var externalVolumes: [ExternalVolume] { volumes }
     /// `--demo-volume-error [category]` shows how a settings error of the
     /// core looks; the category defaults to a failed save.
-    let externalVolumeSettingsError: ExternalVolumeSettingsError? = {
+    var externalVolumeSettingsError: ExternalVolumeSettingsError? { forgetError ?? launchVolumeError }
+    private var forgetError: ExternalVolumeSettingsError?
+    private let launchVolumeError: ExternalVolumeSettingsError? = {
         let arguments = CommandLine.arguments
         guard let flag = arguments.firstIndex(of: "--demo-volume-error") else { return nil }
         let categories: [String: ExternalVolumeSettingsError.Category] = [
@@ -79,6 +85,7 @@ final class DemoSearchService: SearchService {
     }
 
     func setExternalVolume(_ id: String, included: Bool) {
+        forgetError = nil
         guard let index = volumes.firstIndex(where: { $0.id == id }), volumes[index].isIncluded != included else { return }
         var volume = volumes[index]
         volume.isIncluded = included
@@ -99,6 +106,7 @@ final class DemoSearchService: SearchService {
     }
 
     func removeExternalVolumeData(_ id: String) {
+        forgetError = nil
         guard let index = volumes.firstIndex(where: { $0.id == id }) else { return }
         // As the core does: a detached volume is forgotten, an attached one
         // stays listed, left out, with nothing kept.
@@ -111,6 +119,30 @@ final class DemoSearchService: SearchService {
             volumes[index].retainedCount = 0
         }
         changedVolumes()
+    }
+
+    /// As the core does: an attached volume is refused, a detached one is
+    /// shown as being removed for a moment (the core's “pending” case) and
+    /// then leaves the list.
+    func forgetExternalVolume(_ id: String) {
+        forgetError = nil
+        guard let index = volumes.firstIndex(where: { $0.id == id }) else {
+            forgetError = ExternalVolumeSettingsError(category: .forgetNotFound, underlyingMessage: "")
+            onExternalVolumesChange?()
+            return
+        }
+        guard !volumes[index].isOnline else {
+            forgetError = ExternalVolumeSettingsError(category: .forgetOnline, underlyingMessage: "")
+            onExternalVolumesChange?()
+            return
+        }
+        volumes[index].isRemoving = true
+        onExternalVolumesChange?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            self.volumes.removeAll { $0.id == id }
+            self.onExternalVolumesChange?()
+        }
     }
 
     private func changedVolumes() {

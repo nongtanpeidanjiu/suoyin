@@ -484,6 +484,7 @@ private final class ScopePane: SettingsPane {
             self?.updateVolumes()
         }
         volumeList.onDelete = { [weak self] volume in self?.askToDelete(volume) }
+        volumeList.onForget = { [weak self] volume in self?.askToForget(volume) }
         volumeList.onHeightChange = { [weak self] in self?.onSizeChange?() }
         addRow(nil, volumeList, gap: 4)
         (volumeErrorRow, volumeError) = messageRow(after: 2)
@@ -553,6 +554,13 @@ private final class ScopePane: SettingsPane {
     private func askToDelete(_ volume: ExternalVolume) {
         ExternalVolumeConfirmation.askToDelete(volume, in: view.window) { [weak self] in
             self?.service.removeExternalVolumeData(volume.id)
+            self?.updateVolumes()
+        }
+    }
+
+    private func askToForget(_ volume: ExternalVolume) {
+        ExternalVolumeConfirmation.askToForget(volume, in: view.window) { [weak self] in
+            self?.service.forgetExternalVolume(volume.id)
             self?.updateVolumes()
         }
     }

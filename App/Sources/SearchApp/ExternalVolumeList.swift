@@ -9,9 +9,11 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
 
     /// Called with a volume's id and whether it should be searched.
     var onToggle: ((String, Bool) -> Void)?
-    /// Called with a volume whose indexed data the user asked to delete;
-    /// nil hides the menu.
+    /// Called with a volume whose indexed data the user asked to delete.
     var onDelete: ((ExternalVolume) -> Void)?
+    /// Called with a volume the user asked to take off the list. With
+    /// neither this nor `onDelete` set the menu is hidden.
+    var onForget: ((ExternalVolume) -> Void)?
     /// Called after the list changed height.
     var onHeightChange: (() -> Void)?
 
@@ -129,11 +131,27 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         item.representedObject = volume.id
         // Greyed out rather than hidden, so the menu looks the same on every
         // row: there is nothing to delete, or it has not been counted yet.
-        item.isEnabled = volume.hasRetainedData
-        if !item.isEnabled {
-            item.toolTip = volume.retainedCount == nil ? "正在统计已收录的条目，稍后再试" : "这块磁盘没有已收录的数据"
+        if onDelete != nil {
+            item.isEnabled = volume.hasRetainedData && !volume.isRemoving
+            if volume.isRemoving {
+                item.toolTip = "正在从列表中移除"
+            } else if !item.isEnabled {
+                item.toolTip = volume.retainedCount == nil ? "正在统计已收录的条目，稍后再试" : "这块磁盘没有已收录的数据"
+            }
+            menu.addItem(item)
         }
-        menu.addItem(item)
+        if onForget != nil {
+            let forget = NSMenuItem(title: "从列表中移除…", action: #selector(forgetChosen(_:)), keyEquivalent: "")
+            forget.target = self
+            forget.representedObject = volume.id
+            forget.isEnabled = volume.canForget && !volume.isRemoving
+            if volume.isRemoving {
+                forget.toolTip = "正在从列表中移除"
+            } else if !volume.canForget {
+                forget.toolTip = volume.isOnline ? "磁盘连接时不能移除，请先推出磁盘" : "这块磁盘现在不能移除"
+            }
+            menu.addItem(forget)
+        }
     }
 
     /// The right-click menu of the row under the pointer.
@@ -149,8 +167,14 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
         onDelete?(volume)
     }
 
-    /// The “…” button shows only where its one item can be used at all.
-    var showsMenu: Bool { onDelete != nil }
+    @objc private func forgetChosen(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let volume = volumes.first(where: { $0.id == id }) else { return }
+        onForget?(volume)
+    }
+
+    /// The “…” button shows only where the list has a menu at all. It stays
+    /// clickable when every item of a row is greyed out.
+    var showsMenu: Bool { onDelete != nil || onForget != nil }
 }
 
 /// One volume: symbol, name with its detail, state line, switch and an
@@ -195,7 +219,7 @@ private final class VolumeCell: NSTableCellView {
         more.contentTintColor = .secondaryLabelColor
         more.target = self
         more.action = #selector(showMenu)
-        more.toolTip = "删除已收录的数据…"
+        more.toolTip = "更多操作"
 
         let title = NSStackView(views: [nameLabel, detailLabel])
         title.spacing = 6
@@ -242,6 +266,7 @@ private final class VolumeCell: NSTableCellView {
         if stateLabel.stringValue != volume.stateLine { stateLabel.stringValue = volume.stateLine }
         let state: NSControl.StateValue = volume.isIncluded ? .on : .off
         if toggle.state != state { toggle.state = state }
+        toggle.isEnabled = !volume.isRemoving
         toggle.setAccessibilityLabel("将“\(volume.title)”加入搜索")
         more.isHidden = !owner.showsMenu
         more.setAccessibilityLabel("“\(volume.title)”的更多操作")
@@ -279,6 +304,33 @@ enum ExternalVolumeConfirmation {
         delete.hasDestructiveAction = true
         // Return cancels; deleting takes a deliberate click.
         delete.keyEquivalent = ""
+        alert.addButton(withTitle: "取消").keyEquivalent = "\r"
+        alert.alertStyle = .warning
+        let finish = { (response: NSApplication.ModalResponse) in
+            if response == .alertFirstButtonReturn { confirmed() }
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: finish) } else { finish(alert.runModal()) }
+    }
+
+    /// Asks before taking a detached `volume` off the list together with
+    /// what was indexed for it; calls `confirmed` only after the user agreed.
+    static func askToForget(_ volume: ExternalVolume, in window: NSWindow?, confirmed: @escaping () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = "从列表中移除“\(volume.title)”？"
+        let later = "以后再接入时会当作新磁盘。"
+        switch volume.retainedCount {
+        case .some(let count) where count > 0:
+            alert.informativeText = "这块磁盘已收录的 \(formattedCount(count)) 个文件记录会一并删除，磁盘上的文件不受影响。" + later
+        case .some:
+            alert.informativeText = later
+        case nil:
+            // Not counted yet: there may be records, so say they go too.
+            alert.informativeText = "这块磁盘已收录的文件记录会一并删除，磁盘上的文件不受影响。" + later
+        }
+        let remove = alert.addButton(withTitle: "移除")
+        remove.hasDestructiveAction = true
+        // Return cancels; removing takes a deliberate click.
+        remove.keyEquivalent = ""
         alert.addButton(withTitle: "取消").keyEquivalent = "\r"
         alert.alertStyle = .warning
         let finish = { (response: NSApplication.ModalResponse) in

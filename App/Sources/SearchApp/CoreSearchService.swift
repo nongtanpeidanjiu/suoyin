@@ -28,6 +28,12 @@ final class CoreSearchService: SearchService {
     /// Choices sent to the core and not yet reflected in what it reports.
     private var pendingChoices: [String: Bool] = [:]
     private var pendingIncludesNew: Bool?
+    /// Volumes being taken off the list: shown as “正在移除…” until the
+    /// core no longer lists them or the request failed.
+    private var pendingForgets: Set<String> = []
+    /// Why the last request to take a volume off the list failed; cleared by
+    /// the next change the user makes to the volumes.
+    private var forgetError: ExternalVolumeSettingsError?
 
     /// `dataDirectory` replaces the usual one; for tests only.
     init(dataDirectory: URL? = nil) throws {
@@ -122,6 +128,12 @@ final class CoreSearchService: SearchService {
     var externalVolumes: [ExternalVolume] {
         volumeLock.withLock {
             volumes.map { volume in
+                if pendingForgets.contains(volume.id) {
+                    var shown = volume
+                    shown.isRemoving = true
+                    shown.progress = .idle
+                    return shown
+                }
                 guard let included = pendingChoices[volume.id], included != volume.isIncluded else { return volume }
                 var shown = volume
                 shown.isIncluded = included
@@ -131,12 +143,14 @@ final class CoreSearchService: SearchService {
         }
     }
 
-    var externalVolumeSettingsError: ExternalVolumeSettingsError? { volumeLock.withLock { settingsError } }
+    var externalVolumeSettingsError: ExternalVolumeSettingsError? {
+        volumeLock.withLock { forgetError ?? settingsError }
+    }
 
     /// Leaving a volume out takes its files out of the results as soon as
     /// the core returns; its data stays until deleted.
     func setExternalVolume(_ id: String, included: Bool) {
-        volumeLock.withLock { pendingChoices[id] = included }
+        volumeLock.withLock { pendingChoices[id] = included; forgetError = nil }
         onExternalVolumesChange?()
         volumeQueue.async { [weak self] in
             guard let self else { return }
@@ -149,7 +163,7 @@ final class CoreSearchService: SearchService {
     }
 
     func removeExternalVolumeData(_ id: String) {
-        volumeLock.withLock { pendingChoices[id] = false }
+        volumeLock.withLock { pendingChoices[id] = false; forgetError = nil }
         onExternalVolumesChange?()
         volumeQueue.async { [weak self] in
             guard let self else { return }
@@ -157,6 +171,42 @@ final class CoreSearchService: SearchService {
             self.volumeLock.withLock { _ = self.pendingChoices.removeValue(forKey: id) }
             self.readVolumes(notify: true)
             self.onIndexChange?()
+        }
+    }
+
+    /// The row reads “正在移除…” at once. The core either removes the volume
+    /// now or finishes later and reports it through `onExternalVolumesChange`;
+    /// until then the mark stays. A failure clears the mark and shows why.
+    func forgetExternalVolume(_ id: String) {
+        volumeLock.withLock { _ = pendingForgets.insert(id); forgetError = nil }
+        onExternalVolumesChange?()
+        volumeQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                if try self.engine.forgetExternalVolume(id) == .removed {
+                    self.volumeLock.withLock { _ = self.pendingForgets.remove(id) }
+                }
+            } catch {
+                self.volumeLock.withLock {
+                    self.pendingForgets.remove(id)
+                    self.forgetError = Self.forgetFailure(error)
+                }
+            }
+            // The mark or the error changed even when the list did not.
+            self.readVolumes()
+            self.onExternalVolumesChange?()
+            self.onIndexChange?()
+        }
+    }
+
+    private static func forgetFailure(_ error: Error) -> ExternalVolumeSettingsError {
+        switch error as? EngineVolumeForgetError {
+        case .online: return ExternalVolumeSettingsError(category: .forgetOnline, underlyingMessage: "")
+        case .notFound: return ExternalVolumeSettingsError(category: .forgetNotFound, underlyingMessage: "")
+        case .unavailable: return ExternalVolumeSettingsError(category: .forgetUnavailable, underlyingMessage: "")
+        case .settings(let failure): return convert(failure)
+        case nil:
+            return ExternalVolumeSettingsError(category: .forgetUnavailable, underlyingMessage: String(describing: error))
         }
     }
 
@@ -171,6 +221,8 @@ final class CoreSearchService: SearchService {
         let addsNew = engine.includesNewExternalVolumes
         let error = engine.externalVolumeSettingsError.map(Self.convert)
         let changed = volumeLock.withLock { () -> Bool in
+            // A volume the core no longer lists is gone: its mark goes too.
+            pendingForgets.formIntersection(list.map(\.id))
             defer { (volumes, includesNew, settingsError) = (list, addsNew, error) }
             return list != volumes || addsNew != includesNew || error != settingsError
         }
@@ -188,7 +240,8 @@ final class CoreSearchService: SearchService {
                               isOnline: volume.isOnline, isIncluded: volume.isIncluded, progress: progress,
                               indexedCount: volume.indexedCount, retainedCount: volume.retainedCount,
                               // `detail` carries only the file system now.
-                              filesystem: volume.filesystem ?? volume.detail, capacityBytes: volume.capacityBytes)
+                              filesystem: volume.filesystem ?? volume.detail, capacityBytes: volume.capacityBytes,
+                              canForget: volume.canForget)
     }
 
     private static func convert(_ error: EngineVolumeSettingsError) -> ExternalVolumeSettingsError {

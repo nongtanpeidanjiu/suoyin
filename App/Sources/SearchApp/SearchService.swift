@@ -165,6 +165,10 @@ struct ExternalVolume: Equatable {
     /// The file system as the core names it, such as “exfat”.
     var filesystem: String?
     var capacityBytes: Int64?
+    /// Whether it can be taken off the list: true while it is not attached.
+    var canForget = false
+    /// Set by the interface while taking it off the list is under way.
+    var isRemoving = false
 
     var isScanning: Bool { progress != .idle }
 }
@@ -192,6 +196,11 @@ protocol SearchService: AnyObject {
     /// Deletes what was indexed for the volume and stops searching it. A
     /// volume that is not attached is then forgotten.
     func removeExternalVolumeData(_ id: String)
+    /// Takes a volume that is not attached off the list together with what
+    /// was indexed for it; attached again later, it shows up as a new volume.
+    /// The row reads “正在移除…” until the core is done; a failure shows in
+    /// `externalVolumeSettingsError`.
+    func forgetExternalVolume(_ id: String)
     /// What went wrong when keeping these choices or deleting data; nil when
     /// nothing did.
     var externalVolumeSettingsError: ExternalVolumeSettingsError? { get }
@@ -203,6 +212,9 @@ protocol SearchService: AnyObject {
 struct ExternalVolumeSettingsError: Equatable {
     enum Category {
         case readSettings, invalidSettings, backupSettings, writeSettings, inspectIndex, verifyIdentity, removeIndex
+        /// Taking a volume off the list failed: it is attached, it is no
+        /// longer known, or the core cannot do it now.
+        case forgetOnline, forgetNotFound, forgetUnavailable
     }
 
     var category: Category
@@ -228,8 +240,14 @@ struct ExternalVolumeSettingsError: Equatable {
             meaning = "无法确认一块外接磁盘的身份，暂时没有搜索它；重新插入后会再试。"
         case .removeIndex:
             meaning = "删除外接磁盘已收录的数据时出错，数据仍然保留，下次打开软件时会再试一次。"
+        case .forgetOnline:
+            meaning = "这块磁盘现在已连接，不能从列表中移除；请先推出磁盘再试。"
+        case .forgetNotFound:
+            meaning = "这块磁盘已经不在记录中，列表已刷新。"
+        case .forgetUnavailable:
+            meaning = "现在无法从列表中移除磁盘，请稍后再试；如果一直不行，请重新打开软件。"
         }
-        return "\(meaning)（原始信息：\(underlyingMessage)）"
+        return underlyingMessage.isEmpty ? meaning : "\(meaning)（原始信息：\(underlyingMessage)）"
     }
 }
 
@@ -270,6 +288,7 @@ extension ExternalVolume {
 
     /// The state line under the volume's name.
     var stateLine: String {
+        if isRemoving { return "正在移除…" }
         if !isOnline {
             return keptCount.map { "未连接，保留 \(formattedCount($0)) 个已收录条目" } ?? "未连接"
         }

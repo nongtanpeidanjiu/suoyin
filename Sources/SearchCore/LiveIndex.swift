@@ -626,10 +626,10 @@ struct LiveIndex {
             guard attribute & (Kind.mask | Kind.pending | Kind.excluded) == Kind.directory | Kind.pending,
                   !base.isSuppressed(i) else { continue }
             let path = base.fullPath(UInt32(i))
-            if roots.provider(containing: path) != nil && !roots.isTrash(path) { pending[path] = attribute }
+            if roots.provider(containing: path) != nil { pending[path] = attribute }
         }
         for (path, entry) in state.changes where entry.directory && entry.attribute & Kind.pending != 0 {
-            if roots.provider(containing: path) != nil && !roots.isTrash(path) { pending[path] = entry.attribute }
+            if roots.provider(containing: path) != nil { pending[path] = entry.attribute }
         }
         return pending
     }
@@ -645,20 +645,18 @@ struct LiveIndex {
         prepareDelta()
     }
 
-    mutating func purgeProviderTrash(in roots: CloudRoots) {
-        var providers = roots.iCloud.map { [$0] } ?? []
-        if let storage = roots.storage {
-            providers += baseChildren(storage).keys.map { joinedPath(storage, $0) }
-            providers += changedChildren[storage] ?? []
-        }
-        for provider in providers {
-            let trash = joinedPath(provider, ".Trash")
-            _ = reconcile(path: trash, observed: .absent)
-            for anchor in links?.anchors.keys.filter({ inside($0, trash) }) ?? [] {
-                removeSubtree(anchor, includingRoot: true)
+    mutating func providersMissingTrash(in roots: CloudRoots) -> [String] {
+        var providers = Set(roots.iCloud.map { [$0, dataRoot + $0] } ?? [])
+        if let logicalStorage = roots.storage {
+            for storage in [logicalStorage, dataRoot + logicalStorage] {
+                providers.formUnion(baseChildren(storage).keys.map { joinedPath(storage, $0) })
+                providers.formUnion(changedChildren[storage] ?? [])
             }
         }
-        prepareDelta()
+        return providers.sorted().filter { provider in
+            roots.provider(containing: provider) == provider && entry(at: provider)?.directory == true &&
+                !isRestricted(provider) && entry(at: joinedPath(provider, ".Trash")) == nil
+        }
     }
 
     mutating func purgeSubtree(_ path: String) {

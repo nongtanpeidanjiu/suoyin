@@ -27,11 +27,13 @@ public struct EngineQuery: Sendable {
     public var kind: EngineKind
     public var offset: Int
     public var limit: Int
+    /// Optional result-count budget for this query. The engine caps extra counting at 2,000 hits.
+    public var totalCountBudget: Int?
 
     public init(text: String, mode: QueryMode = .name, column: SearchColumn = .name,
                 direction: SearchDirection = .ascending, showAll: Bool = false,
                 kind: EngineKind = .any,
-                offset: Int = 0, limit: Int = 50) {
+                offset: Int = 0, limit: Int = 50, totalCountBudget: Int? = nil) {
         self.text = text
         self.mode = mode
         self.column = column
@@ -40,6 +42,7 @@ public struct EngineQuery: Sendable {
         self.kind = kind
         self.offset = offset
         self.limit = limit
+        self.totalCountBudget = totalCountBudget
     }
 }
 
@@ -77,7 +80,7 @@ public enum EnginePhase: Sendable, Equatable {
     case ready
     case supplementing(name: String, indexed: Int)
     case recovering
-    case failed(String)
+    case failed(EngineFailure)
 }
 
 public struct EngineSourceStatus: Sendable, Equatable {
@@ -92,6 +95,7 @@ public struct EngineSourceStatus: Sendable, Equatable {
     public let inaccessibleLocations: [InaccessibleLocation]
     public let rawInaccessibleLocations: [InaccessibleLocation]
     public let error: String?
+    public let failure: EngineFailure?
     public let scan: ExternalScanStatistics?
     public let cloudProviderKind: CloudProviderKind?
 }
@@ -114,7 +118,7 @@ public struct EngineStatus: Sendable {
 }
 
 public struct EngineVolume: Sendable, Equatable {
-    public enum Progress: String, Sendable { case idle, restoring, scanning }
+    public enum Progress: String, Sendable { case idle, restoring, scanning, failed }
 
     public let id: String
     public let name: String
@@ -125,11 +129,24 @@ public struct EngineVolume: Sendable, Equatable {
     public let indexedCount: Int
     public let retainedCount: Int?
     public let progress: Progress
+    public let failure: EngineFailure?
+    /// A temporary registration cannot inherit the auto-include setting or survive unplugging.
+    public let requiresManualInclusion: Bool
     public let filesystem: String?
     public let capacityBytes: Int64?
     public let detail: String?
 
     public var canForget: Bool { !isOnline }
+}
+
+public struct EngineUnindexedVolume: Sendable, Equatable {
+    public enum Kind: String, Sendable { case diskImage, network, local }
+    public enum Reason: String, Sendable { case diskImagesDisabled, networkUnsupported, localVolumeUnsupported }
+
+    public let id: String
+    public let name: String
+    public let kind: Kind
+    public let reason: Reason
 }
 
 public enum EngineVolumeForgetResult: Sendable, Equatable {
@@ -170,6 +187,7 @@ public final class SearchEngine: @unchecked Sendable {
     private var indexHandler: (@Sendable () -> Void)?
     private var volumesHandler: (@Sendable () -> Void)?
     private var reportedVolumes: [EngineVolume] = []
+    private var reportedUnindexedVolumes: [EngineUnindexedVolume] = []
     private var reportedIncludesNew = false
     private var reportedVolumeError: EngineVolumeSettingsError?
     private var refreshScheduled = false
@@ -191,13 +209,18 @@ public final class SearchEngine: @unchecked Sendable {
 
     convenience init(dataDirectory: URL, root: String) throws {
         guard dataDirectory.isFileURL, dataDirectory.resolvingSymlinksInPath().path != "/" else {
-            throw CocoaError(.fileWriteInvalidFileName)
+            throw EngineFailure(CocoaError(.fileWriteInvalidFileName), fallback: .dataDirectoryUnavailable)
         }
-        try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
+        do {
+            try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { throw EngineFailure(error, fallback: .dataDirectoryUnavailable) }
         let directory = dataDirectory.resolvingSymlinksInPath()
-        let tracker = try ChangeTracker(root: root, snapshot: directory.appendingPathComponent("index.snapshot").path,
+        let tracker: ChangeTracker
+        do {
+            tracker = try ChangeTracker(root: root, snapshot: directory.appendingPathComponent("index.snapshot").path,
                                         ownData: directory.path)
+        } catch { throw EngineFailure(error, dataDirectory: directory.path) }
         self.init(dataDirectory: directory, tracker: tracker)
     }
 
@@ -234,6 +257,13 @@ public final class SearchEngine: @unchecked Sendable {
 
     public var externalVolumes: [EngineVolume] { tracker.externalVolumeManager?.catalog() ?? [] }
 
+    public var unindexedMountedVolumes: [EngineUnindexedVolume] {
+        tracker.externalVolumeManager?.unindexedMountedVolumes() ?? []
+    }
+
+    /// The app's own index directory is omitted from search when it is within the scanned scope.
+    public var indexDataDirectoryExclusion: String? { tracker.indexDataDirectoryExclusion }
+
     public var externalVolumeSettingsError: EngineVolumeSettingsError? { tracker.externalVolumeManager?.settingsError }
 
     public func setExternalVolume(_ id: String, included: Bool) {
@@ -242,6 +272,12 @@ public final class SearchEngine: @unchecked Sendable {
 
     public func removeExternalVolumeData(_ id: String) {
         tracker.externalVolumeManager?.removeData(id)
+    }
+
+    /// Starts a retry for a connected, included volume whose index is in error.
+    @discardableResult
+    public func retryExternalVolume(_ id: String) -> Bool {
+        tracker.externalVolumeManager?.retry(id) ?? false
     }
 
     /// Forgets a disconnected volume and deletes its local snapshots, journals, and scan checkpoints.
@@ -272,7 +308,7 @@ public final class SearchEngine: @unchecked Sendable {
         }
         guard let outcome else { return }
         if case let .failure(error) = outcome {
-            tracker.recordEngineFailure(String(describing: error))
+            tracker.recordEngineFailure(error)
         }
         // Also cover a failed write that left an older durable snapshot in place.
         scheduleRefresh(for: .disk)
@@ -283,16 +319,21 @@ public final class SearchEngine: @unchecked Sendable {
               !query.text.allSatisfy(\.isWhitespace), !query.text.utf8.contains(0) else {
             return EngineResult(hits: [], total: 0, totalIsExact: true)
         }
-        let lookahead = query.offset + query.limit < Int.max
+        let pageEnd = query.offset + query.limit
+        let countBudget = min(query.totalCountBudget ?? 0, 2_000)
+        let searchStart = pageEnd <= countBudget ? 0 : query.offset
+        let searchEnd = max(pageEnd, countBudget)
+        let capacity = searchEnd - searchStart
+        let lookahead = searchEnd < Int.max
         let rows = tracker.search(query.text, mode: query.mode, column: query.column, direction: query.direction,
-                                  showAll: query.showAll, kind: query.kind, offset: query.offset,
-                                  limit: query.limit + (lookahead ? 1 : 0))
+                                  showAll: query.showAll, kind: query.kind, offset: searchStart,
+                                  limit: capacity + (lookahead ? 1 : 0))
         if rows.isEmpty {
-            return EngineResult(hits: [], total: 0, totalIsExact: query.offset == 0)
+            return EngineResult(hits: [], total: 0, totalIsExact: searchStart == 0)
         }
-        return EngineResult(hits: rows.prefix(query.limit).map(EngineHit.init),
-                            total: query.offset + rows.count,
-                            totalIsExact: lookahead ? rows.count <= query.limit : rows.count < query.limit)
+        return EngineResult(hits: rows.dropFirst(query.offset - searchStart).prefix(query.limit).map(EngineHit.init),
+                            total: searchStart + rows.count,
+                            totalIsExact: lookahead ? rows.count <= capacity : rows.count < capacity)
     }
 
     public func recheckAccess() {
@@ -331,7 +372,8 @@ public final class SearchEngine: @unchecked Sendable {
         let localState = tracker.engineState()
         let local = localState.status
         let external = tracker.engineExternalStates()
-        let (volumes, includesNew, volumeError) = tracker.externalVolumeManager?.catalogState() ?? ([], false, nil)
+        let (volumes, includesNew, volumeError, unindexedVolumes) =
+            tracker.externalVolumeManager?.catalogState() ?? ([], false, nil, [])
         let count = localState.indexed + external.reduce(0) { $0 + $1.state.indexed }
         let verified = localState.accessChecked
         func locations(_ state: TrackingStatus, paths: [String]) -> [InaccessibleLocation] {
@@ -357,7 +399,8 @@ public final class SearchEngine: @unchecked Sendable {
             return EngineSourceStatus(id: volume.id, name: volume.name, kind: .externalVolume,
                                       indexed: volume.state.indexed, inaccessibleLocationsVerified: checked,
                                       inaccessibleLocations: AccessDenials.summarize(raw),
-                                      rawInaccessibleLocations: raw, error: status.error, scan: status.externalScan,
+                                      rawInaccessibleLocations: raw, error: status.error, failure: status.failure,
+                                      scan: status.externalScan,
                                       cloudProviderKind: nil)
         }
         let providers = Set(localState.cloudEntries.keys).union(localState.pendingProviders).union(cloudPaths.keys)
@@ -369,14 +412,16 @@ public final class SearchEngine: @unchecked Sendable {
                                               indexed: localState.cloudEntries[provider, default: 0],
                                               inaccessibleLocationsVerified: checked,
                                               inaccessibleLocations: AccessDenials.summarize(raw),
-                                              rawInaccessibleLocations: raw, error: nil, scan: nil,
+                                              rawInaccessibleLocations: raw, error: nil, failure: nil, scan: nil,
                                               cloudProviderKind: label.kind))
         }
         let bytes = disk ? Self.diskBytes(directory) : previous.indexBytesOnDisk
         let phase: EnginePhase
-        if let error = local.error {
+        if let error = local.failure {
             phase = .failed(error)
-        } else if local.indexReconciling || external.contains(where: { $0.state.status.indexReconciling }) {
+        } else if local.indexReconciling || external.contains(where: {
+            $0.state.status.failure == nil && $0.state.status.indexReconciling
+        }) {
             phase = .recovering
         } else if local.phase == "starting" {
             phase = .starting
@@ -398,9 +443,11 @@ public final class SearchEngine: @unchecked Sendable {
                                    indexBytesOnDisk: bytes)
         let (indexCallback, volumeCallback) = lock.withLock {
             reported = updated
-            let changed = volumeRemoved || volumes != reportedVolumes || includesNew != reportedIncludesNew ||
+            let changed = volumeRemoved || volumes != reportedVolumes || unindexedVolumes != reportedUnindexedVolumes ||
+                includesNew != reportedIncludesNew ||
                 volumeError != reportedVolumeError
             reportedVolumes = volumes
+            reportedUnindexedVolumes = unindexedVolumes
             reportedIncludesNew = includesNew
             reportedVolumeError = volumeError
             return (indexHandler, changed ? volumesHandler : nil)

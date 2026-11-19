@@ -257,14 +257,6 @@ struct TrackingTests {
         #expect(filePaths(restarted, query: "deep").isEmpty)
     }
 
-    @Test func providerTrashIsNeverAnObservationTarget() throws {
-        let scope = try WalkScope(root: "/")
-        #expect(scope.insideProviderTrash("/Users/test/Library/CloudStorage/OneDrive-Test/.Trash/a/b"))
-        #expect(scope.insideProviderTrash("/System/Volumes/Data/Users/test/Library/Mobile Documents/com~apple~CloudDocs/.Trash/x"))
-        #expect(!scope.insideProviderTrash("/Users/test/Library/CloudStorage/OneDrive-Test/work/.Trash"))
-        #expect(!scope.insideProviderTrash("/Users/test/.Trash"))
-    }
-
     @Test func preparedDiskRoundTripAndChecksum() throws {
         let dir = try scratch()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -459,10 +451,63 @@ struct TrackingTests {
         var explicit = DirectoryUpdate()
         explicit.requestReconciliation(recursive: true, maySkipAfterParent: false)
         var combined = structural
-        combined.merge(explicit)
+        combined.requestReconciliation(recursive: true, maySkipAfterParent: false)
         #expect(combined.recursive == true && !combined.maySkipAfterParent)
-        explicit.merge(structural)
+        explicit.requestReconciliation(recursive: true, maySkipAfterParent: true)
         #expect(explicit.recursive == true && !explicit.maySkipAfterParent)
+    }
+
+    @Test func consecutiveStructuralBatchesAreImmediateInHiddenAndVisibleDirectories() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let own = root.appendingPathComponent("owned")
+        let hidden = root.appendingPathComponent(".hidden")
+        let visible = root.appendingPathComponent("visible")
+        for folder in [own, hidden, visible] {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        let tracker = try ChangeTracker(root: root.path, snapshot: own.appendingPathComponent("base").path,
+                                        ownData: own.path)
+        tracker.start()
+        defer { try? tracker.stop() }
+        try awaitStatus(tracker) { $0.phase == "caught-up" }
+        var id = tracker.snapshotStatus().appliedEvents.values.max() ?? 1
+        func event(_ url: URL, _ flags: Int) -> VolumeEvent {
+            id += 1
+            return VolumeEvent(path: url.path, id: id, flags: UInt32(flags))
+        }
+        let fileFlag = kFSEventStreamEventFlagItemIsFile
+        let dirFlag = kFSEventStreamEventFlagItemIsDir
+        let created = kFSEventStreamEventFlagItemCreated
+        let removed = kFSEventStreamEventFlagItemRemoved
+        let renamed = kFSEventStreamEventFlagItemRenamed
+        for parent in [hidden, visible] {
+            let before = parent.appendingPathComponent("structural-before")
+            let after = parent.appendingPathComponent("structural-after")
+            for type in [fileFlag, dirFlag] {
+                try tracker.deliverForTesting([event(before, type | created)], writing: {
+                    if type == dirFlag { try fm.createDirectory(at: before, withIntermediateDirectories: false) }
+                    else { try Data([1]).write(to: before) }
+                })
+                #expect(tracker.search("structural-before", showAll: true).map(\.path) == [before.path])
+                try tracker.deliverForTesting([event(before, type | renamed), event(after, type | renamed)],
+                                              writing: { try fm.moveItem(at: before, to: after) })
+                #expect(tracker.search("structural-before", showAll: true).isEmpty)
+                #expect(tracker.search("structural-after", showAll: true).map(\.path) == [after.path])
+                try tracker.deliverForTesting([event(after, type | removed)], writing: { try fm.removeItem(at: after) })
+                #expect(tracker.search("structural-after", showAll: true).isEmpty)
+            }
+            try tracker.deliverForTesting([
+                event(before, fileFlag | created), event(before, fileFlag | renamed), event(after, fileFlag | renamed),
+            ], writing: {
+                try Data([1]).write(to: before)
+                try fm.moveItem(at: before, to: after)
+            })
+            #expect(tracker.search("structural-before", showAll: true).isEmpty)
+            #expect(tracker.search("structural-after", showAll: true).contains { $0.path == after.path })
+            try tracker.deliverForTesting([event(after, fileFlag | removed)], writing: { try fm.removeItem(at: after) })
+        }
     }
 
     @Test func onlyUnambiguousFileContentNotificationsAreCoalesced() {
@@ -544,72 +589,6 @@ struct TrackingTests {
         #expect(cursor.lag.position(at: 32 * second, observed: nil, pending: nil) == nil)
     }
 
-    @Test func delayedDirectoriesKeepEarliestEventAndSettleOnDeadline() {
-        let second = ReplayLag.second
-        var schedule = DirectorySchedule()
-        func request(_ event: UInt64) -> DirectoryUpdate {
-            DirectoryUpdate(recursive: true, pending: [0: event])
-        }
-        schedule.enqueue(request(100), at: "visible", hidden: false, now: 90 * second)
-        #expect(schedule.take(at: 90 * second, force: false).count == 1)
-        schedule.enqueue(request(150), at: "visible", hidden: false, now: 91 * second)
-        schedule.enqueue(request(140), at: "visible", hidden: false, now: 92 * second)
-        #expect(schedule.next == 95 * second)
-        #expect(schedule.floors() == [0: 140])
-        #expect(schedule.take(at: 94 * second, force: false).isEmpty)
-        #expect(schedule.take(at: 95 * second, force: false).count == 1)
-        schedule.enqueue(request(151), at: "visible", hidden: false, now: 96 * second)
-        #expect(schedule.next == 105 * second)
-        _ = schedule.take(at: 105 * second, force: false)
-        schedule.enqueue(request(152), at: "visible", hidden: false, now: 106 * second)
-        #expect(schedule.next == 125 * second)
-        _ = schedule.take(at: 125 * second, force: false)
-        schedule.enqueue(request(153), at: "visible", hidden: false, now: 126 * second)
-        #expect(schedule.next == 155 * second)
-        _ = schedule.take(at: 155 * second, force: false)
-        schedule.enqueue(request(154), at: "visible", hidden: false, now: 216 * second)
-        #expect(schedule.next == 216 * second)
-        _ = schedule.take(at: 216 * second, force: false)
-        schedule.enqueue(request(101), at: "hidden", hidden: true, now: 216 * second)
-        _ = schedule.take(at: 216 * second, force: false)
-        schedule.enqueue(request(102), at: "hidden", hidden: true, now: 217 * second)
-        #expect(schedule.next == 246 * second)
-        #expect(schedule.take(at: 218 * second, force: true).count == 1)
-        #expect(schedule.floors().isEmpty)
-    }
-
-    @Test func visibleExternalStructuralEventsBypassDirectoryBackoff() {
-        let second = ReplayLag.second
-        let mount = "/Volumes/TestDisk"
-        func request(_ event: UInt64, structural: Bool = true) -> DirectoryUpdate {
-            DirectoryUpdate(files: [mount + "/entry": structural ? .structural : []],
-                            pending: [0: event], structural: structural)
-        }
-        var schedule = DirectorySchedule()
-        let start = 90 * second
-        for event in 1...10 {
-            let now = start + UInt64(event) * second
-            schedule.enqueue(request(UInt64(event)), at: mount, hidden: false, now: now, externalFileEvents: true)
-            #expect(schedule.take(at: now, force: false)[mount]?.pending == [0: UInt64(event)])
-        }
-
-        let metadataTime = start + 10 * second + second / 2
-        schedule.enqueue(request(11, structural: false), at: mount, hidden: false, now: metadataTime,
-                         externalFileEvents: true)
-        #expect(schedule.next == start + 15 * second)
-        schedule.enqueue(request(12), at: mount, hidden: false, now: metadataTime,
-                         externalFileEvents: true)
-        #expect(schedule.next == metadataTime)
-        #expect(schedule.take(at: metadataTime, force: false)[mount]?.pending == [0: 11])
-
-        let hidden = mount + "/.hidden"
-        schedule.enqueue(request(13), at: hidden, hidden: true, now: metadataTime, externalFileEvents: true)
-        _ = schedule.take(at: metadataTime, force: false)
-        schedule.enqueue(request(14), at: hidden, hidden: true, now: metadataTime + second,
-                         externalFileEvents: true)
-        #expect(schedule.next == metadataTime + 30 * second)
-    }
-
     @Test func writeBudgetSurvivesNewOwnerAndUsesRollingWindow() throws {
         let dir = try scratch()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -639,21 +618,6 @@ struct TrackingTests {
         #expect(index.attributes.capacity < 100)
         #expect(index.names.capacity < 100)
         #expect(index.search("abc") == original)
-    }
-
-    @Test func throttlingRespectsVisibleSystemAndCloudExceptions() throws {
-        let disk = try WalkScope(root: "/")
-        #expect(disk.backgroundDirectory("/usr/bin"))
-        #expect(!disk.backgroundDirectory("/usr/local"))
-        #expect(!disk.backgroundDirectory("/usr/local/share"))
-        #expect(!disk.backgroundDirectory("/usr/local/bin"))
-        #expect(!disk.backgroundDirectory("/usr/local/sbin"))
-        #expect(!disk.backgroundDirectory("/System/Volumes/Data/usr/local/bin"))
-        #expect(disk.backgroundDirectory("/usr/local/.hidden"))
-        #expect(!disk.backgroundDirectory(disk.homeLibrary + "/CloudStorage/Documents"))
-        #expect(disk.backgroundDirectory(disk.homeLibrary + "/Caches"))
-        #expect(!disk.backgroundDirectory("/Applications/Example.app"))
-        #expect(disk.backgroundDirectory("/Applications/Example.app/Contents"))
     }
 
     @Test func lateBatchAppliesAndOnlyDroppedEventsRebuildTheSubscription() throws {

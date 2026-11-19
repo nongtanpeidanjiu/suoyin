@@ -4,18 +4,30 @@ import DarwinMetadata
 import Foundation
 
 public enum SnapshotError: Error, Equatable {
-    case invalid, unsupportedVersion, filesystem(Int32)
+    case invalid, unsupportedVersion, limitExceeded, filesystem(Int32)
 }
 
 extension SearchIndex {
     static let snapshotMagic = Array("M1INDEX1".utf8)
     static let headerSize = 64
+    static let maximumSnapshotRecords = 20_000_000
+    static let maximumSnapshotNameBytes = 512_000_000
+    static let maximumLegacyMetadataBytes = 1_000_000
+    static let maximumPreparedMetadataBytes = 64_000_000
+
+    static func checkSnapshotCapacity(records: Int, names: Int, metadata: Int, metadataLimit: Int) throws {
+        guard records <= maximumSnapshotRecords, names <= maximumSnapshotNameBytes, metadata <= metadataLimit else {
+            throw SnapshotError.limitExceeded
+        }
+    }
 
     /// The records and volume checkpoint table belong to the same immutable value.
     public func save(to path: String) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let checkpointData = try encoder.encode(volumes)
+        try Self.checkSnapshotCapacity(records: recordCount, names: names.count,
+                                       metadata: checkpointData.count, metadataLimit: Self.maximumLegacyMetadataBytes)
         var header = Data(Self.snapshotMagic)
         func field<T: FixedWidthInteger>(_ value: T) {
             var little = value.littleEndian
@@ -81,7 +93,8 @@ extension SearchIndex {
             let count = Int(read(12, UInt32.self))
             let poolCount = read(16, UInt64.self)
             let volumeCount = read(24, UInt64.self)
-            guard count <= 20_000_000, poolCount <= 512_000_000, volumeCount <= 1_000_000 else {
+            guard count <= maximumSnapshotRecords, poolCount <= maximumSnapshotNameBytes,
+                  volumeCount <= maximumLegacyMetadataBytes else {
                 throw SnapshotError.invalid
             }
             let flagStart = headerSize + count * MemoryLayout<DMRecord>.stride
@@ -172,8 +185,6 @@ extension SearchIndex {
                 if parent != .max { attr |= index.attributes[Int(parent)] & (Kind.hidden | Kind.excluded) }
                 if name.first == 46 || flags & 0x8000 != 0 { attr |= Kind.hidden }
                 if flags & Kind.datalessFlag != 0 { attr |= Kind.placeholderBits(for: attr) }
-                if name.elementsEqual(".Trash".utf8), parent != .max,
-                   CloudRoots.matchesProviderRoot(index.fullPath(parent)) { attr |= Kind.excluded }
                 let (time, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
                 index.append(bytes: name, parent: parent, size: size,
                              modified: overflow ? (seconds < 0 ? .min : .max) : time, attribute: attr)

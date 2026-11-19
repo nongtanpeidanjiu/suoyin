@@ -66,10 +66,12 @@ struct BaseWriteBudget {
 
     private let file: URL
     private var stamps: [TimeInterval]?
+    private(set) var snapshotLimitReached = false
 
     private struct Record: Codable {
         let version: Int
         let attempts: [TimeInterval]
+        let snapshotLimitReached: Bool?
     }
 
     init(snapshot: String) {
@@ -79,6 +81,7 @@ struct BaseWriteBudget {
             if record.version == 1, record.attempts.count <= Self.limit,
                record.attempts.allSatisfy({ $0.isFinite && $0 >= 0 }) {
                 stamps = record.attempts.sorted()
+                snapshotLimitReached = record.snapshotLimitReached == true
             }
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             stamps = []
@@ -88,6 +91,18 @@ struct BaseWriteBudget {
     }
 
     mutating func preventWrites() { stamps = nil }
+
+    mutating func setSnapshotLimitReached(_ value: Bool) throws {
+        guard snapshotLimitReached != value, let stamps else { return }
+        try write(stamps, limitReached: value)
+        snapshotLimitReached = value
+    }
+
+    private func write(_ attempts: [TimeInterval], limitReached: Bool) throws {
+        let data = try JSONEncoder().encode(Record(version: 1, attempts: attempts,
+                                                    snapshotLimitReached: limitReached ? true : nil))
+        try data.write(to: file, options: .atomic)
+    }
 
     private func active(at time: TimeInterval) -> [TimeInterval]? {
         stamps?.filter { time - $0 < Self.window }
@@ -104,8 +119,7 @@ struct BaseWriteBudget {
     mutating func reserve(at time: TimeInterval) throws -> Bool {
         guard var current = active(at: time), current.count < Self.limit else { return false }
         current.append(time)
-        let data = try JSONEncoder().encode(Record(version: 1, attempts: current))
-        try data.write(to: file, options: .atomic)
+        try write(current, limitReached: snapshotLimitReached)
         stamps = current
         return true
     }
@@ -122,13 +136,6 @@ struct DirectoryUpdate {
     var maySkipAfterParent = false
     var files: [String: FileUpdate] = [:]
     var metadata = false
-    var pending: [Int: UInt64] = [:]
-    var structural = false
-
-    mutating func add(event: UInt64, volume: Int) {
-        pending[volume] = min(pending[volume] ?? .max, event)
-    }
-
     mutating func requestReconciliation(recursive: Bool, maySkipAfterParent: Bool) {
         if recursive {
             self.maySkipAfterParent = self.recursive == true
@@ -137,102 +144,7 @@ struct DirectoryUpdate {
         self.recursive = self.recursive == true || recursive
         files.removeAll()
     }
-
-    mutating func merge(_ other: DirectoryUpdate) {
-        if let recursive = other.recursive {
-            requestReconciliation(recursive: recursive, maySkipAfterParent: other.maySkipAfterParent)
-        }
-        if recursive == nil {
-            files.merge(other.files) { $0.union($1) }
-            metadata = metadata || other.metadata
-        }
-        structural = structural || other.structural
-        for (volume, event) in other.pending { add(event: event, volume: volume) }
-    }
 }
-
-struct DirectorySchedule {
-    private static let second = ReplayLag.second
-    private static let quiet = 60 * second
-    private struct Visit {
-        let time: UInt64
-        let interval: UInt64
-        let hidden: Bool
-    }
-    private struct Pending {
-        var update: DirectoryUpdate
-        var due: UInt64
-        var interval: UInt64
-        let hidden: Bool
-    }
-    private var visits: [String: Visit] = [:]
-    private var pending: [String: Pending] = [:]
-    private var lastPrune: UInt64 = 0
-
-    var count: Int { pending.count }
-    var next: UInt64? { pending.values.lazy.map(\.due).min() }
-    var pendingVolumes: Set<Int> { Set(pending.values.flatMap { $0.update.pending.keys }) }
-    var pendingItems: Int { pending.values.reduce(0) { $0 + max(1, $1.update.files.count) } }
-
-    func floors() -> [Int: UInt64] {
-        var result: [Int: UInt64] = [:]
-        for work in pending.values {
-            for (volume, event) in work.update.pending {
-                result[volume] = min(result[volume] ?? .max, event)
-            }
-        }
-        return result
-    }
-
-    func knownVisibility(at path: String, now: UInt64) -> Bool? {
-        pending[path]?.hidden ?? visits[path].flatMap { now - $0.time < Self.quiet ? $0.hidden : nil }
-    }
-
-    mutating func enqueue(_ update: DirectoryUpdate, at path: String, hidden: Bool, now: UInt64,
-                          externalFileEvents: Bool = false) {
-        let prompt = externalFileEvents && update.structural && !hidden
-        if now - lastPrune >= Self.quiet {
-            visits = visits.filter { now - $0.value.time < Self.quiet }
-            lastPrune = now
-        }
-        if var waiting = pending[path] {
-            waiting.update.merge(update)
-            if prompt {
-                waiting.due = min(now, waiting.due)
-                waiting.interval = 0
-            }
-            pending[path] = waiting
-            return
-        }
-        let last = visits[path].flatMap { now - $0.time < Self.quiet ? $0 : nil }
-        let interval: UInt64
-        if prompt { interval = 0 }
-        else if hidden { interval = 30 * Self.second }
-        else {
-            interval = last.map {
-                if $0.interval == 0, now - $0.time >= 5 * Self.second { return 0 }
-                return min(30 * Self.second, max(5 * Self.second, $0.interval * 2))
-            } ?? 0
-        }
-        let due = last.map { max(now, $0.time + interval) } ?? now
-        pending[path] = Pending(update: update, due: due, interval: interval, hidden: hidden)
-    }
-
-    mutating func take(at time: UInt64, force: Bool) -> [String: DirectoryUpdate] {
-        var ready: [String: DirectoryUpdate] = [:]
-        for path in pending.keys.filter({ force || pending[$0]!.due <= time }) {
-            guard let task = pending.removeValue(forKey: path) else { continue }
-            ready[path] = task.update
-            if !force { visits[path] = Visit(time: time, interval: task.interval, hidden: task.hidden) }
-        }
-        return ready
-    }
-
-    mutating func discard(volumes: Set<Int>) {
-        pending = pending.filter { volumes.isDisjoint(with: $0.value.update.pending.keys) }
-    }
-}
-
 
 /// A first content observation is immediate. Further notifications for the
 /// same path are combined until 30 seconds after the last observation.

@@ -11,6 +11,7 @@ private struct EngineCommand: Decodable {
     let kind: String?
     let offset: Int?
     let limit: Int?
+    let totalCountBudget: Int?
     let volumeID: String?
     let included: Bool?
 
@@ -18,7 +19,7 @@ private struct EngineCommand: Decodable {
         EngineQuery(text: query ?? "", mode: mode ?? .name, column: column ?? .name,
                     direction: direction ?? .ascending, showAll: showAll ?? false,
                     kind: kind.flatMap(EngineKind.init(rawValue:)) ?? .any,
-                    offset: offset ?? 0, limit: limit ?? 50)
+                    offset: offset ?? 0, limit: limit ?? 50, totalCountBudget: totalCountBudget)
     }
 }
 
@@ -37,6 +38,7 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
                 "rawInaccessibleLocations": source.rawInaccessibleLocations.map(encodeLocation)
             ]
             if let error = source.error { value["error"] = error }
+            if let failure = source.failure { value["errorCategory"] = failure.category.rawValue }
             if let provider = source.cloudProviderKind { value["cloudProviderKind"] = provider.rawValue }
             if let scan = source.scan, let bytes = try? JSONEncoder().encode(scan) {
                 value["scan"] = try? JSONSerialization.jsonObject(with: bytes)
@@ -64,7 +66,8 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
     case .recovering: result["phase"] = "recovering"
     case let .failed(error):
         result["phase"] = "failed"
-        result["error"] = error
+        result["error"] = error.underlyingMessage
+        result["errorCategory"] = error.category.rawValue
     }
     return result
 }
@@ -92,7 +95,7 @@ func runEngineCLI(_ args: [String]) throws {
 
     engine.onStatusChange = { status in
         if case let .failed(error) = status.phase {
-            FileHandle.standardError.write(Data((error + "\n").utf8))
+            FileHandle.standardError.write(Data((error.underlyingMessage + "\n").utf8))
         }
         for source in status.sources {
             if let error = source.error { FileHandle.standardError.write(Data((error + "\n").utf8)) }

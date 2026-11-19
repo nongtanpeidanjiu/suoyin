@@ -50,14 +50,20 @@ struct PreparedSearch {
     var changedRows: [UInt32] = []
     var nameOrder: [UInt32] = []
     var fileKinds: [UInt8] = []
+    var nameFilter: [UInt64] = []
     let columnOrders = ColumnOrders()
 
     init(keyOffsets: [UInt32]) { self.keyOffsets = keyOffsets }
 
-    init(index: SearchIndex) {
-        keyOffsets = [UInt32](repeating: .max, count: index.recordCount)
+    init(index: SearchIndex, extending previous: PreparedSearch? = nil, previousNameBytes: Int = 0) {
+        let first = previous?.keyOffsets.count ?? 0
+        keyOffsets = previous?.keyOffsets ?? []
+        keyOffsets.append(contentsOf: repeatElement(.max, count: index.recordCount - first))
+        keyBytes = previous?.keyBytes ?? []
+        changedRows = previous?.changedRows ?? []
         index.names.withUnsafeBufferPointer { pool in
-            for (i, record) in index.records.enumerated() {
+            for i in first..<index.recordCount {
+                let record = index.records[i]
                 let offset = Int(record.offset)
                 let end = i + 1 == index.recordCount ? pool.count : Int(index.records[i + 1].offset)
                 let base = pool.baseAddress!.advanced(by: offset)
@@ -72,15 +78,35 @@ struct PreparedSearch {
                 keyBytes.append(0)
             }
         }
+        fileKinds = previous?.fileKinds ?? []
         classifyKinds(in: index)
+        nameFilter = previous?.nameFilter ?? []
+        prepareNameFilter(in: index, previousNameBytes: previousNameBytes)
     }
 
     mutating func classifyKinds(in index: SearchIndex) {
-        var kinds = [UInt8](repeating: 0, count: index.recordCount)
+        var kinds = fileKinds
+        let first = kinds.count
+        kinds.append(contentsOf: repeatElement(0, count: index.recordCount - first))
         withView(index: index) { view in
-            kinds.withUnsafeMutableBufferPointer { dm_classify_kinds(&view, $0.baseAddress) }
+            kinds.withUnsafeMutableBufferPointer { dm_classify_kinds(&view, $0.baseAddress, first) }
         }
         fileKinds = kinds
+    }
+
+    mutating func prepareNameFilter(in index: SearchIndex, previousNameBytes: Int = 0) {
+        let words = dm_name_filter_words(index.names.count)
+        guard words > 0 else { return }
+        let existingBytes = nameFilter.isEmpty ? 0 : previousNameBytes
+        nameFilter.append(contentsOf: repeatElement(0, count: words - nameFilter.count))
+        index.names.withUnsafeBufferPointer { names in
+            index.records.withUnsafeBufferPointer { rows in
+                nameFilter.withUnsafeMutableBufferPointer { filter in
+                    dm_prepare_name_filter(names.baseAddress, names.count, rows.baseAddress, rows.count,
+                                           existingBytes, filter.baseAddress)
+                }
+            }
+        }
     }
 
     func withView<T>(index: SearchIndex, _ body: (inout DMQueryView) -> T) -> T {
@@ -92,15 +118,18 @@ struct PreparedSearch {
                             changedRows.withUnsafeBufferPointer { changed in
                                 index.suppressed.withUnsafeBufferPointer { suppressed in
                                     fileKinds.withUnsafeBufferPointer { kinds in
-                                        var view = DMQueryView(rows: rows.baseAddress,
-                                            attributes: attributes.baseAddress, names: names.baseAddress,
-                                            folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
-                                            fold_rows: changed.baseAddress,
-                                            suppressed_rows: suppressed.isEmpty ? nil : suppressed.baseAddress,
-                                            file_kinds: kinds.baseAddress,
-                                            row_count: rows.count, name_bytes: names.count,
-                                            fold_bytes: folded.count, fold_count: changed.count)
-                                        return body(&view)
+                                        nameFilter.withUnsafeBufferPointer { filter in
+                                            var view = DMQueryView(rows: rows.baseAddress,
+                                                attributes: attributes.baseAddress, names: names.baseAddress,
+                                                folded_names: folded.baseAddress, fold_offsets: offsets.baseAddress,
+                                                fold_rows: changed.baseAddress,
+                                                suppressed_rows: suppressed.isEmpty ? nil : suppressed.baseAddress,
+                                                file_kinds: kinds.baseAddress,
+                                                name_filter: filter.isEmpty ? nil : filter.baseAddress,
+                                                row_count: rows.count, name_bytes: names.count,
+                                                fold_bytes: folded.count, fold_count: changed.count)
+                                            return body(&view)
+                                        }
                                     }
                                 }
                             }
@@ -147,6 +176,7 @@ extension SearchIndex {
             "recordsAndAttributes": records.capacity * MemoryLayout<DMRecord>.stride + attributes.capacity,
             "names": names.capacity, "foldedKeys": keyBytes, "sortTables": order,
             "fileKinds": prepared?.fileKinds.capacity ?? 0,
+            "nameFilter": (prepared?.nameFilter.capacity ?? 0) * MemoryLayout<UInt64>.stride,
             "suppressedRows": suppressed.capacity,
         ]
     }
@@ -164,11 +194,25 @@ extension SearchIndex {
 
     /// Materialize the normalized keys and the default name order.
     public mutating func prepare() {
+        prepare(extending: nil, previousNameBytes: 0)
+    }
+
+    /// Used only by a single append-only scan generation. Column order
+    /// caches belong to the newly published view.
+    mutating func prepare(extending previous: PreparedSearch?, previousNameBytes: Int) {
         guard prepared == nil, !records.isEmpty else { return }
-        var keys = PreparedSearch(index: self)
+        var keys = PreparedSearch(index: self, extending: previous, previousNameBytes: previousNameBytes)
         var names = [UInt32](repeating: 0, count: recordCount)
         keys.withView(index: self) { view in
-            names.withUnsafeMutableBufferPointer { dm_name_order(&view, $0.baseAddress) }
+            names.withUnsafeMutableBufferPointer { order in
+                if let previous {
+                    previous.nameOrder.withUnsafeBufferPointer {
+                        dm_extend_name_order(&view, $0.baseAddress, $0.count, order.baseAddress)
+                    }
+                } else {
+                    dm_name_order(&view, order.baseAddress)
+                }
+            }
         }
         keys.nameOrder = names
         prepared = keys
@@ -198,7 +242,7 @@ extension SearchIndex {
                     offsets.withUnsafeBufferPointer { offsets in
                         ids.withUnsafeMutableBufferPointer { ids in
                             dm_query(&view, order.baseAddress, words.baseAddress, offsets.baseAddress,
-                                     offsets.count, mode == .path, direction == .descending,
+                                     offsets.count, mode == .path, column == .name, direction == .descending,
                                      showAll, kind.code, offset, ids.count, ids.baseAddress)
                         }
                     }

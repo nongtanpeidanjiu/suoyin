@@ -72,6 +72,209 @@ struct EngineTests {
         #expect(reopened.search(EngineQuery(text: "engine-data", showAll: true)).hits.isEmpty)
     }
 
+    @Test func localDenialsAreVerifiedWhileAnExternalSourceIsStillScanning() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let local = root.appendingPathComponent("local")
+        let external = root.appendingPathComponent("external")
+        let denied = local.appendingPathComponent("blocked")
+        for folder in [data, local, external, denied] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        try Data().write(to: external.appendingPathComponent("external-fixture.txt"))
+        try Data([1]).write(to: local.appendingPathComponent("order-fixture-a"))
+        try Data([1, 2]).write(to: external.appendingPathComponent("order-fixture-b"))
+        try Data([1, 2, 3]).write(to: local.appendingPathComponent("order-fixture-c"))
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let mounts = ExternalVolumes(directory: data.path, discoverAutomatically: false, onAccess: { path in
+            if path == external.path {
+                entered.signal()
+                _ = release.wait(timeout: .now() + .seconds(4))
+            }
+        })
+        let tracker = try ChangeTracker(root: local.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                        ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                        externalVolumes: mounts)
+        let engine = SearchEngine(dataDirectory: data, tracker: tracker)
+        defer { engine.stop() }
+        defer { release.signal() }
+        engine.includesNewExternalVolumes = true
+        engine.start()
+        try #require(until { engine.status.inaccessibleLocationsVerified })
+        tracker.injectPermissionObservation(denied.path, .denied(EACCES))
+        try #require(until { engine.status.inaccessibleLocationCount == 1 })
+        let identity = try VolumeIdentity(root: external.path)
+        let volume = VolumeIdentity(root: external.path, mount: external.path, device: identity.device,
+                                    uuid: UUID().uuidString, log: nil, readOnly: false)
+        #expect(ExternalMount(identity: volume, name: "Test media", fileEvents: false).scanWorkers == 1)
+        #expect(ExternalMount(identity: volume, name: "Test media", fileEvents: false,
+                              medium: .solidState).scanWorkers == 3)
+        mounts.updateMounts([ExternalMount(identity: volume, name: "Test media", fileEvents: false,
+                                            filesystem: "exfat", medium: .rotational)])
+        try #require(entered.wait(timeout: .now() + .seconds(2)) == .success)
+        try #require(until { engine.status.sources.contains { $0.kind == .externalVolume } })
+        let checking = engine.status
+        #expect(checking.inaccessibleLocationsVerified && checking.inaccessibleLocationCount == 1)
+        #expect(checking.sources.first?.inaccessibleLocationsVerified == false)
+        #expect(checking.sources.first?.indexed == 0)
+        release.signal()
+        try #require(until { engine.status.sources.first?.inaccessibleLocationsVerified == true })
+        let ready = engine.status
+        #expect(ready.sources.first?.indexed == 2)
+        #expect(ready.sources.first?.scan?.workers == 2)
+        #expect(ready.indexedCount == ready.localIndexedCount + 2)
+        #expect(engine.search(EngineQuery(text: "external-fixture")).total == 1)
+        let ordered = ["order-fixture-a", "order-fixture-b", "order-fixture-c"]
+        for column in [SearchColumn.name, .size] {
+            let first = engine.search(EngineQuery(text: "order-fixture", column: column, limit: 2))
+            #expect(first.hits.map(\.name) == Array(ordered.prefix(2)))
+            #expect(first.total == 3 && !first.totalIsExact)
+            let last = engine.search(EngineQuery(text: "order-fixture", column: column, offset: 2, limit: 2))
+            #expect(last.hits.map(\.name) == [ordered[2]] && last.totalIsExact)
+            let reverse = engine.search(EngineQuery(text: "order-fixture", column: column, direction: .descending))
+            #expect(reverse.hits.map(\.name) == Array(ordered.reversed()))
+        }
+    }
+
+    @Test func externalOptInPersistsAndRemovalClearsAnOfflineCheckpoint() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appendingPathComponent("state")
+        let local = root.appendingPathComponent("local")
+        let external = root.appendingPathComponent("external")
+        let second = root.appendingPathComponent("second")
+        for directory in [data, local, external, second] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        }
+        try Data().write(to: external.appendingPathComponent("mounted-fixture.txt"))
+        try Data().write(to: second.appendingPathComponent("second-fixture.txt"))
+        let descendant = external.appendingPathComponent("descendant")
+        try FileManager.default.createDirectory(at: descendant, withIntermediateDirectories: false)
+        try Data().write(to: descendant.appendingPathComponent("nested-fixture.txt"))
+        let device = try WalkScope.device(external.path)
+        let volumeID = UUID().uuidString
+        let anotherID = UUID().uuidString
+        func mount(_ url: URL, _ id: String) -> ExternalMount {
+            ExternalMount(identity: VolumeIdentity(root: url.path, mount: url.path, device: device,
+                                                    uuid: id, log: nil, readOnly: false),
+                          name: url.lastPathComponent, fileEvents: false, filesystem: "exfat",
+                          detail: "Fixture detail")
+        }
+        func engine(_ manager: ExternalVolumes) throws -> SearchEngine {
+            let tracker = try ChangeTracker(root: local.path, snapshot: data.appendingPathComponent("index.snapshot").path,
+                                            ownData: data.path, wallTime: { Date().timeIntervalSince1970 },
+                                            externalVolumes: manager)
+            return SearchEngine(dataDirectory: data, tracker: tracker)
+        }
+        let first = mount(external, volumeID), newcomer = mount(second, anotherID)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let readDescendant = DispatchSemaphore(value: 0)
+        let noticed = DispatchSemaphore(value: 0)
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false, onAccess: { path in
+            if path == external.path {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 4)
+            }
+            if path == descendant.path { readDescendant.signal() }
+        })
+        let running = try engine(manager)
+        defer { running.stop() }
+        defer { release.signal() }
+        running.onExternalVolumesChange = { noticed.signal() }
+        running.start()
+        manager.updateMounts([first])
+        #expect(noticed.wait(timeout: .now() + 2) == .success)
+        #expect(!running.includesNewExternalVolumes)
+        #expect(running.externalVolumes.first?.isOnline == true)
+        #expect(running.externalVolumes.first?.detail == "Fixture detail")
+        #expect(running.externalVolumes.first?.isIncluded == false)
+        #expect(manager.searchable().isEmpty)
+        #expect(entered.wait(timeout: .now() + .milliseconds(100)) == .timedOut)
+        running.includesNewExternalVolumes = true
+        manager.updateMounts([first, newcomer])
+        #expect(running.externalVolumes.first(where: { $0.id == volumeID })?.isIncluded == false)
+        #expect(running.externalVolumes.first(where: { $0.id == anotherID })?.isIncluded == true)
+        running.includesNewExternalVolumes = false
+        #expect(running.externalVolumes.first(where: { $0.id == anotherID })?.isIncluded == true)
+        running.setExternalVolume(volumeID, included: true)
+        try #require(entered.wait(timeout: .now() + 2) == .success)
+        #expect(running.externalVolumes.first(where: { $0.id == volumeID })?.isScanning == true)
+        running.setExternalVolume(volumeID, included: false)
+        #expect(!manager.searchable().contains(where: { $0.key == volumeID }))
+        #expect(running.search(EngineQuery(text: "mounted-fixture")).total == 0)
+        release.signal()
+        #expect(readDescendant.wait(timeout: .now() + .milliseconds(200)) == .timedOut)
+        release.signal()
+        running.setExternalVolume(volumeID, included: true)
+        #expect(until {
+            running.status.sources.first(where: { $0.id == volumeID })?.inaccessibleLocationsVerified == true &&
+                running.search(EngineQuery(text: "mounted-fixture")).total == 1
+        })
+        running.setExternalVolume(volumeID, included: false)
+        #expect(running.search(EngineQuery(text: "mounted-fixture")).total == 0)
+        let checkpoint = data.appendingPathComponent("external-volumes/\(volumeID)-exfat.scanlog")
+        #expect(FileManager.default.fileExists(atPath: checkpoint.path))
+        running.stop()
+
+        let reopenedManager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        let reopened = try engine(reopenedManager)
+        defer { reopened.stop() }
+        reopened.start()
+        #expect(!reopened.includesNewExternalVolumes)
+        #expect(reopened.externalVolumes.first(where: { $0.id == anotherID })?.isIncluded == true)
+        #expect(reopened.externalVolumes.first(where: { $0.id == volumeID })?.isIncluded == false)
+        reopenedManager.updateMounts([first])
+        #expect(reopenedManager.searchable().isEmpty)
+        reopened.setExternalVolume(volumeID, included: true)
+        #expect(until {
+            reopened.status.sources.first(where: { $0.id == volumeID })?.scan?.restoredEntries == 3 &&
+                reopened.search(EngineQuery(text: "mounted-fixture")).total == 1
+        })
+        reopenedManager.updateMounts([])
+        #expect(reopened.externalVolumes.first(where: { $0.id == volumeID })?.isOnline == false)
+        reopened.removeExternalVolumeData(volumeID)
+        #expect(until { !FileManager.default.fileExists(atPath: checkpoint.path) })
+        #expect(reopened.externalVolumes.first(where: { $0.id == volumeID })?.isIncluded == false)
+        reopened.stop()
+
+        let lastManager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        defer { try? lastManager.stop() }
+        lastManager.updateMounts([first])
+        #expect(lastManager.searchable().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: checkpoint.path))
+    }
+
+    @Test func upgradingKeepsVolumesWithExistingIndexArtifactsIncluded() throws {
+        let data = try scratch()
+        defer { try? FileManager.default.removeItem(at: data) }
+        let cache = data.appendingPathComponent("external-volumes")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: false)
+        let apfs = UUID().uuidString
+        let exfat = UUID().uuidString
+        let log = UUID().uuidString
+        let base = cache.appendingPathComponent("\(apfs)-\(log).snapshot")
+        var index = SearchIndex()
+        index.append("/fixture", attribute: Kind.anchor)
+        index.prepare()
+        try index.savePrepared(to: base.path)
+        let delta = cache.appendingPathComponent("\(apfs)-\(log).snapshot.changes")
+        try Data().write(to: delta)
+        let checkpoint = try ExternalScanLog(path: cache.appendingPathComponent("\(exfat)-exfat.scanlog").path)
+        try checkpoint.flush()
+        let manager = ExternalVolumes(directory: data.path, discoverAutomatically: false)
+        defer { try? manager.stop() }
+        #expect(!manager.includesNew)
+        #expect(Set(manager.catalog().filter(\.isIncluded).map(\.id)) == Set([apfs, exfat]))
+        #expect(manager.catalog().allSatisfy { !$0.isOnline })
+        manager.removeData(apfs)
+        #expect(!FileManager.default.fileExists(atPath: base.path))
+        #expect(!FileManager.default.fileExists(atPath: delta.path))
+        #expect(manager.catalog().first(where: { $0.id == exfat })?.isIncluded == true)
+    }
+
     @Test func kindsComposeWithPagingOrderingAndPublishedEdits() throws {
         let root = try scratch()
         defer { try? FileManager.default.removeItem(at: root) }

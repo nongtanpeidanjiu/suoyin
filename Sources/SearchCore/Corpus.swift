@@ -1,3 +1,4 @@
+import Darwin
 import DarwinMetadata
 import Foundation
 
@@ -111,14 +112,44 @@ public struct SearchIndex {
     }
 
     func fullPath(_ id: UInt32) -> String {
-        var components: [String] = []
+        guard id != .max else { return "" }
+        func bounds(_ row: UInt32) -> Range<Int> {
+            let i = Int(row)
+            let end = i + 1 < records.count ? Int(records[i + 1].offset) : names.count
+            return Int(records[i].offset)..<(end - 1)
+        }
+        var length = -1
         var cursor = id
         while cursor != .max {
-            components.append(name(cursor))
+            length += bounds(cursor).count + 1
             cursor = records[Int(cursor)].parent
         }
-        let joined = components.reversed().joined(separator: "/")
-        return joined.hasPrefix("//") ? String(joined.dropFirst()) : joined
+        guard length > 0 else { return "" }
+        return names.withUnsafeBufferPointer { pool in
+            String(unsafeUninitializedCapacity: length) { output in
+                // Walk from leaf to root and fill the final UTF-8 buffer
+                // backwards without decoding and joining every component.
+                let start = output.baseAddress!
+                var end = length
+                var row = id
+                while row != .max {
+                    let part = bounds(row)
+                    end -= part.count
+                    start.advanced(by: end).initialize(from: pool.baseAddress!.advanced(by: part.lowerBound),
+                                                        count: part.count)
+                    row = records[Int(row)].parent
+                    if row != .max {
+                        end -= 1
+                        start.advanced(by: end).initialize(to: 47)
+                    }
+                }
+                if length > 1 && start[0] == 47 && start[1] == 47 {
+                    memmove(start, start.advanced(by: 1), length - 1)
+                    return length - 1
+                }
+                return length
+            }
+        }
     }
 
     func directoryPath(_ id: UInt32) -> String {
@@ -149,7 +180,9 @@ public struct SearchIndex {
     }
 
     static func key(_ text: String) -> [UInt8] {
-        text.precomposedStringWithCanonicalMapping.utf8.map { (65...90).contains($0) ? $0 + 32 : $0 }
+        let bytes = text.utf8
+        let normalized = bytes.contains { $0 >= 128 } ? text.precomposedStringWithCanonicalMapping.utf8 : bytes
+        return normalized.map { (65...90).contains($0) ? $0 + 32 : $0 }
     }
 
     static func queryWords(_ text: String) -> [[UInt8]] {

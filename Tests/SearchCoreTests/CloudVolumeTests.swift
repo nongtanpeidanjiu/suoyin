@@ -23,6 +23,66 @@ struct CloudVolumeTests {
         return path.resolvingSymlinksInPath()
     }
 
+    @Test func interruptedDirectoryScanResumesAndRepairsATornTail() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let volume = root.appendingPathComponent("volume")
+        try FileManager.default.createDirectory(at: volume, withIntermediateDirectories: false)
+        for name in ["first", "second", "third"] {
+            let folder = volume.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            try Data().write(to: folder.appendingPathComponent("visible-\(name).txt"))
+        }
+        let logPath = root.appendingPathComponent("fixture.scanlog")
+        var visited: [String] = []
+        let interrupted = try WalkScope(root: volume.path, onAccess: { visited.append($0) })
+        let firstLog = try ExternalScanLog(path: logPath.path)
+        #expect(throws: CancellationError.self) {
+            try SearchIndex.scanForTracking(scope: interrupted, workers: 1, excluding: [],
+                                            cancelled: { visited.count >= 2 },
+                                            scanLog: firstLog, profileExternal: true) { _, _ in }
+        }
+        #expect(visited.count == 2 && firstLog.written > 0)
+        let written = try Data(contentsOf: logPath).count
+        let file = try FileHandle(forWritingTo: logPath)
+        try file.seekToEnd()
+        try file.write(contentsOf: Data([0xff, 0xee, 0xdd]))
+        try file.close()
+
+        let restarted = try ExternalScanLog(path: logPath.path)
+        #expect(try Data(contentsOf: logPath).count == written)
+        var metrics: ExternalScanStatistics?
+        var freshReads: [String] = []
+        let resumed = try WalkScope(root: volume.path, onAccess: { freshReads.append($0) })
+        let result = try SearchIndex.scanForTracking(scope: resumed, workers: 1, excluding: [],
+                                                     cancelled: { false }, scanLog: restarted,
+                                                     profileExternal: true) { mark, _ in
+            metrics = mark.external
+        }
+        #expect(metrics?.restoredDirectories == 2)
+        #expect(metrics?.restoredEntries == 4)
+        #expect(freshReads.count == 2 && Set(freshReads).isDisjoint(with: visited))
+        #expect(result.directSearch("visible").count == 3)
+
+        let folder = URL(fileURLWithPath: try #require(visited.last))
+        let original = folder.appendingPathComponent("visible-\(folder.lastPathComponent).txt")
+        try FileManager.default.moveItem(at: original, to: folder.appendingPathComponent("renamed.txt"))
+        let updatedLog = try ExternalScanLog(path: logPath.path)
+        let changed = try SearchIndex.scanForTracking(scope: resumed, workers: 1, excluding: [],
+                                                      cancelled: { false }, scanLog: updatedLog,
+                                                      profileExternal: true) { mark, _ in
+            metrics = mark.external
+        }
+        #expect(metrics?.restoredDirectories == 3 && metrics?.observedDirectories == 1)
+        #expect(changed.directSearch("renamed").count == 1 && changed.directSearch("visible").count == 2)
+        let unchanged = try ExternalScanLog(path: logPath.path)
+        _ = try SearchIndex.scanForTracking(scope: resumed, workers: 1, excluding: [], cancelled: { false },
+                                            scanLog: unchanged, profileExternal: true) { mark, _ in
+            metrics = mark.external
+        }
+        #expect(metrics?.restoredDirectories == 4 && metrics?.checkpointBytes == 0)
+    }
+
     @Test func cloudQueueTimesOutWithoutReleasingTheSingleSlot() throws {
         let writer = DispatchQueue(label: "test.cloud-writer")
         let roots = CloudRoots(home: "/test")
@@ -185,6 +245,9 @@ struct CloudVolumeTests {
         let initial = EnginePhase.supplementing(name: "ExampleProvider", indexed: 4)
         let advanced = EnginePhase.supplementing(name: "ExampleProvider", indexed: 5)
         let sawInitial = until { progress.phases.contains(initial) }
+        #expect(engine.status.inaccessibleLocationsVerified)
+        #expect(engine.status.sources.first?.kind == .cloudProvider)
+        #expect(engine.status.sources.first?.inaccessibleLocationsVerified == false)
         release.signal()
         #expect(sawInitial)
         #expect(until { progress.phases.contains(advanced) })
@@ -303,6 +366,7 @@ struct CloudVolumeTests {
 
         let mounts = ExternalVolumes(directory: root.path)
         defer { try? mounts.stop() }
+        mounts.setIncludesNew(true)
         mounts.updateMounts([formerlyMounted])
         #expect(until { mounts.statuses().first?.caughtUp == true })
         let first = try #require(mounts.searchable().first)
@@ -370,6 +434,7 @@ struct CloudVolumeTests {
         let device = try WalkScope.device(root.path)
         let mounts = ExternalVolumes(directory: root.path)
         defer { try? mounts.stop() }
+        mounts.setIncludesNew(true)
         let volumes = paths.map {
             ExternalMount(identity: VolumeIdentity(root: $0.path, mount: $0.path, device: device, uuid: nil,
                                                    log: nil, readOnly: false), name: "SameName", fileEvents: false)

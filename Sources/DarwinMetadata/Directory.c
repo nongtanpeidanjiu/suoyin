@@ -12,6 +12,9 @@
 #include <libproc.h>
 #include <sys/resource.h>
 #include <uuid/uuid.h>
+#include <time.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 
 static int expected_error(int error, DMCounts *counts) {
     switch (error) {
@@ -40,6 +43,56 @@ static int64_t timestamp(struct timespec time) {
     return result;
 }
 
+static DMDirectoryStamp directory_stamp(const struct stat *st) {
+    return (DMDirectoryStamp){st->st_ino, timestamp(st->st_mtimespec),
+                             timestamp(st->st_ctimespec), timestamp(st->st_birthtimespec), st->st_size};
+}
+
+int dm_directory_stamp(const char *path, int32_t device, DMDirectoryStamp *stamp) {
+    int fd;
+    do { fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC); }
+    while (fd < 0 && errno == EINTR);
+    if (fd < 0) return errno;
+    struct stat st;
+    int result;
+    do { result = fstat(fd, &st); } while (result < 0 && errno == EINTR);
+    int error = result < 0 ? errno : 0;
+    close(fd);
+    if (error) return error;
+    if (st.st_dev != device || (st.st_flags & SF_DATALESS)) return ESTALE;
+    *stamp = directory_stamp(&st);
+    return 0;
+}
+
+int dm_media_kind(uint32_t service) {
+    if (!service) return 0;
+    CFTypeRef value = IORegistryEntrySearchCFProperty(service, kIOServicePlane,
+        CFSTR(kIOPropertyDeviceCharacteristicsKey), kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (!value) return 0;
+    int kind = 0;
+    if (CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+        CFTypeRef medium = CFDictionaryGetValue(value, CFSTR(kIOPropertyMediumTypeKey));
+        if (medium && CFEqual(medium, CFSTR(kIOPropertyMediumTypeSolidStateKey))) kind = 2;
+        if (medium && CFEqual(medium, CFSTR(kIOPropertyMediumTypeRotationalKey))) kind = 1;
+    }
+    CFRelease(value);
+    return kind;
+}
+
+static int finish_listing(int fd, int error, DMCounts *counts) {
+    if (error || !counts->capture_stamp || counts->denied || counts->disappeared) return error;
+    struct stat st;
+    int result;
+    do { result = fstat(fd, &st); } while (result < 0 && errno == EINTR);
+    if (result < 0) return directory_error(errno, counts);
+    const DMDirectoryStamp end = directory_stamp(&st);
+    counts->stamp_valid = end.inode == counts->stamp.inode &&
+        end.modified == counts->stamp.modified && end.changed == counts->stamp.changed &&
+        end.created == counts->stamp.created && end.size == counts->stamp.size;
+    return 0;
+}
+
 static uint32_t node_type(mode_t mode) {
     if (S_ISDIR(mode)) return VDIR;
     if (S_ISREG(mode)) return VREG;
@@ -51,8 +104,14 @@ static int stat_entry(int fd, const char *name, DMEntryCallback callback,
                       DMDeniedEntryCallback denied, void *context, DMCounts *counts) {
     struct stat st;
     int result;
+    uint64_t start = counts->profile ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     do { result = fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW); } while (result < 0 && errno == EINTR);
-    if (result < 0) return entry_error(errno, (const uint8_t *)name, strlen(name), denied, context, counts);
+    int error = result < 0 ? errno : 0;
+    if (counts->profile) {
+        counts->stat_calls++;
+        counts->stat_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+    }
+    if (error) return entry_error(error, (const uint8_t *)name, strlen(name), denied, context, counts);
     callback(context, (const uint8_t *)name, strlen(name), st.st_size,
              timestamp(st.st_mtimespec), st.st_flags, node_type(st.st_mode));
     return 0;
@@ -68,14 +127,21 @@ static int ordinary_list(int fd, DMEntryCallback callback, DMDeniedEntryCallback
     }
     int error = 0;
     for (;;) {
+        uint64_t start = counts->profile ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
         errno = 0;
         struct dirent *entry = readdir(directory);
-        if (!entry && errno == EINTR) continue;
-        if (!entry) { error = directory_error(errno, counts); break; }
+        int code = errno;
+        if (counts->profile) {
+            counts->readdir_calls++;
+            counts->readdir_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+        }
+        if (!entry && code == EINTR) continue;
+        if (!entry) { error = directory_error(code, counts); break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         error = stat_entry(dirfd(directory), entry->d_name, callback, denied, context, counts);
         if (error) break;
     }
+    error = finish_listing(dirfd(directory), error, counts);
     closedir(directory);
     return error;
 }
@@ -120,10 +186,13 @@ static int bulk_record(int fd, const unsigned char *record, const unsigned char 
     if (!unpack(&cursor, name, &type, sizeof(type)) ||
         !unpack(&cursor, name, &modified, sizeof(modified)) ||
         !unpack(&cursor, name, &flags, sizeof(flags))) return EPROTO;
-    if (type != VREG || !(returned.fileattr & ATTR_FILE_DATALENGTH))
+    bool directory_length = type == VDIR && counts->directory_lengths &&
+                            (returned.dirattr & ATTR_DIR_DATALENGTH);
+    if (!directory_length && (type != VREG || !(returned.fileattr & ATTR_FILE_DATALENGTH)))
         return stat_entry(fd, (const char *)name, callback, denied, context, counts);
     int64_t size;
     if (!unpack(&cursor, name, &size, sizeof(size))) return EPROTO;
+    if (directory_length && counts->profile) counts->directory_length_rows++;
     callback(context, name, name_ref.attr_length - 1, size, timestamp(modified), flags, type);
     return 0;
 }
@@ -133,6 +202,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
                 void *context, DMCounts *counts) {
     struct stat st;
     int result;
+    uint64_t start = counts->profile ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     do { result = lstat(path, &st); } while (result < 0 && errno == EINTR);
     if (result < 0) return directory_error(errno, counts);
     if (!S_ISDIR(st.st_mode)) return expected_error(ENOTDIR, counts);
@@ -146,22 +216,35 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
     if (result < 0) { int error = errno; close(fd); return directory_error(error, counts); }
     if (st.st_dev != device_a && st.st_dev != device_b) { close(fd); counts->other_mount++; return 0; }
     if (!load_directory && (st.st_flags & SF_DATALESS)) { close(fd); counts->pending++; return 0; }
+    if (counts->profile) counts->open_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+    if (counts->capture_stamp) counts->stamp = directory_stamp(&st);
     if (ordinary) return ordinary_list(fd, callback, denied, context, counts);
 
     struct attrlist attrs = {
         .bitmapcount = ATTR_BIT_MAP_COUNT,
         .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME |
                       ATTR_CMN_OBJTYPE | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS,
+        .dirattr = counts->directory_lengths ? ATTR_DIR_DATALENGTH : 0,
         .fileattr = ATTR_FILE_DATALENGTH
     };
     _Alignas(8) unsigned char buffer[65536];
     bool started = false;
     int error = 0;
     for (;;) {
+        uint64_t before = counts->profile ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
         int number = getattrlistbulk(fd, &attrs, buffer, sizeof(buffer), 0);
+        int code = errno;
+        if (counts->profile) {
+            counts->bulk_calls++;
+            counts->bulk_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - before;
+        }
         if (number < 0) {
-            int code = errno;
             if (code == EINTR) continue;
+            if (!started && code == EINVAL && attrs.dirattr) {
+                if (lseek(fd, 0, SEEK_SET) < 0) { error = errno; break; }
+                attrs.dirattr = 0;
+                continue;
+            }
             if (!started && (code == ENOTSUP || code == EOPNOTSUPP || code == ENOSYS)) {
                 if (lseek(fd, 0, SEEK_SET) < 0) { error = errno; break; }
                 counts->fallback++;
@@ -187,6 +270,7 @@ static int list(const char *path, int32_t device_a, int32_t device_b, bool ordin
         }
         if (error) break;
     }
+    error = finish_listing(fd, error, counts);
     close(fd);
     return error;
 }

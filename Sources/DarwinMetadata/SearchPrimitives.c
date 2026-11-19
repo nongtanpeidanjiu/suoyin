@@ -79,8 +79,8 @@ uint8_t dm_file_kind(const char *name, uint8_t attribute) {
     return DM_KIND_ANY;
 }
 
-void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds) {
-    for (uint32_t id = 0; id < v->row_count; id++) {
+void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds, size_t first) {
+    for (uint32_t id = (uint32_t)first; id < v->row_count; id++) {
         kinds[id] = (v->attributes[id] & KIND_MASK) == ANCHOR
             ? DM_KIND_ANY : dm_file_kind(original(v, id), v->attributes[id]);
     }
@@ -277,6 +277,20 @@ void dm_name_order(const DMQueryView *v, uint32_t *order) {
     qsort_r(order, v->row_count, sizeof(*order), (void *)v, name_order);
 }
 
+void dm_extend_name_order(const DMQueryView *v, const uint32_t *prefix, size_t count, uint32_t *order) {
+    for (size_t i = count; i < v->row_count; i++) order[i] = (uint32_t)i;
+    qsort_r(order + count, v->row_count - count, sizeof(*order), (void *)v, name_order);
+    size_t prior = 0, added = count, next = 0;
+    // The suffix starts after the entire old order. Until the prefix is
+    // consumed, the merge destination is strictly before unread suffix data.
+    while (prior < count) {
+        if (added == v->row_count || name_order((void *)v, prefix + prior, order + added) <= 0)
+            order[next++] = prefix[prior++];
+        else
+            order[next++] = order[added++];
+    }
+}
+
 bool dm_column_order(const DMQueryView *v, uint32_t *order, int column) {
     if (!v->row_count) return true;
     size_t bytes = v->row_count * sizeof(uint32_t);
@@ -293,8 +307,29 @@ static bool visible(uint8_t attrs, bool all) {
     return (attrs & KIND_MASK) != ANCHOR && !(attrs & EXCLUDED) && (all || !(attrs & HIDDEN));
 }
 
-static uint32_t row_at(const DMQueryView *v, size_t position, bool folded) {
-    size_t low = 0, high = folded ? v->fold_count : v->row_count;
+enum { MAX_SPARSE_NAME_MATCHES = 4096 };
+
+typedef struct {
+    uint8_t *bitmap;
+    uint32_t *sparse;
+    size_t count;
+    bool failed;
+} NameHits;
+
+static void record_name_hit(const DMQueryView *v, NameHits *hits, uint32_t row) {
+    if (hits->failed) return;
+    if (hits->sparse && hits->count == MAX_SPARSE_NAME_MATCHES) {
+        hits->bitmap = scratch_map(v->row_count);
+        if (!hits->bitmap) { hits->failed = true; return; }
+        for (size_t i = 0; i < hits->count; i++) hits->bitmap[hits->sparse[i]] = 1;
+        hits->sparse = NULL;
+    }
+    if (hits->bitmap) hits->bitmap[row] = 1;
+    else hits->sparse[hits->count] = row;
+    hits->count++;
+}
+
+static uint32_t row_at(const DMQueryView *v, size_t position, bool folded, size_t low, size_t high) {
     while (low + 1 < high) {
         size_t middle = low + (high - low) / 2;
         uint32_t offset = folded ? v->fold_offsets[v->fold_rows[middle]] : v->rows[middle].offset;
@@ -303,68 +338,184 @@ static uint32_t row_at(const DMQueryView *v, size_t position, bool folded) {
     return folded ? v->fold_rows[low] : (uint32_t)low;
 }
 
-static bool hit_at(const DMQueryView *v, const char *word, size_t length,
-                   const uint8_t *pool, size_t start, bool folded, uint8_t *hits, size_t *skip) {
-    if (start < *skip) return false;
-    if (folded ? memcmp(pool + start, word, length) != 0 :
-        !folded_prefix((const char *)pool + start, word, length)) return false;
-    uint32_t id = row_at(v, start, folded);
-    uint32_t offset = folded ? v->fold_offsets[id] : v->rows[id].offset;
-    *skip = offset + strlen((const char *)pool + offset) + 1;
-    if (hits[id] || (!folded && v->fold_offsets[id] != UINT32_MAX)) return false;
-    hits[id] = 1;
-    return true;
+typedef struct {
+    const char *word;
+    size_t length;
+    uint64_t first, last, first_case, last_case;
+} NamePattern;
+
+typedef struct { size_t skip, first_row, end_row; } NamePosition;
+
+static uint64_t load_word(const void *source) {
+    uint64_t value;
+    memcpy(&value, source, sizeof(value));
+    return value;
 }
 
-static size_t match_lanes(const DMQueryView *v, const char *word, size_t length,
+static uint64_t case_mask(const char *word) {
+    uint8_t mask[8];
+    for (size_t i = 0; i < sizeof(mask); i++)
+        mask[i] = ascii_letter((uint8_t)word[i]) ? 0x20 : 0;
+    return load_word(mask);
+}
+
+static bool matches_name_bytes(const uint8_t *bytes, const NamePattern *pattern, bool folded) {
+    size_t length = pattern->length;
+    if (folded) return memcmp(bytes, pattern->word, length) == 0;
+    if (length < 8) return folded_prefix((const char *)bytes, pattern->word, length);
+    if ((load_word(bytes) | pattern->first_case) != pattern->first) return false;
+    if ((load_word(bytes + length - 8) | pattern->last_case) != pattern->last) return false;
+    // The two verified ranges may overlap. Long words have a gap to check.
+    return length <= 16 || folded_prefix((const char *)bytes + 8, pattern->word + 8, length - 16);
+}
+
+static void hit_at(const DMQueryView *v, const NamePattern *pattern,
+                   const uint8_t *pool, size_t start, bool folded, NameHits *hits, NamePosition *position) {
+    if (start < position->skip || !matches_name_bytes(pool + start, pattern, folded)) return;
+    uint32_t id = row_at(v, start, folded, position->first_row, position->end_row);
+    uint32_t offset = folded ? v->fold_offsets[id] : v->rows[id].offset;
+    position->skip = offset + strlen((const char *)pool + offset) + 1;
+    // Each scan advances past the entire matched name. Rows with a separate
+    // normalized key are recorded only from the normalized pool.
+    if (folded || v->fold_offsets[id] == UINT32_MAX) record_name_hit(v, hits, id);
+}
+
+static void match_lanes(const DMQueryView *v, const NamePattern *pattern,
                           const uint8_t *pool, size_t base, bool folded,
-                          uint8_t *hits, size_t *skip, uint64_t lanes) {
-    size_t found = 0;
+                          NameHits *hits, NamePosition *position, uint64_t lanes) {
     while (lanes) {
         unsigned bit = (unsigned)__builtin_ctzll(lanes);
-        found += hit_at(v, word, length, pool, base + bit / 8, folded, hits, skip);
+        hit_at(v, pattern, pool, base + bit / 8, folded, hits, position);
         lanes &= ~(UINT64_C(0xff) << bit);
     }
-    return found;
+}
+
+// The last word in each block stores the row owning the first byte. Exact
+// matches can locate their row without binary-searching the whole corpus.
+enum { NAME_FILTER_BYTES = 4096, NAME_FILTER_ROW = 32, NAME_FILTER_WORDS = 33 };
+
+size_t dm_name_filter_words(size_t bytes) {
+    return bytes < 65536 ? 0 : ((bytes - 1) / NAME_FILTER_BYTES + 1) * NAME_FILTER_WORDS;
+}
+
+static unsigned name_filter_bit(uint32_t three_bytes) {
+    uint32_t key = three_bytes & UINT32_C(0xffffff);
+    return ((key * UINT32_C(0x9e3779b1)) ^ ((key >> 9) * UINT32_C(0x85ebca77))) >> 21;
+}
+
+void dm_prepare_name_filter(const uint8_t *names, size_t bytes, const DMRecord *rows, size_t row_count,
+                            size_t previous_bytes, uint64_t *filter) {
+    if (!dm_name_filter_words(bytes)) return;
+    size_t start = previous_bytes > 2 ? (previous_bytes - 2) / NAME_FILTER_BYTES * NAME_FILTER_BYTES : 0;
+    size_t row = start ? filter[start / NAME_FILTER_BYTES * NAME_FILTER_WORDS + NAME_FILTER_ROW] : 0;
+    for (size_t block = start; block < bytes; block += NAME_FILTER_BYTES) {
+        uint64_t *bits = filter + block / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+        while (row + 1 < row_count && rows[row + 1].offset <= block) row++;
+        bits[NAME_FILTER_ROW] = row;
+        // A hash collision can only admit extra candidates for exact matching.
+        memset(bits, 0, NAME_FILTER_ROW * sizeof(*bits));
+        size_t end = block + NAME_FILTER_BYTES < bytes - 2 ? block + NAME_FILTER_BYTES : bytes - 2;
+        if (end <= block) continue;
+        uint32_t value = ((uint32_t)ascii_fold(names[block]) << 8) | ascii_fold(names[block + 1]);
+        for (size_t i = block; i < end; i++) {
+            value = (value << 8) | ascii_fold(names[i + 2]);
+            unsigned bit = name_filter_bit(value);
+            bits[bit >> 6] |= UINT64_C(1) << (bit & 63);
+        }
+    }
+}
+
+typedef struct { size_t shift; unsigned bit; } NameFilterProbe;
+
+static NameFilterProbe name_filter_probe(const char *word, size_t shift) {
+    const uint8_t *start = (const uint8_t *)word + shift;
+    uint32_t value = ((uint32_t)start[0] << 16) | ((uint32_t)start[1] << 8) | start[2];
+    return (NameFilterProbe){shift, name_filter_bit(value)};
+}
+
+static bool name_filter_may_match(const uint64_t *filter, size_t first, size_t last, NameFilterProbe probe) {
+    // The possible starting offsets of this mandatory three-byte sequence
+    // cover at most two blocks, including matches that cross a boundary.
+    size_t a = (first + probe.shift) / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+    size_t b = (last + probe.shift) / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+    unsigned word = probe.bit >> 6;
+    return (filter[a + word] | filter[b + word]) & (UINT64_C(1) << (probe.bit & 63));
 }
 
 /// Scan the byte pools in 16-byte blocks. Exact verification still uses the whole word.
-static size_t pool_hits(const DMQueryView *v, const char *word, bool folded, uint8_t *hits) {
+static void pool_hits(const DMQueryView *v, const char *word, bool folded, NameHits *hits) {
     const uint8_t *pool = folded ? v->folded_names : v->names;
     size_t bytes = folded ? v->fold_bytes : v->name_bytes;
     size_t length = strlen(word);
-    if (!bytes || length < 2 || length > bytes) return 0;
-    size_t found = 0, skip = 0, position = 0, end = bytes - length + 1;
+    if (!bytes || length < 2 || length > bytes) return;
+    NamePattern pattern = {.word = word, .length = length};
+    if (!folded && length >= 8) {
+        pattern.first = load_word(word);
+        pattern.last = load_word(word + length - 8);
+        pattern.first_case = case_mask(word);
+        pattern.last_case = case_mask(word + length - 8);
+    }
+    size_t end = bytes - length + 1;
+    NamePosition lookup = {.end_row = folded ? v->fold_count : v->row_count};
+    const bool filtered = !folded && v->name_filter && length >= 3;
+    NameFilterProbe probes[5];
+    size_t probe_count = 0;
+    if (filtered) {
+        probes[probe_count++] = name_filter_probe(word, 0);
+        if (length > 3) probes[probe_count++] = name_filter_probe(word, length - 3);
+        if (length >= 7) probes[probe_count++] = name_filter_probe(word, (length - 3) / 2);
+        if (length >= 8) {
+            probes[probe_count++] = name_filter_probe(word, 1);
+            probes[probe_count++] = name_filter_probe(word, length - 4);
+        }
+    }
     uint8x16_t first = vdupq_n_u8((uint8_t)word[0]);
     uint8x16_t last = vdupq_n_u8((uint8_t)word[length - 1]);
     uint8x16_t first_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[0]) ? 0x20 : 0);
     uint8x16_t last_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[length - 1]) ? 0x20 : 0);
-    for (; end - position >= 16; position += 16) {
-        uint8x16_t a = vceqq_u8(vorrq_u8(vld1q_u8(pool + position), first_mask), first);
-        uint8x16_t b = vceqq_u8(vorrq_u8(vld1q_u8(pool + position + length - 1), last_mask), last);
-        uint64x2_t masks = vreinterpretq_u64_u8(vandq_u8(a, b));
-        found += match_lanes(v, word, length, pool, position, folded, hits, &skip, vgetq_lane_u64(masks, 0));
-        found += match_lanes(v, word, length, pool, position + 8, folded, hits, &skip, vgetq_lane_u64(masks, 1));
+    const size_t span = filtered ? NAME_FILTER_BYTES : end;
+    for (size_t block = 0; block < end; block += span) {
+        size_t limit = end - block < span ? end : block + span;
+        bool may_match = true;
+        for (size_t i = 0; i < probe_count; i++) {
+            if (!name_filter_may_match(v->name_filter, block, limit - 1, probes[i])) {
+                may_match = false;
+                break;
+            }
+        }
+        if (!may_match) continue;
+        if (filtered) {
+            const uint64_t *block_rows = v->name_filter + block / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+            lookup.first_row = block_rows[NAME_FILTER_ROW];
+            lookup.end_row = block + NAME_FILTER_BYTES < bytes
+                ? block_rows[NAME_FILTER_WORDS + NAME_FILTER_ROW] + 1 : v->row_count;
+        }
+        size_t position = block;
+        for (; limit - position >= 16; position += 16) {
+            uint8x16_t a = vceqq_u8(vorrq_u8(vld1q_u8(pool + position), first_mask), first);
+            uint8x16_t b = vceqq_u8(vorrq_u8(vld1q_u8(pool + position + length - 1), last_mask), last);
+            uint64x2_t masks = vreinterpretq_u64_u8(vandq_u8(a, b));
+            match_lanes(v, &pattern, pool, position, folded, hits, &lookup, vgetq_lane_u64(masks, 0));
+            match_lanes(v, &pattern, pool, position + 8, folded, hits, &lookup, vgetq_lane_u64(masks, 1));
+        }
+        for (; position < limit; position++)
+            hit_at(v, &pattern, pool, position, folded, hits, &lookup);
     }
-    for (; position < end; position++)
-        found += hit_at(v, word, length, pool, position, folded, hits, &skip);
-    return found;
 }
 
-static size_t name_hits(const DMQueryView *v, const char *word, uint8_t *hits) {
+static void collect_name_hits(const DMQueryView *v, const char *word, NameHits *hits) {
     if (word[0] && !word[1]) {
-        size_t count = 0;
         char letters[] = {word[0], ascii_letter((uint8_t)word[0]) ? word[0] - 32 : 0, 0};
         for (uint32_t i = 0; i < v->row_count; i++) {
             const char *name = key(v, i);
-            hits[i] = strchr(name, letters[0]) != NULL ||
-                (letters[1] && v->fold_offsets[i] == UINT32_MAX && strchr(name, letters[1]) != NULL);
-            count += hits[i];
+            if (strchr(name, letters[0]) ||
+                (letters[1] && v->fold_offsets[i] == UINT32_MAX && strchr(name, letters[1])))
+                record_name_hit(v, hits, i);
         }
-        return count;
+        return;
     }
-    size_t count = pool_hits(v, word, false, hits);
-    return count + pool_hits(v, word, true, hits);
+    pool_hits(v, word, false, hits);
+    pool_hits(v, word, true, hits);
 }
 
 static uint32_t advance(const char *pattern, uint32_t length, const uint32_t *fallback,
@@ -440,6 +591,86 @@ static size_t select_order(const DMQueryView *v, const uint32_t *ids, const uint
     return emitted;
 }
 
+static bool later_in_name_page(const DMQueryView *v, const uint32_t *a, const uint32_t *b, bool descending) {
+    int comparison = name_order((void *)v, a, b);
+    return descending ? comparison < 0 : comparison > 0;
+}
+
+// The heap root is the least useful of the candidates retained for this page.
+static void sift_name_candidates(const DMQueryView *v, uint32_t *rows, size_t count,
+                                 size_t at, bool descending) {
+    uint32_t row = rows[at];
+    for (size_t child = 2 * at + 1; child < count; child = 2 * at + 1) {
+        if (child + 1 < count && later_in_name_page(v, rows + child + 1, rows + child, descending))
+            child++;
+        if (!later_in_name_page(v, rows + child, &row, descending)) break;
+        rows[at] = rows[child];
+        at = child;
+    }
+    rows[at] = row;
+}
+
+// Keep only the candidates needed to reach the requested page. Heap updates
+// stay behind the unread part of the candidate array.
+static size_t select_sparse_names(const DMQueryView *v, uint32_t *selected, size_t name_matches,
+                                  const uint8_t *patterns, const uint32_t *offsets, size_t words,
+                                  bool descending, bool all, uint8_t kind, size_t offset, size_t limit,
+                                  uint32_t *out) {
+    if (offset >= name_matches) return 0;
+    size_t count = 0;
+    size_t keep = limit < name_matches - offset ? offset + limit : name_matches;
+    if (!keep) return 0;
+    for (size_t i = 0; i < name_matches; i++) {
+        uint32_t id = selected[i];
+        if (!visible(v->attributes[id], all) || !matches_kind(v, id, kind) ||
+            (v->suppressed_rows && (v->suppressed_rows[id >> 3] & (1U << (id & 7))))) continue;
+        if (words > 1 && !all_words(key(v, id), patterns, offsets, words)) continue;
+        if (count < keep) {
+            selected[count++] = id;
+            if (count == keep && keep < name_matches)
+                for (size_t i = count / 2; i > 0; i--)
+                    sift_name_candidates(v, selected, count, i - 1, descending);
+        } else if (later_in_name_page(v, selected, &id, descending)) {
+            selected[0] = id;
+            sift_name_candidates(v, selected, count, 0, descending);
+        }
+    }
+    if (offset >= count) return 0;
+    qsort_r(selected, count, sizeof(*selected), (void *)v, name_order);
+    size_t emitted = count - offset < limit ? count - offset : limit;
+    for (size_t i = 0; i < emitted; i++)
+        out[i] = selected[descending ? count - 1 - offset - i : offset + i];
+    return emitted;
+}
+
+static size_t query_name(const DMQueryView *v, const uint32_t *order,
+                         const uint8_t *patterns, const uint32_t *offsets, size_t words,
+                         bool name_ordered, bool descending, bool all, uint8_t kind, size_t offset,
+                         size_t limit, uint32_t *results) {
+    uint32_t candidates[MAX_SPARSE_NAME_MATCHES];
+    NameHits hits = {0};
+    if (name_ordered) hits.sparse = candidates;
+    else if (!(hits.bitmap = scratch_map(v->row_count))) return SIZE_MAX;
+    const char *longest = (const char *)patterns + offsets[0];
+    for (size_t i = 1; i < words; i++) {
+        const char *word = (const char *)patterns + offsets[i];
+        if (strlen(word) > strlen(longest)) longest = word;
+    }
+    collect_name_hits(v, longest, &hits);
+    if (hits.failed) return SIZE_MAX;
+    if (hits.sparse)
+        return select_sparse_names(v, candidates, hits.count, patterns, offsets, words,
+                                   descending, all, kind, offset, limit, results);
+    if (words > 1 && hits.count) {
+        for (uint32_t i = 0; i < v->row_count; i++)
+            if (hits.bitmap[i] && !all_words(key(v, i), patterns, offsets, words)) hits.bitmap[i] = 0;
+    }
+    size_t emitted = hits.count ? select_order(v, order, hits.bitmap, NULL, NULL, 0,
+                                              descending, all, kind, offset, limit, v->row_count, results) : 0;
+    scratch_release(hits.bitmap, v->row_count);
+    return emitted;
+}
+
 typedef struct {
     const DMQueryView *view;
     const char *word;
@@ -465,7 +696,9 @@ static void *path_word(void *argument) {
         return NULL;
     }
     task->visible_matches = SIZE_MAX;
-    task->any = name_hits(view, task->word, hits) != 0;
+    NameHits names = {.bitmap = hits};
+    collect_name_hits(view, task->word, &names);
+    task->any = names.count != 0;
     if (task->any) {
         for (uint32_t i = 0; i < view->row_count; i++) {
             uint32_t parent = view->rows[i].parent;
@@ -477,7 +710,7 @@ static void *path_word(void *argument) {
 
 size_t dm_query(const DMQueryView *v, const uint32_t *order,
                 const uint8_t *patterns, const uint32_t *offsets, size_t words,
-                bool path, bool descending, bool all, uint8_t kind, size_t offset,
+                bool path, bool name_ordered, bool descending, bool all, uint8_t kind, size_t offset,
                 size_t limit, uint32_t *results) {
     size_t n = v->row_count;
     if (!path || !words) {
@@ -486,57 +719,47 @@ size_t dm_query(const DMQueryView *v, const uint32_t *order,
                                       descending, all, kind, offset, limit, budget, results);
         if (emitted == limit || budget == n) return emitted;
     }
+    if (!path)
+        return query_name(v, order, patterns, offsets, words, name_ordered, descending,
+                          all, kind, offset, limit, results);
 
     uint8_t *matches = scratch_map(n);
-    uint8_t *single = path && words > 1 ? scratch_map(n) : matches;
+    uint8_t *single = words > 1 ? scratch_map(n) : matches;
     if (!matches || !single) {
         scratch_release(matches, n);
         if (single != matches) scratch_release(single, n);
         return SIZE_MAX;
     }
-    bool ok = true, any = true;
-    uint32_t only_path_hit = UINT32_MAX;
-    if (!path) {
-        const char *longest = (const char *)patterns + offsets[0];
-        for (size_t i = 1; i < words; i++) {
-            const char *word = (const char *)patterns + offsets[i];
-            if (strlen(word) > strlen(longest)) longest = word;
-        }
-        any = name_hits(v, longest, matches) > 0;
-        if (any && words > 1) {
-            for (uint32_t i = 0; i < n; i++)
-                if (matches[i] && !all_words(key(v, i), patterns, offsets, words)) matches[i] = 0;
-        }
+    PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all, .kind = kind};
+    bool ok, any;
+    size_t next = 1;
+    if (words > 1 && n >= 50000) {
+        PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all, .kind = kind};
+        pthread_t thread;
+        bool started = pthread_create(&thread, NULL, path_word, &second) == 0;
+        path_word(&first);
+        if (started) pthread_join(thread, NULL); else path_word(&second);
+        ok = first.ok && second.ok;
+        any = first.any && second.any;
+        if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
+        next = 2;
     } else {
-        PathWord first = {.view = v, .word = (const char *)patterns + offsets[0], .hits = matches, .all = all, .kind = kind};
-        size_t next = 1;
-        if (words > 1 && n >= 50000) {
-            PathWord second = {.view = v, .word = (const char *)patterns + offsets[1], .hits = single, .all = all, .kind = kind};
-            pthread_t thread;
-            bool started = pthread_create(&thread, NULL, path_word, &second) == 0;
-            path_word(&first);
-            if (started) pthread_join(thread, NULL); else path_word(&second);
-            ok = first.ok && second.ok;
-            any = first.any && second.any;
-            if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
-            next = 2;
-        } else {
-            path_word(&first);
-            ok = first.ok;
-            any = first.any;
-        }
-        if (words == 1 && first.visible_matches != SIZE_MAX) {
-            size_t available = first.visible_matches > offset ? first.visible_matches - offset : 0;
-            if (available < limit) limit = available;
-            if (first.visible_matches == 1 && limit == 1) only_path_hit = first.sole_match;
-        }
-        for (size_t j = next; j < words && ok && any; j++) {
-            PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all, .kind = kind};
-            path_word(&task);
-            ok = task.ok;
-            any = task.any;
-            if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
-        }
+        path_word(&first);
+        ok = first.ok;
+        any = first.any;
+    }
+    uint32_t only_path_hit = UINT32_MAX;
+    if (words == 1 && first.visible_matches != SIZE_MAX) {
+        size_t available = first.visible_matches > offset ? first.visible_matches - offset : 0;
+        if (available < limit) limit = available;
+        if (first.visible_matches == 1 && limit == 1) only_path_hit = first.sole_match;
+    }
+    for (size_t j = next; j < words && ok && any; j++) {
+        PathWord task = {.view = v, .word = (const char *)patterns + offsets[j], .hits = single, .all = all, .kind = kind};
+        path_word(&task);
+        ok = task.ok;
+        any = task.any;
+        if (ok && any) for (size_t i = 0; i < n; i++) matches[i] &= single[i];
     }
     size_t result;
     if (only_path_hit != UINT32_MAX) {

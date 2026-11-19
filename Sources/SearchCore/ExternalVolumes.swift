@@ -1,6 +1,8 @@
 import Darwin
 import DiskArbitration
+import DarwinMetadata
 import Foundation
+import IOKit
 
 public struct ExternalVolumeStatus: Codable, Sendable {
     public let id: String
@@ -17,10 +19,28 @@ public struct ExternalVolumeStatus: Codable, Sendable {
 }
 
 struct ExternalMount {
+    enum Medium: Int32 { case unknown, rotational, solidState }
     let identity: VolumeIdentity
     let name: String
     let fileEvents: Bool
     var bsdName: String? = nil
+    var filesystem: String? = nil
+    var medium: Medium = .unknown
+    var detail: String? = nil
+    var needsLiveIdentity = false
+
+    var scanWorkers: Int {
+        switch medium {
+        case .unknown: return 1
+        case .rotational: return 2
+        case .solidState: return 3
+        }
+    }
+
+    var scanLogKey: String? {
+        guard filesystem == "exfat", let volumeID else { return nil }
+        return volumeID + "-exfat.scanlog"
+    }
 
     var volumeID: String? {
         identity.uuid.flatMap { UUID(uuidString: $0)?.uuidString }
@@ -46,12 +66,15 @@ struct ExternalMount {
         let volume = VolumeIdentity(root: identity.root, mount: identity.mount, device: identity.device,
                                     uuid: identity.uuid ?? previous.identity.uuid,
                                     log: identity.log ?? previous.identity.log, readOnly: identity.readOnly)
-        return ExternalMount(identity: volume, name: name, fileEvents: fileEvents, bsdName: bsdName)
+        return ExternalMount(identity: volume, name: name, fileEvents: fileEvents, bsdName: bsdName,
+                             filesystem: filesystem, medium: medium == .unknown ? previous.medium : medium,
+                             detail: detail, needsLiveIdentity: needsLiveIdentity)
     }
 
     func canKeepTracker(for current: Self) -> Bool {
         sameAttachment(as: current) && volumeID == current.volumeID && identity.log == current.identity.log &&
-            identity.readOnly == current.identity.readOnly && fileEvents == current.fileEvents
+            identity.readOnly == current.identity.readOnly && fileEvents == current.fileEvents &&
+            filesystem == current.filesystem && medium == current.medium
     }
 }
 
@@ -65,16 +88,34 @@ final class ExternalVolumes {
         let tracker: ChangeTracker
     }
 
+    private struct Choice: Codable, Equatable {
+        var name: String
+        var included: Bool
+        var detail: String?
+        var removing = false
+    }
+
+    private struct Preferences: Codable, Equatable {
+        var includesNew = false
+        var volumes: [String: Choice] = [:]
+    }
+
     private let queue = DispatchQueue(label: "index.mounts", qos: .utility)
     private let retirement = DispatchQueue(label: "index.detached-volumes", qos: .utility)
     private let lock = NSLock()
     private let directory: String
+    private let preferencesURL: URL
+    private let discoverAutomatically: Bool
+    private let onAccess: ((String) -> Void)?
     private var session: DASession?
     private var active: [String: Active] = [:]
-    private var initialDiscoveryComplete = false
     private var offline: [String: ExternalVolumeStatus] = [:]
     private var retiring: Set<String> = []
     private var lastMounts: [ExternalMount] = []
+    private var attachmentIDs: [String: String] = [:]
+    private var preferences = Preferences()
+    private var preferenceFailure: String?
+    private var preferencesReadable = true
     private var identityPoll: DispatchSourceTimer?
     private var identityPollScheduled = false
     private var unresolved: Set<String> = []
@@ -84,13 +125,151 @@ final class ExternalVolumes {
     private var nextSlot: UInt32 = 1
     var engineObserver: ((EngineChange) -> Void)?
 
-    init(directory: String) {
+    init(directory: String, discoverAutomatically: Bool = true, onAccess: ((String) -> Void)? = nil) {
         self.directory = joinedPath(directory, "external-volumes")
+        preferencesURL = URL(fileURLWithPath: joinedPath(directory, "external-volumes.json"))
+        self.discoverAutomatically = discoverAutomatically
+        self.onAccess = onAccess
+        do {
+            preferences = try JSONDecoder().decode(Preferences.self, from: Data(contentsOf: preferencesURL))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            var migrated = Preferences()
+            do {
+                for (file, id) in try Self.indexFiles(in: self.directory) where
+                    file.hasSuffix(".snapshot") || file.hasSuffix(".scanlog") {
+                    migrated.volumes[id] = Choice(name: "External disk", included: true)
+                }
+                if !migrated.volumes.isEmpty { _ = save(migrated) }
+            } catch {
+                preferencesReadable = false
+                preferenceFailure = "Unable to inspect saved external volume indexes"
+            }
+        } catch {
+            preferencesReadable = false
+            preferenceFailure = "Unable to read external volume settings"
+        }
+    }
+
+    var includesNew: Bool { queue.sync { preferences.includesNew } }
+    var settingsError: String? { queue.sync { preferenceFailure } }
+
+    func catalog() -> [EngineVolume] { catalogState().0 }
+
+    func catalogState() -> ([EngineVolume], Bool, String?) {
+        queue.sync {
+            let online = Set(attachmentIDs.values)
+            let delegates = Dictionary(uniqueKeysWithValues: lock.withLock { active.values.map { ($0.key, $0.tracker) } })
+            let rows = preferences.volumes.map { id, choice in
+                let current = delegates[id]?.engineState()
+                let scanning = current.map {
+                    $0.status.phase != "caught-up" && $0.status.error == nil
+                } ?? false
+                return EngineVolume(id: id, name: choice.name, isOnline: online.contains(id),
+                                    isIncluded: choice.included, isScanning: scanning,
+                                    indexedCount: current?.indexed ?? 0, detail: choice.detail)
+            }
+            return (rows.sorted { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name },
+                    preferences.includesNew, preferenceFailure)
+        }
+    }
+
+    func setIncludesNew(_ value: Bool) {
+        queue.sync {
+            guard !closed, preferences.includesNew != value else { return }
+            var next = preferences
+            next.includesNew = value
+            _ = save(next)
+            engineObserver?(.status)
+        }
+    }
+
+    func setIncluded(_ id: String, included: Bool) {
+        queue.sync {
+            guard !closed, var choice = preferences.volumes[id], choice.included != included else { return }
+            var next = preferences
+            choice.included = included
+            next.volumes[id] = choice
+            if save(next) {
+                if included {
+                    finishRemoval(id)
+                    refresh()
+                }
+                else if let mounted = searchable().first(where: { $0.key == id }) { retire(mounted) }
+            }
+            engineObserver?(.status)
+        }
+    }
+
+    func removeData(_ id: String) {
+        queue.sync {
+            guard !closed, var choice = preferences.volumes[id] else { return }
+            var next = preferences
+            choice.included = false
+            choice.removing = true
+            next.volumes[id] = choice
+            if save(next) {
+                if let mounted = searchable().first(where: { $0.key == id }) { retire(mounted) }
+                finishRemoval(id)
+            }
+            engineObserver?(.status)
+        }
+    }
+
+    @discardableResult
+    private func save(_ next: Preferences) -> Bool {
+        guard preferencesReadable else { return false }
+        do {
+            try JSONEncoder().encode(next).write(to: preferencesURL, options: .atomic)
+            preferences = next
+            preferenceFailure = nil
+            return true
+        } catch {
+            preferenceFailure = "Unable to save external volume settings"
+            return false
+        }
+    }
+
+    private static func indexFiles(in directory: String) throws -> [(String, String)] {
+        let fm = FileManager.default
+        let files: [String]
+        do { files = try fm.contentsOfDirectory(atPath: directory) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return [] }
+        return try files.compactMap { file in
+            guard file.count > 36, let id = UUID(uuidString: String(file.prefix(36)))?.uuidString else { return nil }
+            let path = joinedPath(directory, file)
+            let suffix = String(file.dropFirst(36))
+            let apfs = suffix.first == "-" && suffix.count > 37 &&
+                UUID(uuidString: String(suffix.dropFirst().prefix(36))) != nil &&
+                [".snapshot", ".snapshot.changes", ".snapshot.budget"].contains(String(suffix.dropFirst(37)))
+            guard suffix == "-exfat.scanlog" || apfs,
+                  try fm.attributesOfItem(atPath: path)[.type] as? FileAttributeType == .typeRegular
+            else { return nil }
+            return (file, id)
+        }
+    }
+
+    private func finishRemoval(_ id: String) {
+        guard !retiring.contains(id), var choice = preferences.volumes[id], choice.removing else { return }
+        do {
+            for (file, owner) in try Self.indexFiles(in: directory) where owner == id {
+                try FileManager.default.removeItem(atPath: joinedPath(directory, file))
+            }
+            var next = preferences
+            choice.removing = false
+            next.volumes[id] = choice
+            _ = save(next)
+            engineObserver?(.disk)
+        } catch {
+            preferenceFailure = "Unable to remove external volume index data"
+            engineObserver?(.status)
+        }
     }
 
     func start() {
         queue.async {
-            guard !self.closed, self.session == nil, let session = DASessionCreate(nil) else { return }
+            guard !self.closed, self.session == nil else { return }
+            for id in self.preferences.volumes.keys.sorted() { self.finishRemoval(id) }
+            guard self.discoverAutomatically, let session = DASessionCreate(nil) else { return }
             self.session = session
             let context = Unmanaged.passUnretained(self).toOpaque()
             DARegisterDiskAppearedCallback(session, nil, { _, context in
@@ -99,7 +278,8 @@ final class ExternalVolumes {
             DARegisterDiskDisappearedCallback(session, nil, { disk, context in
                 ExternalVolumes.handleRemoval(disk, context)
             }, context)
-            DARegisterDiskDescriptionChangedCallback(session, nil, [kDADiskDescriptionVolumePathKey] as CFArray,
+            let identityKeys = [kDADiskDescriptionVolumePathKey, kDADiskDescriptionVolumeUUIDKey]
+            DARegisterDiskDescriptionChangedCallback(session, nil, identityKeys as CFArray,
                                                       { disk, _, context in
                 let values = DADiskCopyDescription(disk) as? [String: Any]
                 if values?[kDADiskDescriptionVolumePathKey as String] == nil {
@@ -110,8 +290,6 @@ final class ExternalVolumes {
             }, context)
             DASessionSetDispatchQueue(session, self.queue)
             self.refresh()
-            self.lock.withLock { self.initialDiscoveryComplete = true }
-            self.engineObserver?(.status)
         }
     }
 
@@ -137,7 +315,7 @@ final class ExternalVolumes {
         if let session {
             let mounts = Self.mounted(using: session)
             reconcile(mounts, replacing: path)
-            probeUnresolvedIdentities(in: mounts)
+            probeUnresolvedIdentities(in: searchable().map(\.mount))
         } else {
             reconcile(lastMounts, replacing: path)
         }
@@ -173,18 +351,64 @@ final class ExternalVolumes {
         queue.sync { reconcile(mounts) }
     }
 
+    private func register(_ observations: [ExternalMount]) -> Bool {
+        let previous = Dictionary(uniqueKeysWithValues: lastMounts.map { ($0.identity.mount, $0) })
+        let previousIDs = attachmentIDs
+        let duplicates = Dictionary(grouping: observations.compactMap(\.volumeID), by: { $0 })
+        var assigned: [String: String] = [:]
+        var next = preferences
+        for mount in observations {
+            let path = mount.identity.mount
+            let stable = mount.volumeID
+            let related = previous[path].flatMap { old in
+                old.sameAttachment(as: mount) && (old.volumeID == stable || stable == nil)
+                    ? previousIDs[path] : nil
+            }
+            let unique = stable.flatMap { duplicates[$0]?.count == 1 ? $0 : nil }
+            let id = related ?? unique ?? UUID().uuidString
+            assigned[path] = id
+            if var choice = next.volumes[id] {
+                choice.name = mount.name
+                choice.detail = mount.detail ?? choice.detail
+                next.volumes[id] = choice
+            } else {
+                let oldChoice = previous[path].flatMap { old in
+                    old.volumeID == nil && old.sameAttachment(as: mount)
+                        ? previousIDs[path].flatMap { next.volumes[$0] } : nil
+                }
+                next.volumes[id] = Choice(name: mount.name, included: oldChoice?.included ?? next.includesNew,
+                                          detail: mount.detail)
+            }
+        }
+        let changed = assigned != attachmentIDs || next != preferences
+        lastMounts = observations
+        attachmentIDs = assigned
+        if next != preferences { _ = save(next) }
+        return changed
+    }
+
     private func reconcile(_ observations: [ExternalMount], replacing path: String? = nil) {
         guard !closed else { return }
-        lastMounts = observations
+        let changed = register(observations)
         let previous = lock.withLock { active }
-        let mounts = observations.map { observed in
-            guard observed.identity.mount != path, let active = previous[observed.identity.mount] else { return observed }
-            return observed.retainingKnownIdentity(from: active.mount)
+        let mounts = observations.compactMap { observed -> ExternalMount? in
+            let mountPath = observed.identity.mount
+            guard let id = attachmentIDs[mountPath], let choice = preferences.volumes[id],
+                  choice.included, !choice.removing, !retiring.contains(id) else { return nil }
+            do {
+                let resolved = try resolvedIdentity(for: observed)
+                guard mountPath != path, let active = previous[mountPath] else { return resolved }
+                return resolved.retainingKnownIdentity(from: active.mount)
+            } catch {
+                preferenceFailure = "Unable to verify external volume identity: \(error)"
+                engineObserver?(.status)
+                return nil
+            }
         }
         let byPath = Dictionary(uniqueKeysWithValues: mounts.map { ($0.identity.mount, $0) })
         for value in previous.values {
             let candidate = byPath[value.mount.identity.mount]
-            if value.mount.identity.mount != path, let candidate,
+            if value.mount.identity.mount != path, attachmentIDs[value.mount.identity.mount] == value.key, let candidate,
                value.mount.canKeepTracker(for: candidate) { continue }
             let resolvedProvisional = candidate.map { value.mount.sameAttachment(as: $0) && value.mount.volumeID == nil }
                 ?? false
@@ -193,25 +417,22 @@ final class ExternalVolumes {
 
         for mount in mounts {
             let path = mount.identity.mount
-            guard lock.withLock({ active[path] == nil }) else { continue }
+            guard let key = attachmentIDs[path], !retiring.contains(key),
+                  lock.withLock({ active[path] == nil }) else { continue }
             let volumeID = mount.volumeID
-            if let volumeID, retiring.contains(volumeID) { continue }
-            let hasClone = volumeID.map { id in
-                mounts.lazy.filter { $0.volumeID == id }.count > 1 ||
-                self.lock.withLock { self.active.values.contains { $0.key == id } }
-            } ?? false
-            let key = hasClone ? UUID().uuidString : volumeID ?? UUID().uuidString
-            let cache = hasClone ? nil : mount.cacheKey
+            let cache = key == volumeID ? mount.cacheKey : nil
+            let scanLog = key == volumeID ? mount.scanLogKey.map { joinedPath(directory, $0) } : nil
             let base = joinedPath(directory, (cache ?? key) + ".snapshot")
             do {
-                if cache != nil {
+                if cache != nil || scanLog != nil {
                     try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
                                                             attributes: [.posixPermissions: 0o700])
                 }
                 let tracker = try ChangeTracker(root: mount.identity.root, snapshot: base,
                                                 ownData: parentPath(directory),
                                                 wallTime: { Date().timeIntervalSince1970 },
-                                                external: mount, externalPersistence: cache != nil)
+                                                external: mount, externalPersistence: cache != nil,
+                                                externalScanLog: scanLog, onAccess: onAccess)
                 let volume = Active(mount: mount, key: key, slot: nextSlot, tracker: tracker)
                 nextSlot += 1
                 if let engineObserver { tracker.observeEngineChanges(engineObserver) }
@@ -239,6 +460,7 @@ final class ExternalVolumes {
                 }
             }
         }
+        if changed { engineObserver?(.status) }
     }
 
     private func retire(_ value: Active, recordOffline: Bool = true) {
@@ -253,6 +475,7 @@ final class ExternalVolumes {
             try? value.tracker.stop()
             self.queue.async {
                 self.retiring.remove(value.key)
+                self.finishRemoval(value.key)
                 self.refresh()
             }
         }
@@ -260,10 +483,6 @@ final class ExternalVolumes {
 
     func searchable() -> [Active] {
         lock.withLock { active.values.sorted { $0.key < $1.key } }
-    }
-
-    func engineMounts() -> (discovered: Bool, volumes: [Active]) {
-        lock.withLock { (initialDiscoveryComplete, active.values.sorted { $0.key < $1.key }) }
     }
 
     func isCurrent(_ volume: Active) -> Bool {
@@ -304,13 +523,41 @@ final class ExternalVolumes {
                 return values
             }
         }
+        for volume in volumes { volume.tracker.cancelUnfinishedExternalScan() }
         retirement.sync {}
+        queue.sync {}
         var failure: Error?
         for volume in volumes {
             do { try volume.tracker.stop() }
             catch { failure = failure ?? error }
         }
         if let failure { throw failure }
+    }
+
+    private func resolvedIdentity(for observed: ExternalMount) throws -> ExternalMount {
+        guard observed.needsLiveIdentity, let session else { return observed }
+        let root = observed.identity.root
+        let identity = try VolumeIdentity(root: root, preferFilesystemUUID: true)
+        guard identity.mount == observed.identity.mount, identity.device == observed.identity.device,
+              observed.volumeID == nil || identity.uuid.flatMap({ UUID(uuidString: $0)?.uuidString }) == observed.volumeID
+        else { throw CocoaError(.fileReadUnknown) }
+        var resolved = ExternalMount(identity: identity, name: observed.name, fileEvents: observed.fileEvents,
+                                     bsdName: observed.bsdName, filesystem: observed.filesystem,
+                                     detail: observed.detail, needsLiveIdentity: true)
+        if let disk = DADiskCreateFromVolumePath(nil, session, URL(fileURLWithPath: root) as CFURL) {
+            let media = DADiskCopyIOMedia(disk)
+            resolved.medium = ExternalMount.Medium(rawValue: dm_media_kind(media)) ?? .unknown
+            if media != 0 { IOObjectRelease(media) }
+        }
+        return resolved
+    }
+
+    private static func descriptionUUID(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let id = value as? UUID { return id.uuidString }
+        let cf = value as CFTypeRef
+        guard CFGetTypeID(cf) == CFUUIDGetTypeID() else { return nil }
+        return CFUUIDCreateString(nil, unsafeBitCast(cf, to: CFUUID.self)) as String
     }
 
     private static func mounted(using session: DASession) -> [ExternalMount] {
@@ -321,25 +568,33 @@ final class ExternalVolumes {
         return current.compactMap { info in
             guard info.f_flags & UInt32(MNT_LOCAL) != 0 else { return nil }
             let path = withUnsafeBytes(of: info.f_mntonname) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+            let device = withUnsafeBytes(of: info.f_mntfromname) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
             guard path != "/", !inside(path, "/System"), !inside(path, "/dev"),
-                  access(path, R_OK | X_OK) == 0,
-                  let disk = DADiskCreateFromVolumePath(nil, session, URL(fileURLWithPath: path) as CFURL),
+                  device.hasPrefix("/dev/"),
+                  let disk = device.withCString({ DADiskCreateFromBSDName(nil, session, $0) }),
                   let description = DADiskCopyDescription(disk) as? [String: Any],
                   let mountedURL = description[kDADiskDescriptionVolumePathKey as String] as? URL,
-                  mountedURL.standardizedFileURL.path == path else { return nil }
+                  mountedURL.path == path else { return nil }
             let model = description[kDADiskDescriptionDeviceModelKey as String] as? String
             let transport = description[kDADiskDescriptionDeviceProtocolKey as String] as? String
             let image = model?.contains("Disk Image") == true || transport == "Disk Image"
             let external = description[kDADiskDescriptionDeviceInternalKey as String] as? Bool == false
-            guard image || (external && transport != "Virtual Interface"),
-                  let identity = try? VolumeIdentity(root: path, preferFilesystemUUID: true), identity.mount == path else { return nil }
+            guard image || (external && transport != "Virtual Interface") else { return nil }
+            let uuid = descriptionUUID(description[kDADiskDescriptionVolumeUUIDKey as String])
+            let identity = VolumeIdentity(root: path, mount: path, device: info.f_fsid.val.0,
+                                          uuid: uuid, log: nil, readOnly: info.f_flags & UInt32(MNT_RDONLY) != 0)
             let filesystem = withUnsafeBytes(of: info.f_fstypename) {
                 String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
             }
+            let (capacity, overflow) = Int64(clamping: info.f_blocks).multipliedReportingOverflow(by: Int64(info.f_bsize))
+            let detail = !overflow && capacity > 0
+                ? "\(filesystem) · \(ByteCountFormatter.string(fromByteCount: capacity, countStyle: .file))"
+                : filesystem
             return ExternalMount(identity: identity,
                                  name: description[kDADiskDescriptionVolumeNameKey as String] as? String ?? leafName(path),
                                  fileEvents: ExternalMount.supportsFileEvents(on: filesystem),
-                                 bsdName: DADiskGetBSDName(disk).map { String(cString: $0) })
+                                 bsdName: DADiskGetBSDName(disk).map { String(cString: $0) },
+                                 filesystem: filesystem, detail: detail, needsLiveIdentity: true)
         }
     }
 }

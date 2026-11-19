@@ -259,7 +259,7 @@ struct ChangeJournal {
     }
 }
 
-private extension Data {
+extension Data {
     mutating func put<T: FixedWidthInteger>(_ integer: T) {
         var value = integer.littleEndian
         Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
@@ -271,7 +271,7 @@ private extension Data {
     }
 }
 
-private struct JournalReader {
+struct JournalReader {
     let bytes: Data
     var cursor: Int
 

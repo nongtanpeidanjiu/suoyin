@@ -205,6 +205,7 @@ extension SearchIndex {
             tables = normalized
         } else {
             tables.classifyKinds(in: index)
+            tables.prepareNameFilter(in: index)
         }
         index.prepared = tables
         index.loadedPrepared = true

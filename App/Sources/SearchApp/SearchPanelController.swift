@@ -110,6 +110,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         static let visibleRows: CGFloat = 7.5
         static let listBottom: CGFloat = 10
         static let emptyRow: CGFloat = 44
+        /// Room under the empty-state line for “重试” when the core is down.
+        static let retryRow: CGFloat = 34
         static let sideInset: CGFloat = 16
         /// Between the scope chips and the kind chip: two separate choices.
         static let groupGap: CGFloat = 14
@@ -136,12 +138,41 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private let table = ResultTable()
     private let selectionPill = TintView()
     private let emptyLabel = NSTextField(labelWithString: "没有找到匹配的文件")
+    private let retryButton = NSButton(title: "重试", target: nil, action: nil)
+    /// A short notice over the bottom of the list, such as for a file that
+    /// has gone; it fades by itself.
+    private let notice = NoticeView()
+    private var noticeTimer: Timer?
 
     private let queryQueue = DispatchQueue(label: "interface.query", qos: .userInteractive)
-    private var generation = 0
+    /// Bumped by every new query; answers and pages for an older one are dropped.
+    private var generation = 0 {
+        didSet { generationLock.withLock { sharedGeneration = generation } }
+    }
     private var hits: [SearchHit] = []
+    /// The paths in `hits`, so that a page overlapping the last never shows
+    /// a file twice.
+    private var loadedPaths: Set<String> = []
     private var total = 0
     private var totalIsExact = true
+    /// The query `hits` answer, for asking for the next page of it.
+    private var lastRequest: SearchRequest?
+    /// Rows the core has returned for it so far, duplicates included: the
+    /// offset of the next page.
+    private var fetchedCount = 0
+    /// The next page has been asked for and not yet arrived.
+    private var loadingMore = false
+    /// The core said there is nothing after what is loaded.
+    private var reachedEnd = true
+
+    private enum Paging {
+        static let pageSize = 200
+        /// Rows kept in memory at most; past this the user is asked to narrow
+        /// the search instead.
+        static let maxLoaded = 5_000
+        /// Rows from the end at which the next page is asked for.
+        static let lookahead = 40
+    }
     /// The height the panel is at or animating towards; `panel.frame` lags during a resize.
     private var targetHeight: CGFloat = 0
     private var terms: [String] = []
@@ -183,6 +214,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     private var reloadingResults = false
     /// Asked to open the settings window (Command-comma in the panel).
     var onOpenSettings: (() -> Void)?
+    /// “重试” while the core could not be opened.
+    var onRetry: (() -> Void)?
     /// The user's key for Quick Look; Command-Y always works as well.
     var previewShortcut = ShortcutRole.preview.standard {
         didSet { showPreviewShortcutInMenu() }
@@ -348,14 +381,64 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         scroll.autoresizingMask = [.width]
         scroll.isHidden = true
         content.addSubview(scroll)
+        // Scrolling near the end asks for the next page.
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
+                                               object: scroll.contentView, queue: .main) { [weak self] _ in
+            self?.loadMoreIfNeeded()
+        }
 
         emptyLabel.font = .systemFont(ofSize: 13)
         emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.alignment = .center
         emptyLabel.frame = NSRect(x: 0, y: Layout.searchRow + Layout.filterRow + 8, width: width, height: 18)
         emptyLabel.autoresizingMask = [.width]
+        emptyLabel.lineBreakMode = .byTruncatingMiddle
         emptyLabel.isHidden = true
         content.addSubview(emptyLabel)
+
+        retryButton.target = self
+        retryButton.action = #selector(retry)
+        retryButton.bezelStyle = .rounded
+        retryButton.controlSize = .small
+        retryButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        retryButton.refusesFirstResponder = true
+        retryButton.sizeToFit()
+        retryButton.frame.origin = NSPoint(x: ((width - retryButton.frame.width) / 2).rounded(),
+                                           y: Layout.searchRow + Layout.filterRow + 34)
+        retryButton.autoresizingMask = [.minXMargin, .maxXMargin]
+        retryButton.isHidden = true
+        content.addSubview(retryButton)
+
+        notice.isHidden = true
+        content.addSubview(notice)
+    }
+
+    @objc private func retry() { onRetry?() }
+
+    /// Shows `text` for a moment over the bottom of the panel.
+    private func showNotice(_ text: String) {
+        notice.text = text
+        let size = notice.fittingSize
+        let bottom = max(content.bounds.height - Layout.listBottom - 6, Layout.searchRow + size.height)
+        notice.frame = NSRect(x: ((content.bounds.width - size.width) / 2).rounded(), y: bottom - size.height,
+                              width: size.width, height: size.height)
+        notice.isHidden = false
+        notice.alphaValue = 1
+        notice.setAccessibilityLabel(text)
+        NSAccessibility.post(element: notice, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        noticeTimer?.invalidate()
+        noticeTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = Motion.reduced ? 0.1 : 0.25
+                self.notice.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self, self.notice.alphaValue == 0 else { return }
+                self.notice.isHidden = true
+            })
+        }
     }
 
     private func makeRowMenu() -> NSMenu {
@@ -402,7 +485,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         if kind != .any { kind = .any; showKind() }
         // The field is the source of truth; results from an earlier session may be stale.
         terms = queryTerms(field.stringValue)
-        if terms.isEmpty { hits = []; total = 0; table.reloadData() }
+        if terms.isEmpty { clearResults(); table.reloadData() }
         let height = desiredHeight()
         targetHeight = height
         resizeTimer?.invalidate()
@@ -510,9 +593,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
 
     private var hasQuery: Bool { !terms.isEmpty }
 
+    /// The core could not be opened: the empty state says so and offers “重试”.
+    private var isUnavailable: Bool { service.status.phase.isUnavailable }
+
     private func desiredHeight() -> CGFloat {
         guard hasQuery else { return Layout.searchRow }
-        if hits.isEmpty { return Layout.searchRow + Layout.filterRow + Layout.emptyRow }
+        if hits.isEmpty {
+            return Layout.searchRow + Layout.filterRow + Layout.emptyRow + (isUnavailable ? Layout.retryRow : 0)
+        }
         let rows = min(CGFloat(hits.count), Layout.visibleRows)
         return Layout.searchRow + Layout.filterRow + rows * ResultCellView.rowHeight + Layout.listBottom
     }
@@ -524,6 +612,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         countLabel.isHidden = !hasQuery
         scroll.isHidden = !hasQuery || hits.isEmpty
         emptyLabel.isHidden = !hasQuery || !hits.isEmpty
+        let status = service.status
+        if case .unavailable(let reason) = status.phase {
+            emptyLabel.stringValue = reason
+            emptyLabel.toolTip = reason
+        } else if case .waitingForSetup = status.phase {
+            emptyLabel.stringValue = IndexPhase.waitingLine
+            emptyLabel.toolTip = nil
+        } else {
+            emptyLabel.stringValue = "没有找到匹配的文件"
+            emptyLabel.toolTip = nil
+        }
+        retryButton.isHidden = emptyLabel.isHidden || !status.phase.isUnavailable
     }
 
     private func layoutForCurrentHeight() {
@@ -611,7 +711,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// Called when the index content changed.
     func refresh() {
         // Nothing to update while hidden or empty; `show` re-runs the query.
-        guard isVisible, !field.stringValue.isEmpty else { return }
+        guard isVisible, !field.stringValue.isEmpty else { resizeToFit(); return }
         runQuery(keepingSelection: true)
     }
 
@@ -672,23 +772,48 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         updateFooter()
     }
 
+    private func clearResults() {
+        hits = []
+        loadedPaths = []
+        total = 0
+        totalIsExact = true
+        reachedEnd = true
+        lastRequest = nil
+        fetchedCount = 0
+    }
+
+    /// Runs the query from the first row. A refresh of the same query
+    /// (`keepingSelection`) asks again for as many rows as are loaded, so
+    /// the user's place in a long list survives it.
     private func runQuery(keepingSelection: Bool = false) {
         generation += 1
         let token = generation
+        loadingMore = false
         let text = field.stringValue
-        let request = SearchRequest(text: normalizedQuery(text), scope: searchesPath ? .path : .name,
+        var request = SearchRequest(text: normalizedQuery(text), scope: searchesPath ? .path : .name,
                                     includeSystemFiles: Preferences.includeSystemFiles, kind: kind)
+        if keepingSelection {
+            request.limit = min(max(Paging.pageSize, hits.count), Paging.maxLoaded)
+        }
         let service = self.service
         queryQueue.async { [weak self] in
+            // Typing queues a query per key; only the newest is worth running.
+            guard let self, self.isCurrent(token) else { return }
             let response = service.search(request)
             DispatchQueue.main.async {
-                guard let self, token == self.generation else { return }
+                guard token == self.generation else { return }
                 let previousRow = self.table.selectedRow
                 let previousPath = self.hits.indices.contains(previousRow) ? self.hits[previousRow].path : nil
                 self.terms = queryTerms(text)
-                self.hits = response.hits
+                self.hits = []
+                self.loadedPaths = []
+                for hit in response.hits where self.loadedPaths.insert(hit.path).inserted { self.hits.append(hit) }
                 self.total = response.total
                 self.totalIsExact = response.totalIsExact
+                self.lastRequest = request
+                self.fetchedCount = response.hits.count
+                self.reachedEnd = response.hits.count < request.limit
+                    || (response.totalIsExact && request.offset + response.hits.count >= response.total)
                 // Reloading passes the selection through the first row on the
                 // way back to the user's row; the preview follows only the end.
                 self.reloadingResults = true
@@ -710,15 +835,71 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
     }
 
+    /// Read on the query queue, written on the main thread; a stale read
+    /// only means one query too many runs.
+    private let generationLock = NSLock()
+    private var sharedGeneration = 0
+    private func isCurrent(_ token: Int) -> Bool { generationLock.withLock { sharedGeneration == token } }
+
+    /// Whether more rows can be asked for: the core has more, and the list
+    /// is still under its limit.
+    private var canLoadMore: Bool {
+        !reachedEnd && !loadingMore && lastRequest != nil && hits.count < Paging.maxLoaded
+    }
+
+    /// Asks for the next page once the visible rows come near the end.
+    private func loadMoreIfNeeded() {
+        guard canLoadMore, isVisible else { return }
+        let lastVisible = table.rows(in: table.visibleRect).upperBound
+        if lastVisible >= hits.count - Paging.lookahead { loadMore() }
+    }
+
+    private func loadMore() {
+        guard canLoadMore, var request = lastRequest else { return }
+        request.offset = fetchedCount
+        request.limit = min(Paging.pageSize, Paging.maxLoaded - hits.count)
+        loadingMore = true
+        let token = generation
+        let offset = fetchedCount
+        let service = self.service
+        queryQueue.async { [weak self] in
+            guard let self, self.isCurrent(token) else { return }
+            let response = service.search(request)
+            DispatchQueue.main.async {
+                // A new query, or a refresh that replaced the list, drops the page.
+                guard token == self.generation, offset == self.fetchedCount else { return }
+                self.loadingMore = false
+                self.fetchedCount += response.hits.count
+                let fresh = response.hits.filter { self.loadedPaths.insert($0.path).inserted }
+                self.reachedEnd = response.hits.count < request.limit
+                    || (response.totalIsExact && offset + response.hits.count >= response.total)
+                self.total = response.total
+                self.totalIsExact = response.totalIsExact
+                if !fresh.isEmpty {
+                    self.hits += fresh
+                    self.table.noteNumberOfRowsChanged()
+                }
+                self.updateFooter()
+                // Rows already on screen may still reach the end, e.g. after a
+                // page that was all duplicates.
+                DispatchQueue.main.async { self.loadMoreIfNeeded() }
+            }
+        }
+    }
+
     /// Which sort of status the line shows, so that only a change of sort
     /// fades; a count that ticks up every half second is set in place.
     private var lastStatusKey: String?
 
     /// Refreshes the quiet status text at the right of the filter row.
     func updateFooter() {
-        let shown = totalIsExact ? total : max(total - 1, 0)
+        // Not exact means there is at least one more than is loaded.
+        let shown = totalIsExact ? total : hits.count
         let count = formattedCount(shown)
         var lead = totalIsExact ? "\(count) 个结果" : "超过 \(count) 个结果"
+        if hits.count >= Paging.maxLoaded && !(totalIsExact && total <= hits.count) {
+            lead = "只显示前 \(formattedCount(Paging.maxLoaded)) 个，请加关键词缩小范围"
+        }
         // A part that may be cut in the middle when the line is too long,
         // and the rest that must stay whole.
         var name = ""
@@ -751,8 +932,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
             key = "degraded"
         case .ready:
             key = "ready"
+        case .waitingForSetup:
+            lead = IndexPhase.waitingLine
+            key = "waiting"
+        case .unavailable:
+            lead = "无法启动搜索"
+            key = "unavailable"
         }
-        if service is DemoSearchService { tail += " · 演示数据" }
+        if service.isDemo { tail += " · 演示数据" }
         let text = Self.fit(lead, name, tail, width: countLabel.frame.width)
         guard countLabel.stringValue != text else { return }
         let fades = lastStatusKey != nil && lastStatusKey != key
@@ -839,15 +1026,30 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     }
 
     @objc private func openSelection() {
-        guard let hit = selectedHit else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: hit.path))
+        guard let hit = selectedHit, stillExists(hit) else { return }
+        guard NSWorkspace.shared.open(URL(fileURLWithPath: hit.path)) else {
+            NSSound.beep()
+            showNotice("无法打开这个文件")
+            return
+        }
         hide()
     }
 
     @objc private func revealSelection() {
-        guard let hit = selectedHit else { return }
+        guard let hit = selectedHit, stillExists(hit) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: hit.path)])
         hide()
+    }
+
+    /// The index can lag behind the disk; a file moved or deleted since gets
+    /// a word instead of no reaction at all. The panel stays open.
+    private func stillExists(_ hit: SearchHit) -> Bool {
+        // `lstat`, so that a symbolic link whose target is gone still counts.
+        var info = stat()
+        if lstat(hit.path, &info) == 0 { return true }
+        NSSound.beep()
+        showNotice(hit.isDirectory ? "这个文件夹已被移走或删除" : "这个文件已被移走或删除")
+        return false
     }
 
     /// Lets a result row be dragged into other applications as a file.
@@ -937,6 +1139,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         let row = min(max(table.selectedRow + delta, 0), hits.count - 1)
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
+        // Moving down towards the end, or pressing down on the last row,
+        // fetches the next page as scrolling does.
+        if delta > 0, row >= hits.count - Paging.lookahead { loadMore() }
     }
 
     // MARK: Quick Look
@@ -1191,8 +1396,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         if let previewPanel { previewPanel.reloadData(); placePreview(); settlePreview() } else { showPreview() }
     }
 
-    /// Removes stand-ins a previous run left behind.
-    func clearPreviewLeftovers() { previewContent.clear() }
+    /// Removes every stand-in before the application quits.
+    func removePreviewStandIns() { previewContent.clearNow() }
 
     /// Test hook: moves the selection the way the arrow keys do.
     func moveSelectionForTesting(by delta: Int) { moveSelection(by: delta) }
@@ -1237,4 +1442,40 @@ private final class ResultTable: NSTableView {
     // leaving them out keeps the menu free of it.
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {}
     override func didCloseMenu(_ menu: NSMenu, with event: NSEvent?) {}
+}
+
+/// A short message on a dark capsule, over the bottom of the panel.
+private final class NoticeView: NSView {
+    private let label = NSTextField(labelWithString: "")
+    override var wantsUpdateLayer: Bool { true }
+
+    var text: String {
+        get { label.stringValue }
+        set { label.stringValue = newValue; invalidateIntrinsicContentSize() }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 13
+        layer?.cornerCurve = .continuous
+        label.font = .systemFont(ofSize: 12.5, weight: .medium)
+        label.textColor = .white
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+    }
 }

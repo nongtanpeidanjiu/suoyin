@@ -18,6 +18,7 @@ final class DemoSearchService: SearchService {
     var onStatusChange: ((IndexStatus) -> Void)?
     var onIndexChange: (() -> Void)?
     var status: IndexStatus { lock.withLock { current } }
+    var isDemo: Bool { true }
 
     func start() {
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.load() }
@@ -215,6 +216,7 @@ final class DemoSearchService: SearchService {
                 if loaded.count % 500 == 0 { publish(loaded, phase: .scanning(indexed: loaded.count)) }
             }
         }
+        loaded += Self.bulkEntries(firstID: nextID)
         loaded.sort { $0.foldedName == $1.foldedName ? $0.hit.path < $1.hit.path : $0.foldedName < $1.foldedName }
         // Made-up attached volumes being added, so the progress lines and the
         // "checking" state of the access list can be looked at: first one
@@ -233,6 +235,23 @@ final class DemoSearchService: SearchService {
                     contentChanged: false)
         }
         publish(loaded, phase: .ready)
+    }
+
+    /// 12,000 made-up files, enough to page through: search for “样例”.
+    /// They do not exist on disk, so opening one shows what happens to a
+    /// file that has gone. Their folders sit under the home folder's
+    /// Documents, so the location line shows its Finder name.
+    private static func bulkEntries(firstID: UInt64) -> [Entry] {
+        let base = NSHomeDirectory() + "/Documents/演示批量文件"
+        let day = Date().addingTimeInterval(-86_400 * 40)
+        return (1...12_000).map { number in
+            let name = String(format: "样例 %05d.txt", number)
+            let path = "\(base)/第 \((number - 1) / 500 + 1) 组/\(name)"
+            let hit = SearchHit(id: firstID + UInt64(number), name: name, path: path, isDirectory: false,
+                                size: Int64(number * 37), modified: day.addingTimeInterval(Double(number) * 60),
+                                isCloudPlaceholder: false, isOnExternalVolume: false)
+            return Entry(hit: hit, foldedName: name.lowercased(), foldedPath: path.lowercased(), kind: .document)
+        }
     }
 
     private static let sampleVolume = "演示备份盘"
@@ -302,20 +321,49 @@ final class DemoSearchService: SearchService {
             InaccessiblePlace(path: path, count: places.count, reason: places[0].reason)
         }.sorted { $0.path < $1.path }
         status.pendingFullDiskAccessPaths = ["\(home)/Library/Containers", "\(home)/Library/Group Containers"]
+        // A cloud provider and an attached volume with locations of their own.
+        let cloudRoot = "\(home)/Library/CloudStorage/OneDrive-演示"
+        let cloud = [
+            InaccessiblePlace(path: "\(cloudRoot)/共享文件夹/财务", count: 1, reason: .filePermissions),
+            InaccessiblePlace(path: "\(cloudRoot)/共享文件夹/人事", count: 1, reason: .filePermissions),
+            InaccessiblePlace(path: "\(cloudRoot)/个人保险库", count: 1, reason: .unknown),
+        ]
+        let volume = [
+            InaccessiblePlace(path: "/Volumes/演示备份盘/.Spotlight-V100", count: 1, reason: .filePermissions),
+            InaccessiblePlace(path: "/Volumes/演示备份盘/.Trashes", count: 1, reason: .filePermissions),
+        ]
+        status.sources = [
+            IndexSource(id: "demo-onedrive", name: "OneDrive", kind: .cloudProvider, indexed: 8_214, isComplete: true,
+                        rawInaccessiblePlaces: cloud,
+                        inaccessiblePlaces: [
+                            InaccessiblePlace(path: "\(cloudRoot)/共享文件夹", count: 2, reason: .filePermissions),
+                            cloud[2],
+                        ]),
+            IndexSource(id: "demo-backup", name: "演示备份盘", kind: .externalVolume, indexed: 386_540, isComplete: true,
+                        rawInaccessiblePlaces: volume, inaccessiblePlaces: volume),
+        ]
     }
 
+    /// Answers like the core: one row past the page is looked for, and the
+    /// total is exact only when the matches end within the page.
     func search(_ request: SearchRequest) -> SearchResponse {
         let terms = queryTerms(request.text)
-        guard !terms.isEmpty else { return SearchResponse(hits: [], total: 0, totalIsExact: true) }
+        guard !terms.isEmpty, request.limit > 0 else { return SearchResponse(hits: [], total: 0, totalIsExact: true) }
         let all = lock.withLock { entries }
         var hits: [SearchHit] = []
-        var total = 0
+        var seen = 0
         for entry in all {
             let haystack = request.scope == .name ? entry.foldedName : entry.foldedPath
             guard Self.matches(entry, request.kind), terms.allSatisfy({ haystack.contains($0) }) else { continue }
-            if total >= request.offset && hits.count < request.limit { hits.append(entry.hit) }
-            total += 1
+            if seen >= request.offset {
+                if hits.count == request.limit {
+                    return SearchResponse(hits: hits, total: request.offset + hits.count + 1, totalIsExact: false)
+                }
+                hits.append(entry.hit)
+            }
+            seen += 1
         }
-        return SearchResponse(hits: hits, total: total, totalIsExact: true)
+        return SearchResponse(hits: hits, total: hits.isEmpty ? 0 : request.offset + hits.count,
+                              totalIsExact: !hits.isEmpty || request.offset == 0)
     }
 }

@@ -14,11 +14,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
     private var current: SettingsPane?
     private var poll: Timer?
 
+    enum PaneChoice { case general, scope, index }
+
     init(service: SearchService, shortcuts: ShortcutCenter, onShowAccessGuide: @escaping () -> Void,
-         onShowSetupGuide: @escaping () -> Void) {
+         onShowSetupGuide: @escaping () -> Void, onRetry: @escaping () -> Void) {
         general = GeneralPane(shortcuts: shortcuts, onShowSetupGuide: onShowSetupGuide)
         scope = ScopePane(service: service, onShowAccessGuide: onShowAccessGuide)
-        index = IndexPane(service: service)
+        index = IndexPane(service: service, onRetry: onRetry)
         super.init()
         for pane in panes { pane.onSizeChange = { [weak self, weak pane] in if let pane { self?.fit(pane) } } }
     }
@@ -32,6 +34,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         if window?.isVisible != true { window?.center() }
         window?.makeKeyAndOrderFront(nil)
         startPolling()
+    }
+
+    /// Opens the window on a given pane, e.g. “搜索范围” for the list of
+    /// unreadable locations.
+    func show(pane choice: PaneChoice) {
+        show()
+        let pane: SettingsPane
+        switch choice {
+        case .general: pane = general
+        case .scope: pane = scope
+        case .index: pane = index
+        }
+        select(pane, animated: true)
     }
 
     /// Brings the window back in front after the application's activation
@@ -460,7 +475,8 @@ private final class ScopePane: SettingsPane {
     private let sourcesNote = NSTextField(wrappingLabelWithString: "")
     private var pendingRow: NSGridRow!
     private let pendingList = PlacesList()
-    private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace], verified: Bool)?
+    private var shown: (raw: [InaccessiblePlace], merged: [InaccessiblePlace], sources: [IndexSource],
+                        verified: Bool)?
     private var pendingPaths: [String] = []
 
     init(service: SearchService, onShowAccessGuide: @escaping () -> Void) {
@@ -591,10 +607,16 @@ private final class ScopePane: SettingsPane {
             pendingList.paths = pendingPaths
             showPending()
         }
+        // Only the sources with something unreadable; their counts move all
+        // the time and must not rebuild the list.
+        let sources = status.sources.filter { !$0.rawInaccessiblePlaces.isEmpty || !$0.inaccessiblePlaces.isEmpty }
+            .map { IndexSource(id: $0.id, name: $0.name, kind: $0.kind, indexed: 0, isComplete: true, failure: nil,
+                               rawInaccessiblePlaces: $0.rawInaccessiblePlaces,
+                               inaccessiblePlaces: $0.inaccessiblePlaces) }
         guard shown?.raw != status.rawInaccessiblePlaces || shown?.merged != status.inaccessiblePlaces
-                || shown?.verified != status.inaccessibleVerified else { return }
-        let wasEmpty = shown.map { $0.verified && $0.raw.isEmpty && $0.merged.isEmpty } ?? true
-        shown = (status.rawInaccessiblePlaces, status.inaccessiblePlaces, status.inaccessibleVerified)
+                || shown?.sources != sources || shown?.verified != status.inaccessibleVerified else { return }
+        let wasEmpty = shown.map { $0.verified && $0.raw.isEmpty && $0.merged.isEmpty && $0.sources.isEmpty } ?? true
+        shown = (status.rawInaccessiblePlaces, status.inaccessiblePlaces, sources, status.inaccessibleVerified)
         // While the core is still checking, its lists are empty or about to
         // change: show no number at all, and an empty box with a word on
         // when the list will appear, rather than a count that then jumps.
@@ -608,16 +630,18 @@ private final class ScopePane: SettingsPane {
             placesSpinner.stopAnimation(nil)
         }
         placesOutline.show(raw: checking ? [] : status.rawInaccessiblePlaces,
-                           merged: checking ? [] : status.inaccessiblePlaces)
+                           merged: checking ? [] : status.inaccessiblePlaces,
+                           sources: checking ? [] : sources)
         placesOutline.placeholder = checking ? "核对完成后显示" : nil
         let isEmpty = !checking && status.rawInaccessiblePlaces.isEmpty && status.inaccessiblePlaces.isEmpty
+            && sources.isEmpty
         placesOutline.isHidden = isEmpty
         placesNote.isHidden = isEmpty
         if isEmpty != wasEmpty { onSizeChange?() }
     }
 
-    /// The list above covers this Mac only. Attached volumes and cloud
-    /// storage still being scanned may add locations once they finish.
+    /// Attached volumes and cloud storage still being scanned may add
+    /// locations to the list once they finish.
     private func showScanningSources(_ sources: [IndexSource]) {
         let names = sources.filter { !$0.isComplete && $0.failure == nil }.map(\.name)
         let text: String?
@@ -659,15 +683,29 @@ private final class IndexPane: SettingsPane {
     private let count = NSTextField(labelWithString: "")
     private let size = NSTextField(labelWithString: "")
     private let rebuild = NSButton(title: "立即重建索引…", target: nil, action: nil)
+    private let retry = NSButton(title: "重试", target: nil, action: nil)
+    private var retryRow: NSGridRow!
     private var countParts: NSTextField!
     private var countPartsRow: NSGridRow!
+    private let onRetry: () -> Void
 
-    init(service: SearchService) {
+    init(service: SearchService, onRetry: @escaping () -> Void) {
         self.service = service
+        self.onRetry = onRetry
         super.init(identifier: "index", title: "索引", symbol: "internaldrive")
-        for field in [state, count, size] { field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
+        for field in [count, size] { field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
+        // Wraps: an error can be long.
+        state.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        state.lineBreakMode = .byWordWrapping
+        state.maximumNumberOfLines = 0
+        state.preferredMaxLayoutWidth = Self.noteWidth
+        state.isSelectable = true
         addRow("状态：", state)
-        addRow("已收录文件：", count)
+        retry.target = self
+        retry.action = #selector(retryClicked)
+        retryRow = addRow(nil, retry)
+        retryRow.isHidden = true
+        addRow("已收录项目：", count)
         countParts = note("")
         countParts.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         countPartsRow = addRow(nil, countParts)
@@ -681,8 +719,19 @@ private final class IndexPane: SettingsPane {
 
     override func reload() { update(service.status) }
 
+    @objc private func retryClicked() { onRetry() }
+
     func update(_ status: IndexStatus) {
-        state.stringValue = status.summary
+        if state.stringValue != status.summary {
+            let lines = state.stringValue.count > 30 || status.summary.count > 30
+            state.stringValue = status.summary
+            if lines { onSizeChange?() }
+        }
+        let unavailable = status.phase.isUnavailable
+        if retryRow.isHidden == unavailable {
+            retryRow.isHidden = !unavailable
+            onSizeChange?()
+        }
         count.stringValue = "\(formattedCount(status.indexedCount)) 个"
         let parts = Self.countParts(status)
         if countParts.stringValue != parts ?? "" { countParts.stringValue = parts ?? "" }
@@ -691,7 +740,7 @@ private final class IndexPane: SettingsPane {
             onSizeChange?()
         }
         size.stringValue = ByteCountFormatter.string(fromByteCount: status.indexBytesOnDisk, countStyle: .file)
-        rebuild.isEnabled = !status.isBusy
+        rebuild.isEnabled = !status.isBusy && status.phase.isSearchable
     }
 
     /// “其中本机 1,950,000 个，外接磁盘 700,000 个” while attached volumes
@@ -704,7 +753,11 @@ private final class IndexPane: SettingsPane {
     @objc private func confirmRebuild() {
         let alert = NSAlert()
         alert.messageText = "要重建索引吗？"
-        alert.informativeText = "重建通常需要一到几分钟，期间仍可以搜索，完成后结果会完整准确。"
+        var text = "重建通常需要一到几分钟，期间仍可以搜索，完成后结果会完整准确。"
+        if service.externalVolumes.contains(where: { $0.isIncluded && $0.isOnline }) {
+            text += "已加入的外接磁盘也会重新核对，大容量机械硬盘可能要几十分钟。"
+        }
+        alert.informativeText = text
         alert.addButton(withTitle: "重建")
         alert.addButton(withTitle: "取消")
         // A free-standing alert: this pane is shorter than an alert sheet,
@@ -818,8 +871,10 @@ private final class PlaceCell: NSTableCellView {
     }
 }
 
-/// The unreadable locations grouped by reason. Each group lists the merged
-/// entries, and each merged entry opens onto the locations it stands for.
+/// The unreadable locations of this Mac grouped by reason, then those of
+/// each cloud provider and attached volume grouped by source. Each group
+/// lists the merged entries, and each merged entry opens onto the locations
+/// it stands for.
 private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     static let width: CGFloat = 360
     private static let rowHeight: CGFloat = 20
@@ -827,6 +882,8 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     final class Node: NSObject {
         enum Kind {
             case group(AccessReason, count: Int)
+            /// The unreadable locations inside one cloud provider or attached volume.
+            case source(IndexSource, count: Int)
             case place(InaccessiblePlace)
             case detail(InaccessiblePlace, parent: String)
         }
@@ -907,7 +964,7 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
 
     /// Replaces the contents, keeping what was open, what was selected and
     /// where the list was scrolled to.
-    func show(raw: [InaccessiblePlace], merged: [InaccessiblePlace]) {
+    func show(raw: [InaccessiblePlace], merged: [InaccessiblePlace], sources: [IndexSource]) {
         let previous = Set(groups.map(\.key))
         var expanded = Set<String>()
         func collect(_ nodes: [Node]) {
@@ -920,11 +977,11 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         let selected = (outline.item(atRow: outline.selectedRow) as? Node)?.key
         let origin = contentView.bounds.origin
 
-        groups = Self.tree(raw: raw, merged: merged)
+        groups = Self.tree(raw: raw, merged: merged) + sources.compactMap(Self.sourceGroup)
         outline.reloadData()
         func restore(_ nodes: [Node]) {
             for node in nodes {
-                let isGroup = if case .group = node.kind { true } else { false }
+                let isGroup = switch node.kind { case .group, .source: true; default: false }
                 // A group seen for the first time starts open.
                 if expanded.contains(node.key) || (isGroup && !previous.contains(node.key)) {
                     outline.expandItem(node)
@@ -958,34 +1015,91 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     /// still listed, as an entry of its own.
     private static func tree(raw: [InaccessiblePlace], merged: [InaccessiblePlace]) -> [Node] {
         AccessReason.allCases.compactMap { reason in
-            let entries = merged.filter { $0.reason == reason }
-            var details: [String: [InaccessiblePlace]] = [:]
-            var loose: [InaccessiblePlace] = []
-            let covering = Set(entries.map(\.path))
-            for place in raw where place.reason == reason {
-                var path = place.path
-                while !covering.contains(path), path != "/", !path.isEmpty {
-                    path = (path as NSString).deletingLastPathComponent
-                }
-                if covering.contains(path) { details[path, default: []].append(place) } else { loose.append(place) }
-            }
-            let places = (entries + loose).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-            guard !places.isEmpty else { return nil }
             let groupKey = "\(reason)"
-            let group = Node(key: groupKey, kind: .group(reason, count: places.reduce(0) { $0 + $1.count }))
-            group.children = places.map { place in
-                let node = Node(key: groupKey + "\u{0}" + place.path, kind: .place(place))
-                let inside = details[place.path] ?? []
-                // A single location that is the entry itself needs no detail.
-                if !(inside.count == 1 && inside[0].path == place.path) {
-                    node.children = inside.map {
-                        Node(key: node.key + "\u{0}" + $0.path, kind: .detail($0, parent: place.path))
-                    }
-                }
-                return node
-            }
+            guard let places = entries(raw: raw.filter { $0.reason == reason },
+                                       merged: merged.filter { $0.reason == reason }, under: groupKey) else { return nil }
+            let group = Node(key: groupKey, kind: .group(reason, count: places.reduce(0) { $0 + placeCount($1) }))
+            group.children = places
             return group
         }
+    }
+
+    /// One group for a cloud provider or attached volume, after this Mac's
+    /// reasons; its entries are built the same way.
+    private static func sourceGroup(_ source: IndexSource) -> Node? {
+        let groupKey = "source\u{0}\(source.id)"
+        guard let places = entries(raw: source.rawInaccessiblePlaces, merged: source.inaccessiblePlaces,
+                                   under: groupKey) else { return nil }
+        let group = Node(key: groupKey, kind: .source(source, count: places.reduce(0) { $0 + placeCount($1) }))
+        group.children = places
+        return group
+    }
+
+    private static func placeCount(_ node: Node) -> Int {
+        if case .place(let place) = node.kind { return place.count }
+        return 0
+    }
+
+    /// The merged entries, each holding the raw locations it covers; nil
+    /// when there are none.
+    private static func entries(raw: [InaccessiblePlace], merged entries: [InaccessiblePlace],
+                                under groupKey: String) -> [Node]? {
+        var details: [String: [InaccessiblePlace]] = [:]
+        var loose: [InaccessiblePlace] = []
+        let covering = Set(entries.map(\.path))
+        for place in raw {
+            var path = place.path
+            while !covering.contains(path), path != "/", !path.isEmpty {
+                path = (path as NSString).deletingLastPathComponent
+            }
+            if covering.contains(path) { details[path, default: []].append(place) } else { loose.append(place) }
+        }
+        let places = (entries + loose).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        guard !places.isEmpty else { return nil }
+        return places.map { place in
+            let node = Node(key: groupKey + "\u{0}" + place.path, kind: .place(place))
+            let inside = details[place.path] ?? []
+            // A single location that is the entry itself needs no detail.
+            if !(inside.count == 1 && inside[0].path == place.path) {
+                node.children = inside.map {
+                    Node(key: node.key + "\u{0}" + $0.path, kind: .detail($0, parent: place.path))
+                }
+            }
+            return node
+        }
+    }
+
+    /// The heading of a group: symbol, tint, bold title and explanation.
+    private static func heading(_ kind: Node.Kind) -> (symbol: String, tint: NSColor, title: String, explanation: String)? {
+        switch kind {
+        case .group(let reason, let count):
+            let (symbol, tint): (String, NSColor)
+            switch reason {
+            case .needsFullDiskAccess: (symbol, tint) = ("key", .systemBlue)
+            case .filePermissions: (symbol, tint) = ("lock", .secondaryLabelColor)
+            case .unknown: (symbol, tint) = ("questionmark.circle", .secondaryLabelColor)
+            }
+            return (symbol, tint, "\(title(reason)) · \(formatted(count)) 个位置", explanation(reason))
+        case .source(let source, let count):
+            let isCloud = source.kind == .cloudProvider
+            let name = isCloud ? source.name : "外接磁盘 \(source.name)"
+            return (isCloud ? "icloud" : "externaldrive", .secondaryLabelColor,
+                    "\(name) · \(formatted(count)) 个位置", sourceExplanation(source, isCloud: isCloud))
+        case .place, .detail:
+            return nil
+        }
+    }
+
+    /// Why the locations of a source could not be read, counted by reason.
+    private static func sourceExplanation(_ source: IndexSource, isCloud: Bool) -> String {
+        let places = source.rawInaccessiblePlaces.isEmpty ? source.inaccessiblePlaces : source.rawInaccessiblePlaces
+        let reasons = AccessReason.allCases.compactMap { reason -> String? in
+            let count = places.filter { $0.reason == reason }.reduce(0) { $0 + $1.count }
+            return count > 0 ? "\(title(reason)) \(formatted(count)) 个" : nil
+        }
+        let place = isCloud ? "这个云盘里" : "这块磁盘上"
+        let lead = "\(place)读不到的位置，其中的文件不会出现在搜索结果中。"
+        return reasons.isEmpty ? lead : lead + "原因：" + reasons.joined(separator: "、") + "。"
     }
 
     private static func title(_ reason: AccessReason) -> String {
@@ -1021,9 +1135,9 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     // MARK: Appearance
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
-        guard let node = item as? Node, case .group(let reason, _) = node.kind else { return Self.rowHeight }
+        guard let node = item as? Node, let heading = Self.heading(node.kind) else { return Self.rowHeight }
         let probe = GroupCell.measuring
-        probe.show(reason: reason, title: "", explanation: Self.explanation(reason))
+        probe.show(symbol: heading.symbol, tint: heading.tint, title: "", explanation: heading.explanation)
         // The column can still be at its initial width when rows are first
         // measured; a heading is indented by the disclosure triangle.
         let estimate = max(outline.tableColumns.first?.width ?? 0, Self.width - 4) - 26
@@ -1033,15 +1147,16 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? Node else { return nil }
         switch node.kind {
-        case .group(let reason, let count):
+        case .group, .source:
+            guard let heading = Self.heading(node.kind) else { return nil }
             let identifier = NSUserInterfaceItemIdentifier("group")
             let cell = outlineView.makeView(withIdentifier: identifier, owner: nil) as? GroupCell ?? {
                 let cell = GroupCell()
                 cell.identifier = identifier
                 return cell
             }()
-            cell.show(reason: reason, title: "\(Self.title(reason)) · \(formatted(count)) 个位置",
-                      explanation: Self.explanation(reason))
+            cell.show(symbol: heading.symbol, tint: heading.tint, title: heading.title,
+                      explanation: heading.explanation)
             cell.onWidthChange = { [weak self] width in self?.noteGroupCellWidth(width) }
             return cell
         case .place(let place):
@@ -1077,8 +1192,8 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
     }
 
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
-        if let node = item as? Node, case .group = node.kind { return false }
-        return true
+        guard let node = item as? Node else { return true }
+        return Self.heading(node.kind) == nil
     }
 }
 
@@ -1120,14 +1235,7 @@ private final class GroupCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func show(reason: AccessReason, title: String, explanation: String) {
-        let symbol: String
-        let tint: NSColor
-        switch reason {
-        case .needsFullDiskAccess: (symbol, tint) = ("key", .systemBlue)
-        case .filePermissions: (symbol, tint) = ("lock", .secondaryLabelColor)
-        case .unknown: (symbol, tint) = ("questionmark.circle", .secondaryLabelColor)
-        }
+    func show(symbol: String, tint: NSColor, title: String, explanation: String) {
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = tint
         titleLabel.stringValue = title

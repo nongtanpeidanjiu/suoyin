@@ -48,6 +48,8 @@ struct SearchRequest {
     var includeSystemFiles = true
     var kind: SearchKind = .any
     var offset = 0
+    /// One page; the panel asks for the next page with `offset` as the
+    /// list is scrolled towards its end.
     var limit = 200
 }
 
@@ -81,6 +83,12 @@ enum IndexPhase {
     /// searchable) rather than reading new folders.
     case supplementing(name: String, indexed: Int, restoring: Bool)
     case degraded(reason: String)
+    /// First launch: indexing waits until the setup guide's full disk access
+    /// step is past, so the system's access prompts never come before the
+    /// guide has explained them.
+    case waitingForSetup
+    /// The core could not be opened; `reason` is the whole line to show.
+    case unavailable(reason: String)
 }
 
 /// Why a location could not be read.
@@ -118,10 +126,14 @@ struct IndexStatus {
     /// does not tell them apart. `indexedCount` adds the attached volumes.
     var localIndexedCount: Int? = nil
     /// Attached volumes being searched and cloud providers, each with its own
-    /// progress. The lists of unreadable locations above cover this Mac only.
+    /// progress and its own unreadable locations; the lists above leave
+    /// these out.
     var sources: [IndexSource] = []
 
-    var inaccessibleCount: Int { rawInaccessiblePlaces.count }
+    /// Every unreadable location, this Mac's and those of the sources.
+    var inaccessibleCount: Int {
+        rawInaccessiblePlaces.count + sources.reduce(0) { $0 + $1.rawInaccessiblePlaces.count }
+    }
 }
 
 /// An attached volume or a cloud provider the index is filling in.
@@ -135,6 +147,10 @@ struct IndexSource: Equatable {
     var isComplete: Bool
     /// Set when the source stopped with an error.
     var failure: String?
+    /// Locations inside this source that could not be read, raw and merged
+    /// the same way as this Mac's; empty until `isComplete`.
+    var rawInaccessiblePlaces: [InaccessiblePlace] = []
+    var inaccessiblePlaces: [InaccessiblePlace] = []
 }
 
 /// An attached volume the index knows about, attached now or remembered
@@ -174,6 +190,8 @@ struct ExternalVolume: Equatable {
 }
 
 protocol SearchService: AnyObject {
+    /// True for the stand-in data of `--demo`.
+    var isDemo: Bool { get }
     func start()
     func stop()
     func search(_ request: SearchRequest) -> SearchResponse
@@ -208,6 +226,10 @@ protocol SearchService: AnyObject {
     var onExternalVolumesChange: (() -> Void)? { get set }
 }
 
+extension SearchService {
+    var isDemo: Bool { false }
+}
+
 /// Something the core could not do with the choices about attached volumes.
 struct ExternalVolumeSettingsError: Equatable {
     enum Category {
@@ -235,7 +257,7 @@ struct ExternalVolumeSettingsError: Equatable {
         case .writeSettings:
             meaning = "外接磁盘的设置没能保存，刚才的更改在重新打开软件后可能失效。"
         case .inspectIndex:
-            meaning = "读不到部分外接磁盘已收录的数据，这些磁盘暂时无法显示保留的条目数。"
+            meaning = "读不到部分外接磁盘已收录的数据，这些磁盘暂时无法显示保留的项目数。"
         case .verifyIdentity:
             meaning = "无法确认一块外接磁盘的身份，暂时没有搜索它；重新插入后会再试。"
         case .removeIndex:
@@ -290,24 +312,24 @@ extension ExternalVolume {
     var stateLine: String {
         if isRemoving { return "正在移除…" }
         if !isOnline {
-            return keptCount.map { "未连接，保留 \(formattedCount($0)) 个已收录条目" } ?? "未连接"
+            return keptCount.map { "未连接，保留 \(formattedCount($0)) 个已收录项目" } ?? "未连接"
         }
         if !isIncluded {
-            return keptCount.map { "未加入，保留 \(formattedCount($0)) 个已收录条目" } ?? "未加入"
+            return keptCount.map { "未加入，保留 \(formattedCount($0)) 个已收录项目" } ?? "未加入"
         }
         switch progress {
         case .restoring:
             // What an earlier run indexed comes back at once and can be
             // searched while it is checked; nothing starts over.
             if indexedCount > 0 { return "正在恢复上次收录的内容，\(formattedCount(indexedCount)) 个已可搜索" }
-            return keptCount.map { "正在恢复上次收录的 \(formattedCount($0)) 个条目" } ?? "正在恢复上次收录的内容"
+            return keptCount.map { "正在恢复上次收录的 \(formattedCount($0)) 个项目" } ?? "正在恢复上次收录的内容"
         case .scanning:
             return indexedCount > 0 ? "正在扫描，已收录 \(formattedCount(indexedCount)) 个" : "正在扫描"
         case .idle:
-            if indexedCount > 0 { return "已加入，共 \(formattedCount(indexedCount)) 个文件" }
+            if indexedCount > 0 { return "已加入，共 \(formattedCount(indexedCount)) 个项目" }
             // Just attached or just switched on: kept entries are about to be
             // loaded.
-            return keptCount.map { "已加入，正在载入已收录的 \(formattedCount($0)) 个条目" } ?? "已加入"
+            return keptCount.map { "已加入，正在载入已收录的 \(formattedCount($0)) 个项目" } ?? "已加入"
         }
     }
 

@@ -5,7 +5,6 @@ final class ResultCellView: NSTableCellView {
     static var compact = false
     static var invertsWhenChosen = true
     static var rowHeight: CGFloat { compact ? 30 : 46 }
-    private static let icons = NSCache<NSString, NSImage>()
     private static func formatter(_ template: String) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate(template)
@@ -41,6 +40,9 @@ final class ResultCellView: NSTableCellView {
     private let badge = NSImageView()
     private var hit: SearchHit?
     private var terms: [String] = []
+    /// The icon this row is waiting for; a row reused for another result
+    /// ignores an icon that arrives for the old one.
+    private var iconKey: String?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -113,13 +115,18 @@ final class ResultCellView: NSTableCellView {
         self.hit = hit
         self.terms = terms
         isChosen = false
-        let key = hit.path as NSString
-        if let cached = Self.icons.object(forKey: key) {
+        // Looking an icon up can touch the disk (a slow or sleeping volume),
+        // so it happens off the main thread; a generic icon stands in.
+        let key = IconLoader.key(for: hit)
+        iconKey = key
+        if let cached = IconLoader.shared.cached(key) {
             icon.image = cached
         } else {
-            let image = NSWorkspace.shared.icon(forFile: hit.path)
-            Self.icons.setObject(image, forKey: key)
-            icon.image = image
+            icon.image = IconLoader.placeholder(for: hit)
+            IconLoader.shared.load(key, path: hit.path) { [weak self] image in
+                guard let self, self.iconKey == key else { return }
+                self.icon.image = image
+            }
         }
         location.stringValue = Self.displayLocation(of: hit.path)
         modified.stringValue = hit.modified == .distantPast ? "" : Self.displayDate(hit.modified)
@@ -171,19 +178,98 @@ final class ResultCellView: NSTableCellView {
         name.attributedStringValue = text
     }
 
-    /// "/Users/me/Documents/a/b.txt" becomes "个人 › Documents › a".
+    /// "/Users/me/Documents/a/b.txt" becomes "个人 › 文稿 › a": the standard
+    /// folders of the home folder under the names the Finder shows.
     static func displayLocation(of path: String) -> String {
         let parent = (path as NSString).deletingLastPathComponent
         let home = NSHomeDirectory()
         var parts: [String]
         if parent == home || parent.hasPrefix(home + "/") {
-            parts = ["个人"] + parent.dropFirst(home.count).split(separator: "/").map(String.init)
+            parts = parent.dropFirst(home.count).split(separator: "/").map(String.init)
+            if let first = parts.first, let shown = homeFolderNames[first] { parts[0] = shown }
+            parts.insert("个人", at: 0)
         } else if parent.hasPrefix("/Volumes/") {
             parts = parent.dropFirst("/Volumes/".count).split(separator: "/").map(String.init)
         } else {
             parts = parent.split(separator: "/").map(String.init)
-            if parts.isEmpty { parts = ["Macintosh HD"] }
+            if parts.isEmpty { parts = [startupVolumeName] }
         }
         return parts.joined(separator: " › ")
+    }
+
+    /// The startup disk's name as the Finder shows it, asked once.
+    private static let startupVolumeName: String = {
+        let values = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeLocalizedNameKey, .volumeNameKey])
+        return values?.volumeLocalizedName ?? values?.volumeName ?? "启动磁盘"
+    }()
+
+    /// The standard folders of the home folder and the names the system
+    /// gives them in the current language (“Documents” → “文稿”), asked once.
+    private static let homeFolderNames: [String: String] = {
+        let home = NSHomeDirectory()
+        var names: [String: String] = [:]
+        for folder in ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Library",
+                       "Applications", "Public", "Sites"] {
+            let path = home + "/" + folder
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let shown = FileManager.default.displayName(atPath: path)
+            if !shown.isEmpty && shown != folder { names[folder] = shown }
+        }
+        return names
+    }()
+}
+
+/// File icons for the result rows, looked up off the main thread and kept.
+///
+/// Files with an extension share the icon of their type, keyed by the
+/// extension. Folders, applications, packages and files without an
+/// extension can each have an icon of their own (a special folder, an
+/// application's own icon), so they are keyed by their path.
+final class IconLoader {
+    static let shared = IconLoader()
+
+    private let cache = NSCache<NSString, NSImage>()
+    private let queue = OperationQueue()
+    /// What to call once an icon arrives, per key; only the main thread
+    /// touches it.
+    private var waiting: [String: [(NSImage) -> Void]] = [:]
+
+    private init() {
+        cache.countLimit = 3_000
+        queue.name = "dev.local.filesearch.icons"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .userInitiated
+    }
+
+    static func key(for hit: SearchHit) -> String {
+        let ext = (hit.name as NSString).pathExtension.lowercased()
+        if hit.isDirectory || ext.isEmpty { return "path:" + hit.path }
+        return "ext:" + ext
+    }
+
+    /// A generic folder or document icon while the real one is fetched.
+    static func placeholder(for hit: SearchHit) -> NSImage {
+        hit.isDirectory ? folderIcon : documentIcon
+    }
+
+    private static let folderIcon = NSWorkspace.shared.icon(for: .folder)
+    private static let documentIcon = NSWorkspace.shared.icon(for: .data)
+
+    func cached(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
+
+    /// Fetches the icon for `path` unless it is already on its way, then
+    /// calls `done` on the main thread.
+    func load(_ key: String, path: String, done: @escaping (NSImage) -> Void) {
+        if waiting[key] != nil { waiting[key]?.append(done); return }
+        waiting[key] = [done]
+        queue.addOperation { [weak self] in
+            let image = NSWorkspace.shared.icon(forFile: path)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cache.setObject(image, forKey: key as NSString)
+                let calls = self.waiting.removeValue(forKey: key) ?? []
+                calls.forEach { $0(image) }
+            }
+        }
     }
 }

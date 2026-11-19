@@ -51,12 +51,23 @@ final class PreviewContent {
     /// Results for files looked at while the preview is open, newest last.
     private var plans: [(path: String, plan: Plan)] = []
 
-    init() {
+    /// `~/Library/Caches/<bundle identifier>/PreviewStandIns`.
+    static let standInsFolder: URL = {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         let owner = Bundle.main.bundleIdentifier ?? "dev.local.filesearch"
-        root = caches.appendingPathComponent(owner, isDirectory: true)
+        return caches.appendingPathComponent(owner, isDirectory: true)
             .appendingPathComponent("PreviewStandIns", isDirectory: true)
+    }()
+
+    init() {
+        root = Self.standInsFolder
+    }
+
+    /// Removes the whole folder at once, before anything can be previewed:
+    /// at launch, for stand-ins a crash left behind.
+    static func removeAll() {
+        try? FileManager.default.removeItem(at: standInsFolder)
     }
 
     /// The plan for a file already looked at, or nil while it is unknown.
@@ -96,13 +107,22 @@ final class PreviewContent {
         while plans.count > 2 { Self.discard(plans.removeFirst().plan) }
     }
 
-    /// Removes every stand-in: when the preview closes, and at launch for
-    /// any left behind by a crash.
+    /// Removes every stand-in when the preview closes. Work still under
+    /// way is dropped, and anything it writes is removed with the rest, as
+    /// this runs after it on the same queue.
     func clear() {
         plans = []
         lock.lock(); latest += 1; lock.unlock()
         let root = root
         queue.async { try? FileManager.default.removeItem(at: root) }
+    }
+
+    /// The same, waiting until it is done: when the application quits.
+    func clearNow() {
+        plans = []
+        lock.lock(); latest += 1; lock.unlock()
+        let root = root
+        queue.sync { try? FileManager.default.removeItem(at: root) }
     }
 
     private static func discard(_ plan: Plan) {

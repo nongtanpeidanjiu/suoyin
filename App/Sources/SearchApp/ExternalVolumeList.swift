@@ -136,7 +136,7 @@ final class ExternalVolumeList: NSScrollView, NSTableViewDataSource, NSTableView
             if volume.isRemoving {
                 item.toolTip = "正在从列表中移除"
             } else if !item.isEnabled {
-                item.toolTip = volume.retainedCount == nil ? "正在统计已收录的条目，稍后再试" : "这块磁盘没有已收录的数据"
+                item.toolTip = volume.retainedCount == nil ? "正在统计已收录的项目，稍后再试" : "这块磁盘没有已收录的数据"
             }
             menu.addItem(item)
         }
@@ -292,7 +292,7 @@ enum ExternalVolumeConfirmation {
         let alert = NSAlert()
         alert.messageText = "要删除“\(volume.title)”已收录的数据吗？"
         var text = "将删除本软件为这块磁盘保存的"
-        text += volume.retainedCount.map { " \(formattedCount($0)) 个已收录条目" } ?? "已收录条目"
+        text += volume.retainedCount.map { " \(formattedCount($0)) 个已收录项目" } ?? "已收录项目"
         text += "，磁盘上的文件不受任何影响。"
         if volume.isOnline {
             text += "删除后不再搜索这块磁盘，它仍留在列表中，显示为“未加入”；以后可以重新加入，届时需要从头扫描。"
@@ -320,12 +320,12 @@ enum ExternalVolumeConfirmation {
         let later = "以后再接入时会当作新磁盘。"
         switch volume.retainedCount {
         case .some(let count) where count > 0:
-            alert.informativeText = "这块磁盘已收录的 \(formattedCount(count)) 个文件记录会一并删除，磁盘上的文件不受影响。" + later
+            alert.informativeText = "这块磁盘已收录的 \(formattedCount(count)) 个项目记录会一并删除，磁盘上的文件不受影响。" + later
         case .some:
             alert.informativeText = later
         case nil:
             // Not counted yet: there may be records, so say they go too.
-            alert.informativeText = "这块磁盘已收录的文件记录会一并删除，磁盘上的文件不受影响。" + later
+            alert.informativeText = "这块磁盘已收录的项目记录会一并删除，磁盘上的文件不受影响。" + later
         }
         let remove = alert.addButton(withTitle: "移除")
         remove.hasDestructiveAction = true

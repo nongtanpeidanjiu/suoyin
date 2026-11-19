@@ -1,15 +1,17 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// The real core by default; `--demo` keeps the stand-in data for interface
-    /// work. `--data-dir <path>` points the core at another data directory, so
-    /// tests that change the index leave the user's own alone. Both are test
-    /// hooks (see TestHooks.swift).
-    private let service: SearchService = {
-        if !TestHooks.flag("--demo"),
-           let real = try? CoreSearchService(dataDirectory: AppDelegate.testDataDirectory) { return real }
-        return DemoSearchService()
-    }()
+    /// The real core; only `--demo` uses the stand-in data instead. When the
+    /// core cannot be opened the application still starts and says why, with
+    /// “重试” (see ServiceHost). `--data-dir <path>` points the core at
+    /// another data directory, so tests that change the index leave the
+    /// user's own alone. Both are test hooks (see TestHooks.swift).
+    private var service: ServiceHost!
+
+    private static func openService() throws -> SearchService {
+        if TestHooks.flag("--demo") { return DemoSearchService() }
+        return try CoreSearchService(dataDirectory: testDataDirectory)
+    }
 
     private static var testDataDirectory: URL? {
         guard let value = TestHooks.value(after: "--data-dir") else { return nil }
@@ -23,11 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var setupGuide = SetupGuideController(
         service: service, shortcuts: shortcuts,
         onGranted: { [weak self] in self?.service.recheckAccess() },
+        onAccessStepPassed: { [weak self] in self?.service.release() },
         onFinish: { [weak self] in self?.panel.show(anchor: nil) })
     private lazy var settings = SettingsWindowController(
         service: service, shortcuts: shortcuts,
         onShowAccessGuide: { [weak self] in self?.setupGuide.show(at: .access) },
-        onShowSetupGuide: { [weak self] in self?.setupGuide.show(at: .welcome) })
+        onShowSetupGuide: { [weak self] in self?.setupGuide.show(at: .welcome) },
+        onRetry: { [weak self] in self?.retryService() })
     private var spinner: Timer?
     /// The status line of the menu while it is open, kept current as the
     /// supplementing count rises.
@@ -35,9 +39,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var angle: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The setup guide opens by itself once, on the first launch. The key
+        // is the one the earlier single-page access guide set, so whoever saw
+        // that one is not asked again. `--show-setup` opens it regardless,
+        // for testing. On that first launch indexing waits for the guide's
+        // access step (see ServiceHost).
+        let forced = TestHooks.flag("--show-setup")
+        let firstLaunch = !UserDefaults.standard.bool(forKey: "accessGuideShown") && !TestHooks.flag("--show")
+        service = ServiceHost(holding: firstLaunch, open: Self.openService)
+
         installMainMenu()
+        // Stand-ins a previous run left behind, e.g. after a crash.
+        PreviewContent.removeAll()
         panel = SearchPanelController(service: service)
         panel.onOpenSettings = { [weak self] in self?.openSettings() }
+        panel.onRetry = { [weak self] in self?.retryService() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
@@ -73,14 +89,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         service.start()
-        panel.clearPreviewLeftovers()
+        reflect(service.status)
 
-        // The setup guide opens by itself once, on the first launch. The key
-        // is the one the earlier single-page access guide set, so whoever saw
-        // that one is not asked again. `--show-setup` opens it regardless,
-        // for testing.
-        let forced = TestHooks.flag("--show-setup")
-        if forced || (!UserDefaults.standard.bool(forKey: "accessGuideShown") && !TestHooks.flag("--show")) {
+        if forced || firstLaunch {
             if !forced { UserDefaults.standard.set(true, forKey: "accessGuideShown") }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.setupGuide.show(at: .welcome) }
         }
@@ -120,11 +131,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.panel.togglePreview()
         }
         // Previews a given file (object: its path), e.g. test samples the
-        // index has not picked up yet.
-        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.previewPath"),
-                                                            object: nil, queue: .main) { [weak self] note in
-            guard let path = note.object as? String else { return }
-            self?.panel.previewPathForTesting(path)
+        // index has not picked up yet. It opens any path, so only with the
+        // demo data or a test data directory, never in a preview build that
+        // runs on the user's own index.
+        if TestHooks.flag("--demo") || TestHooks.value(after: "--data-dir") != nil {
+            DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.previewPath"),
+                                                                object: nil, queue: .main) { [weak self] note in
+                guard let path = note.object as? String else { return }
+                self?.panel.previewPathForTesting(path)
+            }
         }
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.select"),
                                                             object: nil, queue: .main) { [weak self] note in
@@ -173,14 +188,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         service.stop()
+        panel.removePreviewStandIns()
+    }
+
+    /// “重试” after the core could not be opened.
+    @objc private func retryService() {
+        service.retry()
+        panel.refresh()
     }
 
     private var wasSearchable = false
 
     /// Results typed in before the index finished loading appear once it is ready.
     private func noteReadiness(_ status: IndexStatus) {
-        var searchable = true
-        if case .starting = status.phase { searchable = false }
+        let searchable = status.phase.isSearchable
         if searchable && !wasSearchable { panel.refresh() }
         wasSearchable = searchable
     }
@@ -193,8 +214,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.isEnabled = false
         menu.addItem(status)
         statusMenuItem = status
-        showStatusLine(service.status)
+        let current = service.status
+        showStatusLine(current)
+        if current.phase.isUnavailable {
+            menu.addItem(withTitle: "重试", action: #selector(retryService), keyEquivalent: "").target = self
+        }
         menu.addItem(.separator())
+        // Only when there is something to show.
+        if current.inaccessibleVerified && current.inaccessibleCount > 0 {
+            menu.addItem(withTitle: "无法访问的位置…", action: #selector(showInaccessible), keyEquivalent: "").target = self
+        }
         if !DiskAccess.isGranted {
             menu.addItem(withTitle: "授予完整磁盘访问权限…", action: #selector(showAccessGuide), keyEquivalent: "").target = self
             menu.addItem(.separator())
@@ -216,6 +245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openSettings() {
         panel.hide()
         settings.show()
+    }
+
+    @objc private func showInaccessible() {
+        panel.hide()
+        settings.show(pane: .scope)
     }
 
     func settingsDidChangeDockIcon() { settings.reassert() }
@@ -281,16 +315,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusItem.button?.image = Glyphs.menuBar(.indexing(angle: 0))
                 return
             }
-            spinner = Timer.scheduledTimer(withTimeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
+            // Ten frames a second is smooth enough for an icon this small;
+            // one turn still takes 1.2 seconds.
+            spinner = Timer.scheduledTimer(withTimeInterval: 1.0 / 10, repeats: true) { [weak self] _ in
                 guard let self else { return }
-                self.angle += 2 * .pi / (1.2 * 20)
+                self.angle += 2 * .pi / (1.2 * 10)
                 self.statusItem.button?.image = Glyphs.menuBar(.indexing(angle: self.angle))
             }
-        case .ready, .supplementing:
+        case .ready, .supplementing, .waitingForSetup:
             spinner?.invalidate()
             spinner = nil
             statusItem.button?.image = Glyphs.menuBar(.idle)
-        case .degraded:
+        case .degraded, .unavailable:
             spinner?.invalidate()
             spinner = nil
             statusItem.button?.image = Glyphs.menuBar(.attention)

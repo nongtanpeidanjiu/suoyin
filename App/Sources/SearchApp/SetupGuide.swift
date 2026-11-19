@@ -15,6 +15,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
     private let service: SearchService
     private let shortcuts: ShortcutCenter
     private let onGranted: () -> Void
+    private let onAccessStepPassed: () -> Void
     private let onFinish: () -> Void
     private var window: NSWindow?
     private var step: Step = .welcome
@@ -55,11 +56,15 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
     // Last step.
     private let doneBody = NSTextField(wrappingLabelWithString: "")
 
+    /// `onAccessStepPassed` is called once the full disk access step is
+    /// behind the user: access granted, “暂不授权” clicked, or the guide
+    /// closed. On the first launch indexing waits for it.
     init(service: SearchService, shortcuts: ShortcutCenter, onGranted: @escaping () -> Void,
-         onFinish: @escaping () -> Void) {
+         onAccessStepPassed: @escaping () -> Void, onFinish: @escaping () -> Void) {
         self.service = service
         self.shortcuts = shortcuts
         self.onGranted = onGranted
+        self.onAccessStepPassed = onAccessStepPassed
         self.onFinish = onFinish
     }
 
@@ -81,6 +86,8 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         poll?.invalidate()
         poll = nil
+        // Closing the guide skips the steps not seen, the access one included.
+        onAccessStepPassed()
         if recorder.isRecording { window?.makeFirstResponder(nil) }
     }
 
@@ -203,7 +210,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
                                color: .tertiaryLabelColor)
         points.alignment = .center
         return page(icon: NSApp.applicationIconImage, symbol: nil, title: "欢迎使用\(AppName.short)",
-                    body: "按文件名搜索整台电脑，输入几个字就能找到文件。\n只读取文件名、大小和修改时间，不读文件内容，不联网。",
+                    body: "按文件名搜索整台电脑，输入几个字就能找到文件。\n建立索引时只读取文件名、大小和修改时间；\n只有你预览某个文件时，才会读取它的内容。\n不上传任何信息，不联网。",
                     below: [points])
     }
 
@@ -389,6 +396,7 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
     }
 
     @objc private func goNext() {
+        if step == .access { onAccessStepPassed() }
         guard let following = Step(rawValue: step.rawValue + 1) else {
             window?.close()
             onFinish()
@@ -405,6 +413,8 @@ final class SetupGuideController: NSObject, NSWindowDelegate {
         let granted = DiskAccess.isGranted
         if granted && !reportedGrant {
             reportedGrant = true
+            // With access there is no prompt to wait for.
+            onAccessStepPassed()
             onGranted()
         }
         dots.current = step.rawValue

@@ -296,7 +296,9 @@ final class CoreSearchService: SearchService {
         IndexSource(id: source.id, name: displayName(source),
                     kind: source.kind == .externalVolume ? .externalVolume : .cloudProvider,
                     indexed: source.indexed, isComplete: source.inaccessibleLocationsVerified,
-                    failure: source.error)
+                    failure: source.error,
+                    rawInaccessiblePlaces: source.rawInaccessibleLocations.map(Self.convert),
+                    inaccessiblePlaces: source.inaccessibleLocations.map(Self.convert))
     }
 
     /// iCloud Drive under the name the Finder gives it in Chinese; other

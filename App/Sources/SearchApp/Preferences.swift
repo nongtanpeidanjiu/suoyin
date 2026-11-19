@@ -31,11 +31,13 @@ extension IndexStatus {
         switch phase {
         case .starting: return "正在准备索引"
         case .scanning: return "正在建立索引，已收录 \(count) 个"
-        case .ready: return "索引已就绪，共 \(count) 个文件"
-        case .recovering: return "正在更新索引，共 \(count) 个文件"
+        case .ready: return "索引已就绪，共 \(count) 个项目"
+        case .recovering: return "正在更新索引，共 \(count) 个项目"
         case .supplementing(let name, let indexed, let restoring):
             return IndexPhase.supplementingLine(name, indexed, restoring: restoring)
         case .degraded(let reason): return reason
+        case .waitingForSetup: return IndexPhase.waitingLine
+        case .unavailable(let reason): return reason
         }
     }
 
@@ -48,6 +50,21 @@ extension IndexStatus {
 }
 
 extension IndexPhase {
+    static let waitingLine = "完成设置后开始建立索引"
+
+    /// Whether the core is running and can be searched.
+    var isSearchable: Bool {
+        switch self {
+        case .starting, .waitingForSetup, .unavailable: return false
+        default: return true
+        }
+    }
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+
     /// "正在补充 <名称>，已收录 <数量> 个", written like the first build's
     /// "正在建立索引，已收录 <数量> 个"; without the count while it is 0.
     /// While a volume brings back an earlier run's entries the line says

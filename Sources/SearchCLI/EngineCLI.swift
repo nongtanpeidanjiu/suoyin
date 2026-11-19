@@ -55,6 +55,11 @@ private func encodeStatus(_ status: EngineStatus) -> [String: Any] {
         "pendingFullDiskAccessCount": status.pendingFullDiskAccessCount,
         "indexBytesOnDisk": status.indexBytesOnDisk
     ]
+    if let startup = status.startup {
+        result["startupHistoryEvents"] = startup.historyEvents
+        result["startupCatchUpNanoseconds"] = startup.catchUpNanoseconds
+        result["startupRecoveryReason"] = startup.recoveryReason
+    }
     switch status.phase {
     case .starting: result["phase"] = "starting"
     case .scanning: result["phase"] = "scanning"

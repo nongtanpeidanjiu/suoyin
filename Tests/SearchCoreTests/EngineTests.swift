@@ -49,6 +49,7 @@ struct EngineTests {
         engine.start()
         try #require(until { engine.status.phase == .ready && engine.status.indexBytesOnDisk > 0 })
         #expect(engine.status.indexedCount == 4)
+        #expect((engine.status.startup?.catchUpNanoseconds ?? 0) > 0)
         for empty in ["", "   ", "\t\n"] {
             let result = engine.search(EngineQuery(text: empty))
             #expect(result.hits.isEmpty && result.total == 0 && result.totalIsExact)
@@ -78,7 +79,7 @@ struct EngineTests {
         let modified = try #require(file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
         #expect(abs(hit.modified.timeIntervalSince(modified)) < 0.001)
 
-        engine.stop()
+        #expect(engine.stop() == .finished)
         let reopened = try SearchEngine(dataDirectory: data, root: root.path)
         defer { reopened.stop() }
         reopened.start()

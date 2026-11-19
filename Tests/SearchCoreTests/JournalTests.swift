@@ -75,6 +75,31 @@ struct JournalTests {
         #expect(index.restoredRows().map(\.name) == ["old"])
     }
 
+    @Test func journalCapacityIsCheckedBeforeTouchingTheCommittedPrefix() throws {
+        let directory = try scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("index").path
+        let digest = Data(repeating: 5, count: 32)
+        var journal = ChangeJournal(snapshot: path, identity: digest)
+        let first = JournalFrame(rows: [.init(path: "/fixture/first", value: item)], masks: [], coverage: [],
+                                 positions: ["/fixture": 20])
+        _ = try journal.append(first)
+        let committed = journal.length
+        let file = URL(fileURLWithPath: journal.path)
+        let prefix = try Data(contentsOf: file)
+        #expect(throws: ChangeJournal.CapacityError.requiresNewBase) {
+            try journal.append(JournalFrame(rows: [], masks: [], coverage: [], positions: ["/fixture": 21]),
+                               limit: committed)
+        }
+        let after = try Data(contentsOf: file)
+        #expect(journal.length == committed && after == prefix)
+        var restored = base()
+        var reader = ChangeJournal(snapshot: path, identity: digest)
+        try reader.restore(into: &restored, root: "/fixture")
+        #expect(restored.volumes.first?.appliedEvent == 20)
+        #expect(restored.tracking?.changes == ["/fixture/first": item])
+    }
+
     @Test func journalDeltaUsesFinalValuesAndOmitsUnchangedRows() {
         let old = JournalImage(rows: ["/fixture/old": item], masks: [4], coverage: [], positions: ["/fixture": 10])
         let current = JournalImage(rows: ["/fixture/new": item], masks: [2], coverage: ["/fixture/private"],

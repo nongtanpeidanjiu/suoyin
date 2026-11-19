@@ -749,83 +749,87 @@ struct TrackingTests {
         defer { try? restarted.stop() }
         try awaitStatus(restarted) { $0.phase == "caught-up" }
         #expect(restarted.snapshotStatus().recovery == "invalid-checkpoint")
+        #expect(restarted.snapshotStatus().startupRecoveryReason == "checkpoint-unusable")
         #expect(restarted.snapshotStatus().recoveries == 1)
     }
 
-    private final class WallClock {
-        private let lock = NSLock()
-        private var value: TimeInterval = 300
-        private var started: Date?
-
-        func read() -> TimeInterval {
-            lock.withLock { value + (started.map { Date().timeIntervalSince($0) } ?? 0) }
-        }
-
-        func set(_ time: TimeInterval, ticking: Bool = false) {
-            lock.withLock {
-                value = time
-                started = ticking ? Date() : nil
-            }
-        }
-    }
-
-    @Test(arguments: ["frozen", "exit", "idle"])
-    func exhaustedBudgetFreezesDiskButDoesNotFreezeTheRebuiltView(mode: String) throws {
+    @Test func exhaustedBudgetAllowsRecoveryAndLaterJournalWritesAcrossRestart() throws {
         let fixture = try scratch()
         defer { try? FileManager.default.removeItem(at: fixture) }
         let own = fixture.appendingPathComponent("owned")
         try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
-        let snapshot = own.appendingPathComponent("index.tmp")
-        let journal = URL(fileURLWithPath: snapshot.path + ".changes")
+        let snapshot = own.appendingPathComponent("index")
         var budget = BaseWriteBudget(snapshot: snapshot.path)
         #expect(try budget.reserve(at: 100))
         #expect(try budget.reserve(at: 200))
-        let clock = WallClock()
-        let idle = mode == "idle"
-        let second = try ChangeTracker(root: fixture.path, snapshot: snapshot.path,
-                                       ownData: own.path, wallTime: { clock.read() },
-                                       recoveryTiming: RecoveryTiming(quietWindow: 150_000_000))
-        second.start()
-        defer { try? second.stop() }
-        try awaitStatus(second) { $0.phase == "caught-up" }
-        let initialWrites = second.snapshotStatus().baseWrites
-        let baseline = try Data(contentsOf: snapshot)
-        let prefix = try Data(contentsOf: journal)
-        if idle { clock.set(100 + BaseWriteBudget.window - 5, ticking: true) }
-        second.holdUpdates(true)
-        let changed = fixture.appendingPathComponent("changed-live.tmp")
-        try Data([8]).write(to: changed)
-        second.simulateDroppedHistory()
-        second.holdUpdates(false)
-        try awaitStatus(second) { $0.phase == "caught-up" && $0.baseWriteDeferred }
-        #expect(second.search("changed-live").map(\.path) == [changed.path])
-        try second.save()
-        #expect(second.snapshotStatus().baseWrites == initialWrites)
-        #expect(try Data(contentsOf: snapshot) == baseline)
-        let checkpointJournal = try Data(contentsOf: journal)
-        #expect(checkpointJournal.starts(with: prefix))
-        #expect(second.snapshotStatus().durableEvents.isEmpty)
 
-        if mode == "exit" {
-            second.holdUpdates(true)
-            clock.set(100 + BaseWriteBudget.window)
-        } else if idle {
-            try awaitStatus(second) { $0.baseWrites == initialWrites + 1 && !$0.baseWriteDeferred }
+        func tracker() throws -> ChangeTracker {
+            try ChangeTracker(root: fixture.path, snapshot: snapshot.path, ownData: own.path, wallTime: { 300 },
+                              recoveryTiming: RecoveryTiming(quietWindow: 150_000_000))
         }
-        try second.stop()
-        let result = second.snapshotStatus()
-        #expect(result.baseWrites == initialWrites + (mode == "frozen" ? 0 : 1))
-        #expect(result.exitBaseWrites == (mode == "exit" ? 1 : 0))
-        if mode != "frozen" {
-            let persisted = try SearchIndex.load(from: snapshot.path)
-            #expect(persisted.restoredRows().map(\.path).contains(changed.path))
-            #expect(result.automaticBaseWritesInWindow == 2)
-        }
+
+        let running = try tracker()
+        running.start()
+        defer { try? running.stop() }
+        try awaitStatus(running) { $0.phase == "caught-up" && $0.baseWrites == 1 }
+        let first = try SearchIndex.preparedIdentity(at: snapshot.path)
+        let rebuilt = fixture.appendingPathComponent("recovered-fixture.tmp")
+        try Data([1]).write(to: rebuilt)
+        running.simulateDroppedHistory()
+        try awaitStatus(running) { $0.phase == "caught-up" && $0.requiredBaseWrites == 2 }
+        #expect(try SearchIndex.preparedIdentity(at: snapshot.path) != first)
+
+        let incremental = fixture.appendingPathComponent("appended-fixture.tmp")
+        try Data([2]).write(to: incremental)
+        running.synchronize()
+        try awaitStatus(running) { _ in running.search("appended-fixture").count == 1 }
+
+        // This must reach disk during normal running, before stop is called.
+        try awaitStatus(running, timeout: 22) { $0.journalLength > ChangeJournal.headerBytes }
+        let persisted = running.snapshotStatus()
+        #expect(persisted.journalFrames > 0 && persisted.baseWrites == 2 && persisted.automaticBaseWritesInWindow == 2)
+
+        var disk = try SearchIndex.load(from: snapshot.path)
+        var journal = ChangeJournal(snapshot: snapshot.path, identity: try SearchIndex.preparedIdentity(at: snapshot.path))
+        try journal.restore(into: &disk, root: fixture.path, repairSuffix: false)
+        #expect(Set(disk.restoredRows().map(\.path)).isSuperset(of: [rebuilt.path, incremental.path]))
+        try running.stop()
+
+        let reopened = try tracker()
+        reopened.start()
+        defer { try? reopened.stop() }
+        try awaitStatus(reopened) { $0.phase == "caught-up" }
+        #expect(reopened.snapshotStatus().rebuilds == 0)
+        #expect(reopened.search("fixture.tmp").count == 2)
     }
 
-    private func awaitStatus(_ tracker: ChangeTracker,
+    @Test func stoppingReturnsAtTheDeadlineWithAWriterStillBusy() throws {
+        let fixture = try scratch()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let own = fixture.appendingPathComponent("owned")
+        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        let snapshot = own.appendingPathComponent("index")
+        let running = try ChangeTracker(root: fixture.path, snapshot: snapshot.path, ownData: own.path)
+        let arrived = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        running.start { phase in
+            if phase == "scan-start" { arrived.signal(); _ = release.wait(timeout: .now() + .seconds(8)) }
+        }
+        defer { release.signal(); try? running.stop() }
+        try #require(arrived.wait(timeout: .now() + .seconds(2)) == .success)
+        let started = DispatchTime.now().uptimeNanoseconds
+        #expect(throws: TrackerShutdownError.deadlineExceeded) {
+            try running.stop(until: .now() + .milliseconds(100))
+        }
+        #expect(DispatchTime.now().uptimeNanoseconds - started < 1_000_000_000)
+        release.signal()
+        try running.stop()
+        #expect(!FileManager.default.fileExists(atPath: snapshot.path))
+    }
+
+    private func awaitStatus(_ tracker: ChangeTracker, timeout: TimeInterval = 9,
                              _ ready: (TrackingStatus) -> Bool) throws {
-        let end = Date().addingTimeInterval(9)
+        let end = Date().addingTimeInterval(timeout)
         while Date() < end {
             let status = tracker.snapshotStatus()
             if ready(status) { return }

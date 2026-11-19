@@ -737,7 +737,9 @@ final class ExternalVolumes {
         lock.withLock { offline[value.key] = last }
         retiring.insert(value.key)
         retirement.async {
-            try? value.tracker.stop()
+            // The settings operation must wait for the old owner before
+            // deleting or reopening its files. Application exit has its own deadline.
+            try? value.tracker.stop(until: .distantFuture)
             self.queue.async {
                 if let entries = value.tracker.snapshotStatus().externalRetainedEntries {
                     self.retained[value.key] = entries
@@ -780,7 +782,7 @@ final class ExternalVolumes {
         for active in searchable() { active.tracker.synchronize() }
     }
 
-    func stop() throws {
+    func stop(until deadline: DispatchTime = .now() + .seconds(3)) throws {
         let volumes = queue.sync {
             closed = true
             if let session { DASessionSetDispatchQueue(session, nil) }
@@ -798,7 +800,7 @@ final class ExternalVolumes {
         queue.sync {}
         var failure: Error?
         for volume in volumes {
-            do { try volume.tracker.stop() }
+            do { try volume.tracker.stop(until: deadline) }
             catch { failure = failure ?? error }
         }
         if let failure { throw failure }

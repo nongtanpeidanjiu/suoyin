@@ -573,9 +573,10 @@ extension SearchIndex {
     }
 
     static func scanDataVolume(scope: WalkScope, keeping sealed: consuming SearchIndex,
-                               excluding paths: Set<String>) throws -> SearchIndex {
+                               excluding paths: Set<String>, cancelled: @escaping () -> Bool = { false }) throws -> SearchIndex {
         try scan(root: scope.root, workers: 4, ordinary: false, establishListener: false,
-                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, scope: scope, onProgress: { _, _ in })
+                 excludedPaths: paths, dataOnly: true, keeping: consume sealed, scope: scope,
+                 cancelled: cancelled, onProgress: { _, _ in })
     }
 
     private static func scan(root: String, workers: Int, ordinary: Bool, establishListener: Bool,

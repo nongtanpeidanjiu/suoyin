@@ -77,6 +77,36 @@ struct CoreTests {
         }
     }
 
+    @Test func nameFilterHandlesBoundariesAndAppendOnlyViews() throws {
+        var index = SearchIndex()
+        let root = index.append("/test", attribute: Kind.anchor)
+        let parent = index.append("Café archipelago", parent: root, attribute: Kind.directory)
+        for i in 0..<4_500 { index.append("filler-row-\(i).txt", parent: parent) }
+        let padding = (4096 - (index.names.count % 4096) + 4094) % 4096
+        index.append(String(repeating: "x", count: padding) + "BoundaryProbe.PDF", parent: parent)
+        index.prepare()
+        let prior = try #require(index.prepared)
+        #expect(!prior.nameFilter.isEmpty)
+        let bytes = index.names.count
+        index.prepared = nil
+        index.append("Earlier boundaryprobe.txt", parent: parent)
+        index.append("decomposed Cafe\u{301} needle.txt", parent: parent, attribute: Kind.file | Kind.hidden)
+        index.append("z-last rare-needle.md", parent: parent)
+        var reference = index
+        reference.prepare()
+        index.prepare(extending: prior, previousNameBytes: bytes)
+        #expect(index.prepared?.nameFilter == reference.prepared?.nameFilter)
+        #expect(index.prepared?.nameOrder == reference.prepared?.nameOrder)
+        for mode in [QueryMode.name, .path] {
+            for kind in [EngineKind.any, .document, .image] {
+                for term in ["boundaryprobe", "café needle", "archipelago needle", "unlikely absence"] {
+                    let direct = index.directSearch(term, mode: mode, showAll: true, kind: kind)
+                    #expect(index.search(term, mode: mode, showAll: true, kind: kind) == direct)
+                }
+            }
+        }
+    }
+
     @Test func normalizationStoresOnlyChangedNonASCIIKeys() {
         var index = SearchIndex()
         let root = index.append("/UPPER", attribute: Kind.anchor)

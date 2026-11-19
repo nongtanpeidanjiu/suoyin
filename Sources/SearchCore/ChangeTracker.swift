@@ -1202,6 +1202,8 @@ public final class ChangeTracker {
         note("scan-start")
         let exclusions = Set(activeExclusions)
         var index: SearchIndex
+        var partialSearch: PreparedSearch?
+        var partialNameBytes = 0
         if !initial, root == "/", !affected.contains(0), current != nil {
             let sealed = sealedVolume(from: current!.base, excluding: scope.dataVolumeRoots,
                                       coverage: current!.state)
@@ -1233,13 +1235,21 @@ public final class ChangeTracker {
                     var searchable = partial
                     // Removable media can remain on a growing partial view for minutes.
                     // Keep those views on the same query path as the finished index.
-                    if self.external != nil, self.engineObserver != nil { searchable.prepare() }
+                    if self.external != nil, self.engineObserver != nil {
+                        searchable.prepare(extending: partialSearch, previousNameBytes: partialNameBytes)
+                        partialSearch = searchable.prepared
+                        partialNameBytes = searchable.names.count
+                    }
                     self.publish(LiveIndex(base: searchable, root: self.root, linkChildren: false), changed: true)
                 }
                 if initial && mark.phase == "partial" { self.note("scan-partial") }
             }
         }
         dm_release_allocator_cache()
+        if let partialSearch {
+            index.prepare(extending: partialSearch, previousNameBytes: partialNameBytes)
+        }
+        partialSearch = nil
         if initial || root != "/" { index.tightenScannedStorage() }
         else { index.prepare() }
         dm_release_allocator_cache()

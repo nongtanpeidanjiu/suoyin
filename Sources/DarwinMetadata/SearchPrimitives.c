@@ -79,8 +79,8 @@ uint8_t dm_file_kind(const char *name, uint8_t attribute) {
     return DM_KIND_ANY;
 }
 
-void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds) {
-    for (uint32_t id = 0; id < v->row_count; id++) {
+void dm_classify_kinds(const DMQueryView *v, uint8_t *kinds, size_t first) {
+    for (uint32_t id = (uint32_t)first; id < v->row_count; id++) {
         kinds[id] = (v->attributes[id] & KIND_MASK) == ANCHOR
             ? DM_KIND_ANY : dm_file_kind(original(v, id), v->attributes[id]);
     }
@@ -277,6 +277,20 @@ void dm_name_order(const DMQueryView *v, uint32_t *order) {
     qsort_r(order, v->row_count, sizeof(*order), (void *)v, name_order);
 }
 
+void dm_extend_name_order(const DMQueryView *v, const uint32_t *prefix, size_t count, uint32_t *order) {
+    for (size_t i = count; i < v->row_count; i++) order[i] = (uint32_t)i;
+    qsort_r(order + count, v->row_count - count, sizeof(*order), (void *)v, name_order);
+    size_t prior = 0, added = count, next = 0;
+    // The suffix starts after the entire old order. Until the prefix is
+    // consumed, the merge destination is strictly before unread suffix data.
+    while (prior < count) {
+        if (added == v->row_count || name_order((void *)v, prefix + prior, order + added) <= 0)
+            order[next++] = prefix[prior++];
+        else
+            order[next++] = order[added++];
+    }
+}
+
 bool dm_column_order(const DMQueryView *v, uint32_t *order, int column) {
     if (!v->row_count) return true;
     size_t bytes = v->row_count * sizeof(uint32_t);
@@ -328,26 +342,94 @@ static size_t match_lanes(const DMQueryView *v, const char *word, size_t length,
     return found;
 }
 
+// Record three-byte sequences by starting offset in the original name pool.
+// A collision can only admit extra candidates to the exact matcher.
+enum { NAME_FILTER_BYTES = 4096, NAME_FILTER_WORDS = 32 };
+
+size_t dm_name_filter_words(size_t bytes) {
+    return bytes < 65536 ? 0 : ((bytes - 1) / NAME_FILTER_BYTES + 1) * NAME_FILTER_WORDS;
+}
+
+static unsigned name_filter_bit(uint32_t three_bytes) {
+    uint32_t key = three_bytes & UINT32_C(0xffffff);
+    return ((key * UINT32_C(0x9e3779b1)) ^ ((key >> 9) * UINT32_C(0x85ebca77))) >> 21;
+}
+
+void dm_prepare_name_filter(const uint8_t *names, size_t bytes, size_t previous_bytes, uint64_t *filter) {
+    if (!dm_name_filter_words(bytes)) return;
+    size_t start = previous_bytes > 2 ? (previous_bytes - 2) / NAME_FILTER_BYTES * NAME_FILTER_BYTES : 0;
+    for (size_t block = start; block < bytes; block += NAME_FILTER_BYTES) {
+        uint64_t *bits = filter + block / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+        memset(bits, 0, NAME_FILTER_WORDS * sizeof(*bits));
+        size_t end = block + NAME_FILTER_BYTES < bytes - 2 ? block + NAME_FILTER_BYTES : bytes - 2;
+        if (end <= block) continue;
+        uint32_t value = ((uint32_t)ascii_fold(names[block]) << 8) | ascii_fold(names[block + 1]);
+        for (size_t i = block; i < end; i++) {
+            value = (value << 8) | ascii_fold(names[i + 2]);
+            unsigned bit = name_filter_bit(value);
+            bits[bit >> 6] |= UINT64_C(1) << (bit & 63);
+        }
+    }
+}
+
+typedef struct { size_t shift; unsigned bit; } NameFilterProbe;
+
+static NameFilterProbe name_filter_probe(const char *word, size_t shift) {
+    const uint8_t *start = (const uint8_t *)word + shift;
+    uint32_t value = ((uint32_t)start[0] << 16) | ((uint32_t)start[1] << 8) | start[2];
+    return (NameFilterProbe){shift, name_filter_bit(value)};
+}
+
+static bool name_filter_may_match(const uint64_t *filter, size_t first, size_t last, NameFilterProbe probe) {
+    // The possible starting offsets of this mandatory three-byte sequence
+    // cover at most two blocks, including matches that cross a boundary.
+    size_t a = (first + probe.shift) / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+    size_t b = (last + probe.shift) / NAME_FILTER_BYTES * NAME_FILTER_WORDS;
+    unsigned word = probe.bit >> 6;
+    return (filter[a + word] | filter[b + word]) & (UINT64_C(1) << (probe.bit & 63));
+}
+
 /// Scan the byte pools in 16-byte blocks. Exact verification still uses the whole word.
 static size_t pool_hits(const DMQueryView *v, const char *word, bool folded, uint8_t *hits) {
     const uint8_t *pool = folded ? v->folded_names : v->names;
     size_t bytes = folded ? v->fold_bytes : v->name_bytes;
     size_t length = strlen(word);
     if (!bytes || length < 2 || length > bytes) return 0;
-    size_t found = 0, skip = 0, position = 0, end = bytes - length + 1;
+    size_t found = 0, skip = 0, end = bytes - length + 1;
+    const bool filtered = !folded && v->name_filter && length >= 3;
+    NameFilterProbe probes[3];
+    size_t probe_count = 0;
+    if (filtered) {
+        probes[probe_count++] = name_filter_probe(word, 0);
+        if (length > 3) probes[probe_count++] = name_filter_probe(word, length - 3);
+        if (length >= 7) probes[probe_count++] = name_filter_probe(word, (length - 3) / 2);
+    }
     uint8x16_t first = vdupq_n_u8((uint8_t)word[0]);
     uint8x16_t last = vdupq_n_u8((uint8_t)word[length - 1]);
     uint8x16_t first_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[0]) ? 0x20 : 0);
     uint8x16_t last_mask = vdupq_n_u8(!folded && ascii_letter((uint8_t)word[length - 1]) ? 0x20 : 0);
-    for (; end - position >= 16; position += 16) {
-        uint8x16_t a = vceqq_u8(vorrq_u8(vld1q_u8(pool + position), first_mask), first);
-        uint8x16_t b = vceqq_u8(vorrq_u8(vld1q_u8(pool + position + length - 1), last_mask), last);
-        uint64x2_t masks = vreinterpretq_u64_u8(vandq_u8(a, b));
-        found += match_lanes(v, word, length, pool, position, folded, hits, &skip, vgetq_lane_u64(masks, 0));
-        found += match_lanes(v, word, length, pool, position + 8, folded, hits, &skip, vgetq_lane_u64(masks, 1));
+    const size_t span = filtered ? NAME_FILTER_BYTES : end;
+    for (size_t block = 0; block < end; block += span) {
+        size_t limit = end - block < span ? end : block + span;
+        bool may_match = true;
+        for (size_t i = 0; i < probe_count; i++) {
+            if (!name_filter_may_match(v->name_filter, block, limit - 1, probes[i])) {
+                may_match = false;
+                break;
+            }
+        }
+        if (!may_match) continue;
+        size_t position = block;
+        for (; limit - position >= 16; position += 16) {
+            uint8x16_t a = vceqq_u8(vorrq_u8(vld1q_u8(pool + position), first_mask), first);
+            uint8x16_t b = vceqq_u8(vorrq_u8(vld1q_u8(pool + position + length - 1), last_mask), last);
+            uint64x2_t masks = vreinterpretq_u64_u8(vandq_u8(a, b));
+            found += match_lanes(v, word, length, pool, position, folded, hits, &skip, vgetq_lane_u64(masks, 0));
+            found += match_lanes(v, word, length, pool, position + 8, folded, hits, &skip, vgetq_lane_u64(masks, 1));
+        }
+        for (; position < limit; position++)
+            found += hit_at(v, word, length, pool, position, folded, hits, &skip);
     }
-    for (; position < end; position++)
-        found += hit_at(v, word, length, pool, position, folded, hits, &skip);
     return found;
 }
 

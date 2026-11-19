@@ -45,7 +45,7 @@ struct SearchRequest {
     var scope: SearchScope = .name
     var sort: SortColumn = .name
     var order: SortOrder = .ascending
-    var includeSystemFiles = false
+    var includeSystemFiles = true
     var kind: SearchKind = .any
     var offset = 0
     var limit = 200

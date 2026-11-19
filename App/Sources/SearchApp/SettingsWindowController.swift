@@ -471,7 +471,7 @@ private final class ScopePane: SettingsPane {
         systemFiles.target = self
         systemFiles.action = #selector(toggleSystemFiles)
         addRow("显示：", systemFiles)
-        addRow(nil, note("包括系统目录、个人“资源库”、应用程序包内部，以及名称以“.”开头的文件。"))
+        addRow(nil, note("默认开启，所有文件都能搜到。关闭后不显示系统目录、个人“资源库”、应用程序包内部，以及名称以“.”开头的文件；微信等软件收到的文件在“资源库”里，也会一并搜不到。"))
 
         newVolumes.target = self
         newVolumes.action = #selector(toggleNewVolumes)

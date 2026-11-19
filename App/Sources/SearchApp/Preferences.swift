@@ -2,14 +2,16 @@ import AppKit
 
 /// Interface preferences kept in the user defaults.
 enum Preferences {
-    private static let systemFilesKey = "includeSystemFiles"
+    // A new key: the earlier "includeSystemFiles" defaulted to off, and every
+    // file is meant to be found unless the user turns this off.
+    private static let systemFilesKey = "showSystemAndHiddenFiles"
     private static let dockIconKey = "showDockIcon"
 
     /// Posted on the main thread when a preference that affects searching changes.
     static let searchOptionsChanged = Notification.Name("SearchOptionsChanged")
 
     static var includeSystemFiles: Bool {
-        get { UserDefaults.standard.bool(forKey: systemFilesKey) }
+        get { UserDefaults.standard.object(forKey: systemFilesKey) as? Bool ?? true }
         set {
             UserDefaults.standard.set(newValue, forKey: systemFilesKey)
             NotificationCenter.default.post(name: searchOptionsChanged, object: nil)

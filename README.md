@@ -1,3 +1,5 @@
+<p align="center">简体中文 | <a href="README.en.md">English</a></p>
+
 <p align="center">
   <img src="App/Resources/AppIcon.iconset/icon_128x128@2x.png" width="128" height="128" alt="索隐的应用图标">
 </p>
@@ -190,9 +192,3 @@ cd App && swift run SearchApp --demo
 8. 读不到的位置：在没有完整磁盘访问权限的进程中从整个启动磁盘建索引，记录到 341 个原始位置，归并为 22 条，出处：[里程碑 4 门面验收](docs/里程碑4-门面验收.md)“任务单 14 · 全盘访问状态”。
 9. 授权检测方式：见[里程碑 4 门面验收](docs/里程碑4-门面验收.md)“任务单 13 · 完整磁盘访问与报告范围”。
 10. 索引大小：约 195 万行的本机索引，持久文件合计 106,369,799 字节，出处：[里程碑 4 门面验收](docs/里程碑4-门面验收.md)“任务单 15 · 同档体积与物理占用”，行数见同节“类型筛选”。
-
----
-
-## In English
-
-Suoyin (索隐) is a menu-bar file name search tool for macOS on Apple silicon. It keeps its own index of every file name on the Mac, hidden files and system folders included, and does not use the Spotlight index. On my test Mac with about 2.18 million entries, 95% of name searches returned within 10 ms, and new, renamed or deleted files showed up in about a second. The interface is Simplified Chinese only, and the source is published under the PolyForm Noncommercial License 1.0.0, which is not an open-source license and does not allow commercial use.

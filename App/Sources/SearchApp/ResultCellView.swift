@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 /// One result row: file icon, highlighted name, location, modified date.
 final class ResultCellView: NSTableCellView {
@@ -123,7 +124,7 @@ final class ResultCellView: NSTableCellView {
             icon.image = cached
         } else {
             icon.image = IconLoader.placeholder(for: hit)
-            IconLoader.shared.load(key, path: hit.path) { [weak self] image in
+            IconLoader.shared.load(key, path: hit.path, isDirectory: hit.isDirectory) { [weak self] image in
                 guard let self, self.iconKey == key else { return }
                 self.icon.image = image
             }
@@ -184,7 +185,12 @@ final class ResultCellView: NSTableCellView {
         let parent = (path as NSString).deletingLastPathComponent
         let home = NSHomeDirectory()
         var parts: [String]
-        if parent == home || parent.hasPrefix(home + "/") {
+        let cloud = home + "/Library/Mobile Documents/com~apple~CloudDocs"
+        if parent == cloud || parent.hasPrefix(cloud + "/") {
+            // iCloud Drive, under the name the Finder gives it.
+            parts = parent.dropFirst(cloud.count).split(separator: "/").map(String.init)
+            parts.insert("iCloud 云盘", at: 0)
+        } else if parent == home || parent.hasPrefix(home + "/") {
             parts = parent.dropFirst(home.count).split(separator: "/").map(String.init)
             if let first = parts.first, let shown = homeFolderNames[first] { parts[0] = shown }
             parts.insert("个人", at: 0)
@@ -252,6 +258,12 @@ final class IconLoader {
         hit.isDirectory ? folderIcon : documentIcon
     }
 
+    private static func icon(forMissing path: String, isDirectory: Bool) -> NSImage {
+        let ext = (path as NSString).pathExtension
+        if isDirectory { return NSWorkspace.shared.icon(for: ext.lowercased() == "app" ? .applicationBundle : .folder) }
+        return NSWorkspace.shared.icon(for: UTType(filenameExtension: ext) ?? .data)
+    }
+
     private static let folderIcon = NSWorkspace.shared.icon(for: .folder)
     private static let documentIcon = NSWorkspace.shared.icon(for: .data)
 
@@ -259,11 +271,14 @@ final class IconLoader {
 
     /// Fetches the icon for `path` unless it is already on its way, then
     /// calls `done` on the main thread.
-    func load(_ key: String, path: String, done: @escaping (NSImage) -> Void) {
+    /// A file that is not there (on a disk not attached, or gone since it
+    /// was indexed) gets the icon of its kind rather than a blank page.
+    func load(_ key: String, path: String, isDirectory: Bool, done: @escaping (NSImage) -> Void) {
         if waiting[key] != nil { waiting[key]?.append(done); return }
         waiting[key] = [done]
         queue.addOperation { [weak self] in
-            let image = NSWorkspace.shared.icon(forFile: path)
+            let image = FileManager.default.fileExists(atPath: path)
+                ? NSWorkspace.shared.icon(forFile: path) : Self.icon(forMissing: path, isDirectory: isDirectory)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.cache.setObject(image, forKey: key as NSString)

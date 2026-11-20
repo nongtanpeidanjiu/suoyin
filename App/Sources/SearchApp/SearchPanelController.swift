@@ -212,7 +212,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
     /// selection moves.
     private var previewPathOverride: String?
     /// The file the preview shows.
-    private var previewTarget: String? { previewPathOverride ?? selectedHit?.path }
+    /// The showcase's sample files are shown under a made-up location but
+    /// previewed from where they really are (see ShowcaseData).
+    private var previewTarget: String? {
+        (previewPathOverride ?? selectedHit?.path).map(ShowcaseData.previewPath(for:))
+    }
     private var reloadingResults = false
     /// Asked to open the settings window (Command-comma in the panel).
     var onOpenSettings: (() -> Void)?
@@ -959,7 +963,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate, NSTextFieldDelega
         }
         let explanation = service.status.phase.failure?.text(.index)
         if countLabel.toolTip != explanation { countLabel.toolTip = explanation }
-        if service.isDemo { tail += " · 演示数据" }
+        // The showcase (`--showcase`) is for screenshots and shows no mark.
+        if service.isDemo && !TestHooks.flag("--showcase") { tail += " · 演示数据" }
         let text = Self.fit(lead, name, tail, width: countLabel.frame.width)
         guard countLabel.stringValue != text else { return }
         let fades = lastStatusKey != nil && lastStatusKey != key

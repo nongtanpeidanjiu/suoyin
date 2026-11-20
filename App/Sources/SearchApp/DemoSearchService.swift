@@ -20,7 +20,19 @@ final class DemoSearchService: SearchService {
     var status: IndexStatus { lock.withLock { current } }
     var isDemo: Bool { true }
 
+    /// `--showcase`：给介绍页截图用的一套干净内容，索引一开始就已就绪，
+    /// 不播放建索引、恢复和补充的过程（见 ShowcaseData.swift）。
+    private let showcase = TestHooks.flag("--showcase")
+
+    init() {
+        if showcase { volumes = Self.showcaseVolumes }
+    }
+
     func start() {
+        if showcase {
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.loadShowcase() }
+            return
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.load() }
         DispatchQueue.main.async { [weak self] in self?.runScans() }
     }
@@ -86,9 +98,24 @@ final class DemoSearchService: SearchService {
                        requiresManualInclusion: true),
     ]
 
+    /// The showcase's volumes, all settled: one searched, one attached and
+    /// left out, one not attached.
+    private static let showcaseVolumes: [ExternalVolume] = [
+        ExternalVolume(id: "showcase-portable", name: ShowcaseData.volumeName, isOnline: true, isIncluded: true,
+                       indexedCount: ShowcaseData.volumeCount, retainedCount: ShowcaseData.volumeCount,
+                       filesystem: "apfs", capacityBytes: 1_000_204_886_016),
+        ExternalVolume(id: "showcase-stick", name: "U 盘", isOnline: true, isIncluded: false,
+                       indexedCount: 0, retainedCount: 0, filesystem: "exfat", capacityBytes: 64_023_257_088),
+        ExternalVolume(id: "showcase-old", name: "旧备份盘", isOnline: false, isIncluded: true,
+                       indexedCount: 0, retainedCount: 241_806, filesystem: "apfs", capacityBytes: 2_000_398_934_016,
+                       canForget: true),
+    ]
+
     /// Attached now and not searched: a disk image and a network share.
     var unindexedMountedVolumes: [UnindexedVolume] {
-        [
+        if showcase { return [UnindexedVolume(id: "showcase-dmg", name: "安装器", kind: .diskImage,
+                                              reason: .diskImagesDisabled)] }
+        return [
             UnindexedVolume(id: "demo-dmg", name: "演示安装包", kind: .diskImage, reason: .diskImagesDisabled),
             UnindexedVolume(id: "demo-nas", name: "演示家庭 NAS", kind: .network, reason: .networkUnsupported),
         ]
@@ -309,14 +336,44 @@ final class DemoSearchService: SearchService {
         }
     }
 
+    /// The showcase's entries, ready at once. Its few text files are
+    /// written to the data directory first, so that they can be previewed.
+    private func loadShowcase() {
+        let directory = TestHooks.value(after: "--data-dir").map {
+            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true)
+        } ?? FileManager.default.temporaryDirectory.appendingPathComponent("SearchAppShowcase", isDirectory: true)
+        DispatchQueue.main.sync { ShowcaseData.prepareFiles(in: directory) }
+        var loaded: [Entry] = []
+        for (index, item) in ShowcaseData.items().enumerated() {
+            let name = (item.path as NSString).lastPathComponent
+            let hit = SearchHit(id: UInt64(index + 1), name: name, path: item.path, isDirectory: item.isDirectory,
+                                size: item.size, modified: item.modified, isCloudPlaceholder: item.isCloudPlaceholder,
+                                isOnExternalVolume: item.isOnExternalVolume)
+            loaded.append(Entry(hit: hit,
+                                foldedName: name.precomposedStringWithCanonicalMapping.lowercased(),
+                                foldedPath: item.path.precomposedStringWithCanonicalMapping.lowercased(),
+                                kind: Self.kind(name: name, isDirectory: item.isDirectory)))
+        }
+        loaded.sort { $0.foldedName == $1.foldedName ? $0.hit.path < $1.hit.path : $0.foldedName < $1.foldedName }
+        publish(loaded, phase: .ready)
+    }
+
     private static let sampleVolume = "演示备份盘"
     private static let restoredVolume = "演示移动硬盘"
 
     private func publish(_ loaded: [Entry], phase: IndexPhase, contentChanged: Bool = true) {
         var snapshot = IndexStatus(phase: phase, indexedCount: loaded.count, indexBytesOnDisk: 0)
-        switch phase {
-        case .ready, .failed: Self.addSampleAccessState(to: &snapshot)
-        default: snapshot.inaccessibleVerified = false
+        if showcase {
+            // Counts of a typical Mac rather than of the few entries above.
+            snapshot.indexedCount = ShowcaseData.totalCount
+            snapshot.localIndexedCount = ShowcaseData.totalCount - ShowcaseData.volumeCount
+            snapshot.indexBytesOnDisk = 312_475_648
+            Self.addShowcaseAccessState(to: &snapshot)
+        } else {
+            switch phase {
+            case .ready, .failed: Self.addSampleAccessState(to: &snapshot)
+            default: snapshot.inaccessibleVerified = false
+            }
         }
         lock.withLock {
             entries = loaded
@@ -353,6 +410,36 @@ final class DemoSearchService: SearchService {
         case .folder: return entry.hit.isDirectory
         default: return entry.kind == kind
         }
+    }
+
+    /// The showcase's unreadable locations: a few of each reason, as on a
+    /// typical Mac, and the searched volume complete with none of its own.
+    private static func addShowcaseAccessState(to status: inout IndexStatus) {
+        let home = NSHomeDirectory()
+        var raw: [InaccessiblePlace] = []
+        func add(_ reason: AccessReason, _ paths: [String]) {
+            raw += paths.map { InaccessiblePlace(path: $0, count: 1, reason: reason) }
+        }
+        add(.needsFullDiskAccess, ["\(home)/Library/Mail", "\(home)/Library/Messages", "\(home)/Library/Safari"])
+        add(.filePermissions, ["/Library/Application Support/com.apple.TCC", "/private/var/audit",
+                               "/private/var/db/ConfigurationProfiles/Store", "/private/var/db/dslocal/nodes/Default",
+                               "/private/var/db/fpsd", "/private/var/db/locationd"])
+        add(.unknown, ["/private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C",
+                       "/System/Volumes/Data/.Spotlight-V100"])
+        raw.sort { $0.path < $1.path }
+        let merged = Dictionary(grouping: raw) { place -> String in
+            let parent = (place.path as NSString).deletingLastPathComponent
+            return raw.filter { ($0.path as NSString).deletingLastPathComponent == parent && $0.reason == place.reason }
+                .count > 1 ? parent : place.path
+        }
+        status.rawInaccessiblePlaces = raw
+        status.inaccessiblePlaces = merged.map { path, places in
+            InaccessiblePlace(path: path, count: places.count, reason: places[0].reason)
+        }.sorted { $0.path < $1.path }
+        status.sources = [
+            IndexSource(id: "showcase-portable", name: ShowcaseData.volumeName, kind: .externalVolume,
+                        indexed: ShowcaseData.volumeCount, isComplete: true),
+        ]
     }
 
     /// Made-up but typical access results, so the settings list can be

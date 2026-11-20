@@ -24,6 +24,9 @@ let package = Package(
         ], linkerSettings: [
             // 打包后 Sparkle.framework 在 Contents/Frameworks/ 里（见 Tools/bundle.sh）。
             .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
+            // 直接运行 .build/*/SearchApp 时也按中文显示系统给的名字（见该文件里的说明）。
+            .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                          "-Xlinker", Context.packageDirectory + "/Tools/debug-Info.plist"]),
         ]),
     ],
     swiftLanguageModes: [.v5]

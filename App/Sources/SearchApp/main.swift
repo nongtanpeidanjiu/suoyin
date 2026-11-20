@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // access step (see ServiceHost).
         let forced = TestHooks.flag("--show-setup")
         let firstLaunch = !UserDefaults.standard.bool(forKey: "accessGuideShown") && !TestHooks.flag("--show")
+            && !TestHooks.flag("--showcase")
         service = ServiceHost(holding: firstLaunch, open: Self.openService)
 
         installMainMenu()
@@ -113,6 +114,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if TestHooks.enabled { installTestHooks() }
     }
 
+    /// `--backdrop light|dark` 铺在桌面图标之上的干净背景，截图用。
+    private var backdrop: Backdrop?
+
     /// Distributed notifications and launch arguments that drive the
     /// interface from test scripts. Only with test hooks enabled.
     private func installTestHooks() {
@@ -158,6 +162,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("dev.local.filesearch.select"),
                                                             object: nil, queue: .main) { [weak self] note in
             self?.panel.moveSelectionForTesting(by: Int(note.object as? String ?? "") ?? 1)
+        }
+
+        if let style = TestHooks.value(after: "--backdrop") {
+            backdrop = Backdrop(dark: style == "dark")
         }
 
         // `--show-settings [general|scope|index]` opens the settings window

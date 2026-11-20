@@ -38,14 +38,7 @@ final class CoreSearchService: SearchService {
 
     /// `dataDirectory` replaces the usual one; for tests only.
     init(dataDirectory: URL? = nil) throws {
-        let directory: URL
-        if let dataDirectory {
-            directory = dataDirectory
-        } else {
-            let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                   appropriateFor: nil, create: true)
-            directory = base.appendingPathComponent("dev.local.filesearch", isDirectory: true)
-        }
+        let directory = dataDirectory ?? AppDirectories.dataDirectory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
             engine = try SearchEngine(dataDirectory: directory)

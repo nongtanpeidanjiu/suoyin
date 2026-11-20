@@ -60,7 +60,7 @@ final class DemoSearchService: SearchService {
 
     /// A made-up path: the demo keeps nothing on disk.
     var indexDataDirectoryExclusion: String? {
-        NSHomeDirectory() + "/Library/Application Support/dev.local.filesearch"
+        AppDirectories.dataDirectory.path
     }
 
     // MARK: Attached volumes

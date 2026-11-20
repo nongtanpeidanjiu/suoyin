@@ -113,6 +113,21 @@ enum ShortcutSelfTest {
                     preview: SavedShortcut(shortcut: nil, changedAt: 0),
                     expect: (controlOptionJ, previewDefault), reset: [])
 
+        // Not a shortcut rule, but checked here so that it runs without
+        // building a release bundle and starting it.
+        print("\n附：各版本的数据目录（索引 | 缓存）")
+        let directoryCases: [(String?, String, String)] = [
+            ("io.github.nongtanpeidanjiu.suoyin", "io.github.nongtanpeidanjiu.suoyin", "io.github.nongtanpeidanjiu.suoyin"),
+            ("dev.local.filesearch.demo", "dev.local.filesearch", "dev.local.filesearch.demo"),
+            (nil, "dev.local.filesearch", "dev.local.filesearch"),
+        ]
+        for (identifier, data, caches) in directoryCases {
+            let actualData = AppDirectories.dataFolderName(bundleIdentifier: identifier)
+            let actualCaches = AppDirectories.cachesFolderName(bundleIdentifier: identifier)
+            record(actualData == data && actualCaches == caches,
+                   "\(identifier ?? "（不在包里）") | 期望 \(data) | \(caches) | 实际 \(actualData) | \(actualCaches)")
+        }
+
         print("\n合计：通过 \(passed) 项，失败 \(failed) 项。")
         return failed == 0
     }

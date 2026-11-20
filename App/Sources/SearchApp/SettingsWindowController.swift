@@ -4,6 +4,9 @@ import ServiceManagement
 /// The standard settings window: toolbar tabs at the top, one form per tab.
 final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     private static let width: CGFloat = 560
+    /// Room kept free above and below the window on a screen too short for
+    /// a pane; the pane then scrolls inside the window.
+    private static let screenMargin: CGFloat = 20
     private static let paneKey = "settingsPane"
 
     private let general: GeneralPane
@@ -23,6 +26,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         index = IndexPane(service: service, onRetry: onRetry)
         super.init()
         for pane in panes { pane.onSizeChange = { [weak self, weak pane] in if let pane { self?.fit(pane) } } }
+        // The room a pane may take depends on the screen and on whether
+        // scroll bars take space of their own.
+        let refit: (Notification) -> Void = { [weak self] _ in self?.refit() }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main, using: refit)
+        NotificationCenter.default.addObserver(forName: NSScroller.preferredScrollerStyleDidChangeNotification,
+                                               object: nil, queue: .main, using: refit)
+    }
+
+    private func refit() {
+        if let current { fit(current, animated: false) }
     }
 
     var isVisible: Bool { window?.isVisible == true }
@@ -97,6 +111,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         startPolling()
     }
 
+    func windowDidChangeScreen(_ notification: Notification) { refit() }
+
     func windowWillClose(_ notification: Notification) {
         poll?.invalidate()
         poll = nil
@@ -123,7 +139,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         current = pane
         pane.reload()
         let view = pane.view
-        window.contentView = view
+        window.contentView = pane.scrollView
         fit(pane, animated: animated)
         if animated && !Motion.reduced {
             view.alphaValue = 0
@@ -134,18 +150,31 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
         }
     }
 
-    /// Resizes the window to the pane, keeping its top edge in place.
+    /// Resizes the window to the pane, keeping its top edge in place. The
+    /// window is never taller than the screen's visible area less a margin;
+    /// a pane taller than that scrolls inside the window.
     private func fit(_ pane: SettingsPane, animated: Bool = true) {
         guard let window, pane === current else { return }
-        let size = NSSize(width: Self.width, height: pane.fittingHeight(width: Self.width))
-        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
-        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
-        // A tall pane that would run off the bottom of the screen moves the
-        // window up rather than hiding its last rows.
-        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame, frame.minY < visible.minY {
-            frame.origin.y = min(visible.minY, visible.maxY - frame.height)
+        let height = pane.fittingHeight(width: Self.width)
+        pane.view.frame = NSRect(x: 0, y: 0, width: Self.width, height: height)
+        var frame = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: Self.width, height: height))
+        let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+        if let visible, frame.height > visible.height - 2 * Self.screenMargin {
+            frame.size.height = max(visible.height - 2 * Self.screenMargin, 200)
+            // A scroll bar that takes room of its own (when a mouse is
+            // attached, by default) widens the window rather than the form.
+            if NSScroller.preferredScrollerStyle == .legacy {
+                frame.size.width += NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+            }
         }
-        guard abs(frame.height - window.frame.height) > 0.5 else { return }
+        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        // A pane that would run off the bottom of the screen moves the window
+        // up rather than hiding its last rows.
+        if let visible, frame.minY < visible.minY + Self.screenMargin {
+            frame.origin.y = min(visible.minY + Self.screenMargin, visible.maxY - frame.height)
+        }
+        guard abs(frame.height - window.frame.height) > 0.5 || abs(frame.width - window.frame.width) > 0.5
+            || abs(frame.minY - window.frame.minY) > 0.5 else { return }
         window.setFrame(frame, display: true, animate: animated && window.isVisible && !Motion.reduced)
     }
 
@@ -178,7 +207,10 @@ class SettingsPane {
     let identifier: NSToolbarItem.Identifier
     let title: String
     let symbol: String
-    let view = NSView()
+    /// The form; its height is the form's own, the scroll view around it is
+    /// as tall as the window allows.
+    let view: NSView = TopDownView()
+    let scrollView = NSScrollView()
     let grid = NSGridView()
     var onSizeChange: (() -> Void)?
 
@@ -193,6 +225,12 @@ class SettingsPane {
         grid.rowAlignment = .firstBaseline
         grid.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(grid)
+        view.autoresizingMask = [.width]
+        scrollView.documentView = view
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         NSLayoutConstraint.activate([
             grid.topAnchor.constraint(equalTo: view.topAnchor, constant: 24),
             grid.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -253,6 +291,12 @@ class SettingsPane {
         row.isHidden = hidden
         onSizeChange?()
     }
+}
+
+/// Lays its content out from the top, so a scrolled form starts at its
+/// first row.
+private final class TopDownView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 // MARK: General
@@ -1084,7 +1128,7 @@ private final class InaccessibleOutline: NSScrollView, NSOutlineViewDataSource, 
         addSubview(placeholderLabel)
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: Self.width),
-            heightAnchor.constraint(equalToConstant: 200),
+            heightAnchor.constraint(equalToConstant: 140),
         ])
     }
 

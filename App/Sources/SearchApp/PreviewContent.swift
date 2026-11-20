@@ -51,14 +51,9 @@ final class PreviewContent {
     /// Results for files looked at while the preview is open, newest last.
     private var plans: [(path: String, plan: Plan)] = []
 
-    /// `~/Library/Caches/<bundle identifier>/PreviewStandIns`.
-    static let standInsFolder: URL = {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let owner = Bundle.main.bundleIdentifier ?? "dev.local.filesearch"
-        return caches.appendingPathComponent(owner, isDirectory: true)
-            .appendingPathComponent("PreviewStandIns", isDirectory: true)
-    }()
+    /// `PreviewStandIns` in the application's caches folder (see AppDirectories).
+    static let standInsFolder: URL =
+        AppDirectories.cachesDirectory.appendingPathComponent("PreviewStandIns", isDirectory: true)
 
     init() {
         root = Self.standInsFolder
@@ -166,15 +161,18 @@ final class PreviewContent {
         guard stillWanted() else { return .original }
 
         let name = url.lastPathComponent
-        // The stand-in's name only has to end right; the title shown is the
-        // original name. A name near the 255-byte limit gets a short one.
-        let base = name.utf8.count > 240 ? "file" : name
+        // The title Quick Look shows is the original name; the stand-in's own
+        // name only has to end right. Quick Look's “open with” and share
+        // buttons act on the stand-in and cannot be pointed elsewhere (see
+        // `copyMark`), so its name says that it is a copy. A name near the
+        // 255-byte limit gets a short one.
+        let base = (name.utf8.count > 220 ? "file" : name) + copyMark
         let folder = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
             try makePrivateFolder(root)
             try makePrivateFolder(folder)
             if isMarkdown(type, name: name), let page = markdownPage(url, encoding: encoding,
-                                                                    size: values.fileSize ?? 0, title: name) {
+                                                                    size: values.fileSize ?? 0, title: name + copyMark) {
                 let target = folder.appendingPathComponent(base + ".html")
                 try writePrivately(Data(page.utf8), to: target)
                 return .standIn(target)
@@ -186,7 +184,7 @@ final class PreviewContent {
             } else {
                 // A clone takes the original's permissions; it is a file of its
                 // own, so narrowing them leaves the original untouched.
-                guard chmod(target.path, 0o600) == 0 else { throw CocoaError(.fileWriteNoPermission) }
+                guard chmod(target.path, 0o400) == 0 else { throw CocoaError(.fileWriteNoPermission) }
             }
             return .standIn(target)
         } catch {
@@ -195,8 +193,16 @@ final class PreviewContent {
         }
     }
 
+    /// Added to a stand-in's name. Quick Look's “通过某某打开” and share
+    /// buttons work on the file it was given, and neither the preview item
+    /// nor the panel's delegate can redirect or hide them; its title bar is
+    /// not a toolbar and takes no accessories either. So a stand-in opened
+    /// from there says in its name that it is a copy, and is read-only, so
+    /// that changes are not typed into a file removed when the preview closes.
+    static let copyMark = "（预览副本）"
+
     /// Stand-ins hold the contents of the user's files, so only the user may
-    /// read them: folders 0700, files 0600, whatever the umask.
+    /// read them: folders 0700, files 0400 (read-only), whatever the umask.
     private static func makePrivateFolder(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -204,9 +210,10 @@ final class PreviewContent {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 
-    /// Creates the file with mode 0600 from the start, never wider.
+    /// Creates the file with mode 0400 from the start, never wider; the new
+    /// descriptor may still write to it.
     private static func writePrivately(_ data: Data, to url: URL) throws {
-        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o400)
         guard descriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         try handle.write(contentsOf: data)

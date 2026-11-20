@@ -13,12 +13,12 @@
 
 | 内容 | 位置 | 说明 |
 |---|---|---|
-| 索引数据 | `~/Library/Application Support/dev.local.filesearch` | 全盘的文件名、大小、修改时间，以及“其他磁盘”的加入选择。文件夹新建时权限设为只有你的账户能访问。 |
-| 预览用的临时副本 | `~/Library/Caches/io.github.nongtanpeidanjiu.suoyin/PreviewStandIns` | 只在预览部分文字文件时生成，只保留当前和上一个文件，预览关闭时全部删除；启动和退出时也会清空。文件夹和文件只有你的账户能读写。 |
+| 索引数据 | `~/Library/Application Support/io.github.nongtanpeidanjiu.suoyin` | 全盘的文件名、大小、修改时间，以及“其他磁盘”的加入选择。文件夹新建时权限设为只有你的账户能访问。 |
+| 预览用的临时副本 | `~/Library/Caches/io.github.nongtanpeidanjiu.suoyin/PreviewStandIns` | 只在预览部分文字文件时生成，只保留当前和上一个文件，预览关闭时全部删除；启动和退出时也会清空。文件夹只有你的账户能访问，文件只有你的账户能读，且是只读的。 |
 | 自动更新下载的更新包 | `~/Library/Caches/io.github.nongtanpeidanjiu.suoyin` 内 | 由 Sparkle 管理，安装后清理。 |
 | 偏好设置 | `~/Library/Preferences/io.github.nongtanpeidanjiu.suoyin.plist` | 快捷键、“显示系统文件”开关、更新方式、上次检查更新的时间等。 |
 
-以上 `~` 指你的个人文件夹；`io.github.nongtanpeidanjiu.suoyin` 是正式版的应用标识，自己编译的预览版是 `dev.local.filesearch.demo`。这些数据都只在你的电脑上，彻底删除的方法见[安装说明 › 如何彻底卸载](docs/安装说明.md#如何彻底卸载)。
+以上 `~` 指你的个人文件夹；`io.github.nongtanpeidanjiu.suoyin` 是正式版的应用标识。自己编译的预览版应用标识是 `dev.local.filesearch.demo`，索引数据在 `~/Library/Application Support/dev.local.filesearch`，缓存和偏好设置用 `dev.local.filesearch.demo` 这个名字。这些数据都只在你的电脑上，彻底删除的方法见[安装说明 › 如何彻底卸载](docs/安装说明.md#如何彻底卸载)。
 
 ## 联网
 
